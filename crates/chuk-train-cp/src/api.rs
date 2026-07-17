@@ -298,6 +298,53 @@ pub async fn teardown(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct ColabCellParams {
+    lease_min: Option<f64>,
+    labels: Option<String>,
+}
+
+const DEFAULT_COLAB_LABELS: &str = "colab,t4";
+
+/// Generate a ready-to-paste Colab bootstrap cell (spec §6). The control plane
+/// fills in its own public URL + join token, so there is nothing to hand-edit.
+pub async fn colab_cell(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ColabCellParams>,
+) -> Response {
+    let labels = params
+        .labels
+        .unwrap_or_else(|| DEFAULT_COLAB_LABELS.to_owned());
+    // Optional lease line: passing lease_min makes the worker self-drain at
+    // T-drain (belt) matching the control plane's window.
+    let lease_args = match params.lease_min {
+        Some(m) => format!(
+            "\nargs += [\"--lease-min\", \"{m}\", \"--drain-window-min\", \"{}\"]",
+            state.config.drain_window_min
+        ),
+        None => String::new(),
+    };
+    let cell = format!(
+        r#"# chuk-train · Colab worker — paste into ONE cell (Runtime → T4 GPU), then run.
+CP_URL = "{url}"
+JOIN_TOKEN = "{token}"
+LABELS = "{labels}"
+
+import os, stat, subprocess, urllib.request
+base = CP_URL.rstrip("/"); agent = "/tmp/chuk-train-agent"
+urllib.request.urlretrieve(base + "/agent/linux-x86_64", agent)
+os.chmod(agent, os.stat(agent).st_mode | stat.S_IEXEC)
+ws = base.replace("https://", "wss://").replace("http://", "ws://") + "/ws/agent"
+args = [agent, "--url", ws, "--token", JOIN_TOKEN, "--labels", LABELS]{lease_args}
+print("[chuk-train] joining", ws)
+subprocess.run(args, check=False)
+"#,
+        url = state.config.public_url,
+        token = state.config.join_token,
+    );
+    Json(chuk_train_proto::ColabCell { cell }).into_response()
+}
+
 pub async fn spend_status(State(state): State<Arc<AppState>>) -> Response {
     use std::collections::{BTreeMap, BTreeSet};
     let (live, ledger) = match tokio::try_join!(

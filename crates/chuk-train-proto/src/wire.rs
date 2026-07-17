@@ -306,6 +306,14 @@ pub struct SpendReport {
     pub total_spent: f64,
 }
 
+/// A ready-to-paste Colab bootstrap cell (spec §6: Colab `provision` returns
+/// cell text). The control plane fills in its own URL + join token, so the
+/// caller pastes it verbatim into a T4 notebook.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColabCell {
+    pub cell: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         .route("/blob/{*key}", get(api::blob))
         .route("/provider_offers", get(api::provider_offers))
         .route("/provision", post(api::provision))
+        .route("/colab_cell", get(api::colab_cell))
         .route("/workers/{worker_id}/lease", get(api::lease_status))
         .route("/workers/{worker_id}/extend", post(api::extend_lease))
         .route("/workers/{worker_id}/teardown", post(api::teardown))

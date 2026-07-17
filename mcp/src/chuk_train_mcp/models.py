@@ -225,6 +225,10 @@ class SpendReport(BaseModel):
     total_spent: float
 
 
+class ColabCell(BaseModel):
+    cell: str
+
+
 class WorkerInfo(BaseModel):
     id: str
     labels: list[str]

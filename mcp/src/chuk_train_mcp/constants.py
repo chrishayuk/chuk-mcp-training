@@ -18,6 +18,7 @@ API_CODE_UNITS: Final = "/api/code_units"
 API_ARTIFACT_URL: Final = "/api/artifact_url"
 API_PROVIDER_OFFERS: Final = "/api/provider_offers"
 API_PROVISION: Final = "/api/provision"
+API_COLAB_CELL: Final = "/api/colab_cell"
 API_SPEND: Final = "/api/spend"
 
 

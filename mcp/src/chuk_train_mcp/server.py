@@ -35,6 +35,7 @@ from .constants import (
     api_worker_teardown,
     API_ARTIFACT_URL,
     API_CODE_UNITS,
+    API_COLAB_CELL,
     API_FLEET,
     API_PROVIDER_OFFERS,
     API_PROVISION,
@@ -47,6 +48,7 @@ from .models import (
     CheckpointInfo,
     CodeRef,
     CodeUnitInfo,
+    ColabCell,
     Envelope,
     ExtendLeaseRequest,
     Lease,
@@ -259,6 +261,19 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         """Committed (live leases) vs spent (realised) per provider, from the
         ledger (spec §8)."""
         return await _envelope(cp.get_model(API_SPEND, SpendReport))
+
+    @mcp.tool
+    async def colab_cell(lease_min: float | None = None, labels: str = "colab,t4") -> dict[str, Any]:
+        """Generate a ready-to-paste Colab bootstrap cell (spec §6).
+
+        The control plane fills in its own URL + join token; paste the returned
+        `cell` into one cell of a T4 notebook and run it to join the fleet.
+        Optionally pass lease_min to have the worker self-drain at T-drain.
+        """
+        params: dict[str, Any] = {"labels": labels}
+        if lease_min is not None:
+            params["lease_min"] = lease_min
+        return await _envelope(cp.get_model(API_COLAB_CELL, ColabCell, params=params))
 
     return mcp
 
