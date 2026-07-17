@@ -62,3 +62,6 @@ class ControlPlaneClient:
     async def post_model(self, path: str, body: BaseModel, model: type[M]) -> M:
         payload = await self._request("POST", path, json=body.model_dump(mode="json"))
         return model.model_validate(payload)
+
+    async def post_raw(self, path: str, body: BaseModel) -> dict[str, Any]:
+        return await self._request("POST", path, json=body.model_dump(mode="json"))

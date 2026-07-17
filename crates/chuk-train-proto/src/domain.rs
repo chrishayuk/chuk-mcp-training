@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::constants::DEFAULT_SHELL_TIMEOUT;
+use crate::constants::{DEFAULT_SHELL_TIMEOUT, DEFAULT_TRAIN_TIMEOUT};
 
 macro_rules! string_id {
     ($(#[$doc:meta])* $name:ident) => {
@@ -78,6 +78,7 @@ pub enum WorkerState {
 }
 
 /// Append-only lifecycle event names (spec §5.3: the provenance record).
+/// The first block mirrors `RunState`; the rest are non-state milestones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -88,6 +89,10 @@ pub enum EventKind {
     Completed,
     Failed,
     Cancelled,
+    // M1 milestones:
+    Checkpoint,
+    Sliced,
+    Resumed,
 }
 
 impl From<RunState> for EventKind {
@@ -104,27 +109,133 @@ impl From<RunState> for EventKind {
 }
 
 /// What a run actually executes. Internally tagged so the stored/wire JSON is
-/// self-describing: `{"kind": "shell", "command": ..., "timeout_s": ...}`.
+/// self-describing: `{"kind": "shell", ...}` / `{"kind": "train", ...}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunSpec {
-    Shell {
-        command: String,
-        #[serde(default = "default_shell_timeout_s")]
-        timeout_s: u64,
-    },
+    Shell(ShellSpec),
+    // Boxed: TrainSpec is much larger than ShellSpec, so an unboxed variant
+    // would bloat every RunSpec (clippy large_enum_variant).
+    Train(Box<TrainSpec>),
 }
 
 impl RunSpec {
     pub fn kind_str(&self) -> &'static str {
         match self {
-            Self::Shell { .. } => "shell",
+            Self::Shell(_) => "shell",
+            Self::Train(_) => "train",
+        }
+    }
+
+    /// The wall-clock limit this run's slice should honour.
+    pub fn timeout_s(&self) -> u64 {
+        match self {
+            Self::Shell(s) => s.timeout_s,
+            Self::Train(t) => t.timeout_s,
         }
     }
 }
 
+/// A one-off shell command (M0 job kind).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShellSpec {
+    pub command: String,
+    #[serde(default = "default_shell_timeout_s")]
+    pub timeout_s: u64,
+}
+
 fn default_shell_timeout_s() -> u64 {
     DEFAULT_SHELL_TIMEOUT.as_secs()
+}
+
+fn default_train_timeout_s() -> u64 {
+    DEFAULT_TRAIN_TIMEOUT.as_secs()
+}
+
+/// A train job (spec §5.1). Resolved: `code` is a concrete code-unit ref, not
+/// the `repo`+`commit` sugar (that is resolved to a unit at submit time).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrainSpec {
+    /// The deployable code unit to run (spec §11.1).
+    pub code: CodeRef,
+    /// Named entrypoint from the unit's manifest (e.g. `train`).
+    pub entrypoint: String,
+    /// Config file path *within the code unit*, materialised to `$CHUK_CONFIG`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    /// Config overrides, passed as JSON in `$CHUK_OVERRIDES`.
+    #[serde(default)]
+    pub overrides: serde_json::Value,
+    /// Input artifacts the run reads (checkpoints, datasets, tokenizer).
+    #[serde(default)]
+    pub artifacts_in: Vec<ArtifactRef>,
+    /// Checkpoint schedule + retention (spec §5.1 `checkpoint`).
+    #[serde(default)]
+    pub checkpoint: CheckpointPolicy,
+    /// Seed for this run; exported as `$CHUK_SEED` and stamped into lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    /// Architecture tag recorded in checkpoint lineage (spec §11.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    /// Wall-clock limit for one slice.
+    #[serde(default = "default_train_timeout_s")]
+    pub timeout_s: u64,
+}
+
+/// Reference to a code unit: a name plus its content hash (spec §11.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeRef {
+    pub name: String,
+    pub sha: String,
+}
+
+impl std::fmt::Display for CodeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@sha256:{}", self.name, self.sha)
+    }
+}
+
+/// Typed, content-addressed artifact kinds (spec §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Code,
+    Env,
+    Dataset,
+    Checkpoint,
+    Metrics,
+    Logs,
+    Deck,
+}
+
+/// Reference to an input artifact a run declares (spec §5.1 `artifacts_in`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub name: String,
+    pub kind: ArtifactKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+}
+
+/// Checkpoint schedule + retention policy (spec §5.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointPolicy {
+    /// Advisory: how often the trainer is expected to checkpoint. The harness
+    /// uploads whatever the trainer marks `.ready`; it does not drive cadence.
+    pub every_steps: u64,
+    pub keep_last: u32,
+    pub keep_every: u64,
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            every_steps: 500,
+            keep_last: 3,
+            keep_every: 5000,
+        }
+    }
 }
 
 /// Hardware the agent detects at registration time.

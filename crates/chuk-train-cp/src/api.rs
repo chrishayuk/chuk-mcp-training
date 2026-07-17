@@ -9,18 +9,23 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chuk_train_proto::{
-    ApiError, LogsResponse, RunEvent, RunId, RunRecord, RunSpec, RunSummary, SubmitRunResponse,
-    SubmitShellRequest, WorkerInfo, DEFAULT_LOG_TAIL_LINES, DEFAULT_RUN_LIST_LIMIT,
+    ApiError, BuildCodeUnitRequest, CheckpointInfo, LogsResponse, MetricSeries,
+    PinCheckpointRequest, RunEvent, RunId, RunRecord, RunSpec, RunSummary, ShellSpec, SignedUrl,
+    SubmitRunRequest, SubmitRunResponse, SubmitShellRequest, WorkerInfo, DEFAULT_ARTIFACT_URL_TTL,
+    DEFAULT_LOG_TAIL_LINES, DEFAULT_METRIC_DOWNSAMPLE, DEFAULT_RUN_LIST_LIMIT,
     DEFAULT_SHELL_TIMEOUT,
 };
 use serde::Deserialize;
 
-use crate::AppState;
+use crate::{codeunit, AppState};
 
 const BEARER_PREFIX: &str = "Bearer ";
 const ERR_UNAUTHORIZED: &str = "bad or missing bearer token";
 const ERR_RUN_NOT_FOUND: &str = "no such run";
+const ERR_CKPT_NOT_FOUND: &str = "no such checkpoint";
 const ERR_INTERNAL: &str = "internal error";
+/// Query-param key for the metric-key filter list (comma-separated).
+const METRIC_KEYS_SEP: char = ',';
 
 /// 500-with-envelope for store failures; the MCP layer relays the envelope.
 fn internal(error: anyhow::Error) -> Response {
@@ -86,10 +91,10 @@ pub async fn submit_shell(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SubmitShellRequest>,
 ) -> Response {
-    let spec = RunSpec::Shell {
+    let spec = RunSpec::Shell(ShellSpec {
         command: request.command,
         timeout_s: request.timeout_s.unwrap_or(DEFAULT_SHELL_TIMEOUT.as_secs()),
-    };
+    });
     match state.hub.submit(&request.name, &spec).await {
         Ok(run_id) => Json(SubmitRunResponse { run_id }).into_response(),
         Err(error) => internal(error),
@@ -161,4 +166,175 @@ pub async fn run_events(
 
 pub async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
+}
+
+// ---------------------------------------------------------------------------
+// M1 handlers: code units, train submission, metrics, checkpoints, artifacts
+// ---------------------------------------------------------------------------
+
+pub async fn build_code_unit(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BuildCodeUnitRequest>,
+) -> Response {
+    let built = codeunit::build(
+        state.artifacts.as_ref(),
+        &request.repo,
+        request.commit.as_deref(),
+        request.name.as_deref(),
+    )
+    .await;
+    match built {
+        Ok(info) => {
+            if let Err(error) = state
+                .hub
+                .store
+                .register_code_unit(&info.code, &info.manifest, &info.uri)
+                .await
+            {
+                return internal(error);
+            }
+            Json(info).into_response()
+        }
+        Err(error) => bad_request(&error.to_string()),
+    }
+}
+
+pub async fn submit_run(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SubmitRunRequest>,
+) -> Response {
+    match state.hub.submit(&request.name, &request.spec).await {
+        Ok(run_id) => Json(SubmitRunResponse { run_id }).into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MetricParams {
+    keys: Option<String>,
+    since_step: Option<u64>,
+    downsample: Option<u32>,
+}
+
+pub async fn run_metrics(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Query(params): Query<MetricParams>,
+) -> Response {
+    let run_id = RunId(run_id);
+    let keys: Option<Vec<String>> = params.keys.as_deref().map(|raw| {
+        raw.split(METRIC_KEYS_SEP)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+    let series = state
+        .hub
+        .store
+        .metric_series(
+            &run_id,
+            keys.as_deref(),
+            params.since_step.unwrap_or(0),
+            params.downsample.unwrap_or(DEFAULT_METRIC_DOWNSAMPLE),
+        )
+        .await;
+    match series {
+        Ok(series) => Json::<MetricSeries>(series).into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn list_checkpoints(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Response {
+    match state.hub.store.checkpoints(&RunId(run_id)).await {
+        Ok(ckpts) => Json::<Vec<CheckpointInfo>>(ckpts).into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn pin_checkpoint(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+    Json(request): Json<PinCheckpointRequest>,
+) -> Response {
+    match state
+        .hub
+        .store
+        .pin_checkpoint(&RunId(run_id), request.step, &request.name)
+        .await
+    {
+        Ok(true) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: ERR_CKPT_NOT_FOUND.into(),
+            }),
+        )
+            .into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ArtifactUrlParams {
+    key: String,
+    ttl_s: Option<u64>,
+}
+
+/// Time-limited fetch URL for an artifact key (spec §6 artifact_url). The
+/// filesystem backend has no native signed URL, so this points at the control
+/// plane's own authenticated `/api/blob` endpoint.
+pub async fn artifact_url(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ArtifactUrlParams>,
+) -> Response {
+    let ttl =
+        std::time::Duration::from_secs(params.ttl_s.unwrap_or(DEFAULT_ARTIFACT_URL_TTL.as_secs()));
+    let native = match state.artifacts.presign_get(&params.key, ttl) {
+        Ok(url) => url,
+        Err(error) => return bad_request(&error.to_string()),
+    };
+    let signed = native.unwrap_or_else(|| SignedUrl {
+        url: format!(
+            "{}/api/blob/{}",
+            state.config.public_url.trim_end_matches('/'),
+            params.key
+        ),
+        expires_at: now() + ttl.as_secs_f64(),
+    });
+    Json(signed).into_response()
+}
+
+/// Serve artifact bytes (bearer-authed). Used by artifact_url consumers such as
+/// lazarus pulling checkpoints to the Mac.
+pub async fn blob(State(state): State<Arc<AppState>>, Path(key): Path<String>) -> Response {
+    match state.artifacts.get(&key).await {
+        Ok(bytes) => bytes.into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "no such artifact".into(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn bad_request(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: message.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
+fn now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs_f64()
 }

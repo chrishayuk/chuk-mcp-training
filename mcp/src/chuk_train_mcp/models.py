@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from .constants import DEFAULT_SHELL_TIMEOUT_S
+from .constants import DEFAULT_SHELL_TIMEOUT_S, DEFAULT_TRAIN_TIMEOUT_S
 
 
 class RunState(StrEnum):
@@ -36,10 +36,24 @@ class EventKind(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    CHECKPOINT = "checkpoint"
+    SLICED = "sliced"
+    RESUMED = "resumed"
 
 
 class RunKind(StrEnum):
     SHELL = "shell"
+    TRAIN = "train"
+
+
+class ArtifactKind(StrEnum):
+    CODE = "code"
+    ENV = "env"
+    DATASET = "dataset"
+    CHECKPOINT = "checkpoint"
+    METRICS = "metrics"
+    LOGS = "logs"
+    DECK = "deck"
 
 
 class Hardware(BaseModel):
@@ -54,6 +68,95 @@ class ShellSpec(BaseModel):
     kind: Literal[RunKind.SHELL] = RunKind.SHELL
     command: str
     timeout_s: int = DEFAULT_SHELL_TIMEOUT_S
+
+
+class CodeRef(BaseModel):
+    name: str
+    sha: str
+
+
+class CheckpointPolicy(BaseModel):
+    every_steps: int = 500
+    keep_last: int = 3
+    keep_every: int = 5000
+
+
+class ArtifactRef(BaseModel):
+    name: str
+    kind: ArtifactKind
+    sha: str | None = None
+
+
+class TrainSpec(BaseModel):
+    kind: Literal[RunKind.TRAIN] = RunKind.TRAIN
+    code: CodeRef
+    entrypoint: str
+    config: str | None = None
+    overrides: dict[str, Any] = Field(default_factory=dict)
+    artifacts_in: list[ArtifactRef] = Field(default_factory=list)
+    checkpoint: CheckpointPolicy = Field(default_factory=CheckpointPolicy)
+    seed: int | None = None
+    arch: str | None = None
+    timeout_s: int = DEFAULT_TRAIN_TIMEOUT_S
+
+
+class UnitRequires(BaseModel):
+    cuda: str | None = None
+    min_vram_gb: int | None = None
+
+
+class CodeUnitManifest(BaseModel):
+    name: str
+    version: str = ""
+    entrypoints: dict[str, str] = Field(default_factory=dict)
+    python: str | None = None
+    requires: UnitRequires = Field(default_factory=UnitRequires)
+
+
+class CodeUnitInfo(BaseModel):
+    code: CodeRef
+    manifest: CodeUnitManifest
+    uri: str
+    created_at: float
+
+
+class CheckpointMeta(BaseModel):
+    step: int = 0
+    seed: int | None = None
+    arch: str | None = None
+    code: CodeRef | None = None
+    config_hash: str | None = None
+    tokenizer_hash: str | None = None
+    parent_checkpoint: str | None = None
+    datasets: list[str] = Field(default_factory=list)
+    run_id: str | None = None
+    slices: list[list[int]] = Field(default_factory=list)
+
+
+class CheckpointInfo(BaseModel):
+    run_id: str
+    step: int
+    uri: str
+    model_hash: str
+    pinned: bool
+    pin_name: str | None = None
+    meta: CheckpointMeta
+    created_at: float
+
+
+class MetricPoint(BaseModel):
+    step: int
+    value: float
+
+
+class MetricSeries(BaseModel):
+    run_id: str
+    series: dict[str, list[MetricPoint]] = Field(default_factory=dict)
+
+
+class SignedUrl(BaseModel):
+    url: str
+    expires_at: float
 
 
 class WorkerInfo(BaseModel):
@@ -97,6 +200,22 @@ class SubmitShellRequest(BaseModel):
     name: str
     command: str
     timeout_s: int = DEFAULT_SHELL_TIMEOUT_S
+
+
+class SubmitRunRequest(BaseModel):
+    name: str
+    spec: TrainSpec
+
+
+class BuildCodeUnitRequest(BaseModel):
+    repo: str
+    commit: str | None = None
+    name: str | None = None
+
+
+class PinCheckpointRequest(BaseModel):
+    step: int
+    name: str
 
 
 class SubmitRunResponse(BaseModel):

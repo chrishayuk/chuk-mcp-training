@@ -14,8 +14,14 @@ chuk-train-proto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 serde_json = { workspace = true }
+sha2 = "0.10"
+tar = "0.4"
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
+toml = "0.8"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zstd = "0.13"

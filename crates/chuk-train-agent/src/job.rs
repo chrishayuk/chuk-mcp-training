@@ -1,5 +1,5 @@
-//! Shell run execution: spawn, stream stdout/stderr lines, enforce timeout,
-//! report exit.
+//! Run dispatch: turn an assignment into a supervised child job. Shell runs
+//! (M0) execute here; train runs (M1) delegate to [`crate::train`].
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -7,16 +7,15 @@ use std::time::Duration;
 use chuk_train_proto::{
     AgentToCp, JobAssignment, RunId, RunSpec, EXIT_CODE_AGENT_ERROR, EXIT_CODE_TIMEOUT,
 };
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+use crate::procio::{agent_line, pump_lines};
+
 const SHELL: &str = "/bin/sh";
 const SHELL_FLAG: &str = "-c";
-/// Prefix for lines the agent itself injects into a run's log stream.
-const AGENT_LOG_PREFIX: &str = "[agent]";
 
 pub struct RunningJob {
     handle: JoinHandle<()>,
@@ -33,20 +32,33 @@ impl RunningJob {
     }
 }
 
-pub fn spawn(job: JobAssignment, tx: UnboundedSender<AgentToCp>) -> RunningJob {
+/// Spawn the supervisor task for an assignment. `origin` is the control-plane
+/// HTTP origin, needed by train runs to fetch code + upload checkpoints.
+pub fn spawn(job: JobAssignment, tx: UnboundedSender<AgentToCp>, origin: String) -> RunningJob {
     RunningJob {
-        handle: tokio::spawn(execute(job, tx)),
+        handle: tokio::spawn(execute(job, tx, origin)),
     }
 }
 
-async fn execute(job: JobAssignment, tx: UnboundedSender<AgentToCp>) {
-    let JobAssignment { run_id, spec } = job;
-    let RunSpec::Shell { command, timeout_s } = spec;
-    let _ = tx.send(AgentToCp::JobStarted {
+async fn execute(job: JobAssignment, tx: UnboundedSender<AgentToCp>, origin: String) {
+    let run_id = job.run_id.clone();
+    tx.send(AgentToCp::JobStarted {
         run_id: run_id.clone(),
-    });
-    let code = run_shell(&run_id, &command, Duration::from_secs(timeout_s), &tx).await;
-    let _ = tx.send(AgentToCp::JobExited { run_id, code });
+    })
+    .ok();
+    let code = match job.spec {
+        RunSpec::Shell(shell) => {
+            run_shell(
+                &run_id,
+                &shell.command,
+                Duration::from_secs(shell.timeout_s),
+                &tx,
+            )
+            .await
+        }
+        RunSpec::Train(_) => crate::train::run(job, &tx, &origin).await,
+    };
+    tx.send(AgentToCp::JobExited { run_id, code }).ok();
 }
 
 async fn run_shell(
@@ -65,7 +77,7 @@ async fn run_shell(
     let mut child = match spawned {
         Ok(child) => child,
         Err(error) => {
-            send_agent_line(tx, run_id, &format!("spawn failed: {error}"));
+            agent_line(tx, run_id, &format!("spawn failed: {error}"));
             return EXIT_CODE_AGENT_ERROR;
         }
     };
@@ -83,11 +95,11 @@ async fn run_shell(
     let code = match status {
         Ok(Ok(exit)) => exit.code().map(i64::from).unwrap_or(EXIT_CODE_AGENT_ERROR),
         Ok(Err(error)) => {
-            send_agent_line(tx, run_id, &format!("wait failed: {error}"));
+            agent_line(tx, run_id, &format!("wait failed: {error}"));
             EXIT_CODE_AGENT_ERROR
         }
         Err(_elapsed) => {
-            send_agent_line(
+            agent_line(
                 tx,
                 run_id,
                 &format!("killed: exceeded timeout_s={}", timeout.as_secs()),
@@ -99,8 +111,8 @@ async fn run_shell(
         }
     };
 
-    // The process is dead on every path above, so the pipes are closed and
-    // the pumps drain whatever is buffered, then finish.
+    // The process is dead on every path above, so the pipes are closed and the
+    // pumps drain whatever is buffered, then finish.
     if let Some(pump) = stdout_pump {
         let _ = pump.await;
     }
@@ -108,27 +120,4 @@ async fn run_shell(
         let _ = pump.await;
     }
     code
-}
-
-fn pump_lines(
-    reader: impl AsyncRead + Unpin + Send + 'static,
-    run_id: RunId,
-    tx: UnboundedSender<AgentToCp>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = tx.send(AgentToCp::Log {
-                run_id: run_id.clone(),
-                line,
-            });
-        }
-    })
-}
-
-fn send_agent_line(tx: &UnboundedSender<AgentToCp>, run_id: &RunId, message: &str) {
-    let _ = tx.send(AgentToCp::Log {
-        run_id: run_id.clone(),
-        line: format!("{AGENT_LOG_PREFIX} {message}"),
-    });
 }

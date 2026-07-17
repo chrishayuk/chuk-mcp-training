@@ -4,8 +4,11 @@
 
 pub mod constants;
 pub mod domain;
+pub mod keys;
+pub mod manifest;
 pub mod wire;
 
 pub use constants::*;
 pub use domain::*;
+pub use manifest::*;
 pub use wire::*;

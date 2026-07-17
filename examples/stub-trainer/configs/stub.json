@@ -1,0 +1,6 @@
+{
+  "total_steps": 20,
+  "checkpoint_every": 5,
+  "step_delay_s": 0.4,
+  "arch": "stub-net-v0"
+}

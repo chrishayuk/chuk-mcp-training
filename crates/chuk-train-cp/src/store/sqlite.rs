@@ -1,10 +1,13 @@
 //! SQLite adapter (sqlx, async native).
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
-    EventKind, Hardware, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary, UnixSeconds,
-    WorkerId, WorkerInfo, WorkerState,
+    CheckpointInfo, CheckpointMeta, CodeRef, CodeUnitInfo, CodeUnitManifest, EventKind, Hardware,
+    MetricPoint, MetricSeries, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary,
+    UnixSeconds, WorkerId, WorkerInfo, WorkerState,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -46,8 +49,37 @@ CREATE TABLE IF NOT EXISTS run_events (
   event        TEXT NOT NULL,
   detail       TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS code_units (
+  name         TEXT NOT NULL,
+  sha          TEXT NOT NULL,
+  manifest     TEXT NOT NULL,
+  uri          TEXT NOT NULL,
+  created_at   REAL NOT NULL,
+  PRIMARY KEY (name, sha)
+);
+CREATE TABLE IF NOT EXISTS metrics (
+  run_id       TEXT NOT NULL,
+  step         INTEGER NOT NULL,
+  key          TEXT NOT NULL,
+  value        REAL NOT NULL,
+  ts           REAL NOT NULL,
+  PRIMARY KEY (run_id, key, step)
+);
+CREATE TABLE IF NOT EXISTS checkpoints (
+  run_id       TEXT NOT NULL,
+  step         INTEGER NOT NULL,
+  uri          TEXT NOT NULL,
+  model_hash   TEXT NOT NULL,
+  meta         TEXT NOT NULL,
+  pinned       INTEGER NOT NULL DEFAULT 0,
+  pin_name     TEXT,
+  created_at   REAL NOT NULL,
+  PRIMARY KEY (run_id, step)
+);
 CREATE INDEX IF NOT EXISTS idx_runs_state  ON runs (state, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_run  ON run_events (run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_metrics_run ON metrics (run_id, key, step);
+CREATE INDEX IF NOT EXISTS idx_ckpt_run    ON checkpoints (run_id, step);
 "#;
 
 /// Length of generated run ids (hex chars of a UUID4).
@@ -311,6 +343,205 @@ impl Store for SqliteStore {
             })
             .collect()
     }
+
+    // ---- code units -------------------------------------------------------
+
+    async fn register_code_unit(
+        &self,
+        code: &CodeRef,
+        manifest: &CodeUnitManifest,
+        uri: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO code_units (name, sha, manifest, uri, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(name, sha) DO UPDATE SET manifest = excluded.manifest, uri = excluded.uri",
+        )
+        .bind(&code.name)
+        .bind(&code.sha)
+        .bind(serde_json::to_string(manifest)?)
+        .bind(uri)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn code_unit(&self, name: &str, sha: &str) -> Result<Option<CodeUnitInfo>> {
+        let row = sqlx::query("SELECT * FROM code_units WHERE name = ?1 AND sha = ?2")
+            .bind(name)
+            .bind(sha)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| {
+            Ok(CodeUnitInfo {
+                code: CodeRef {
+                    name: r.get("name"),
+                    sha: r.get("sha"),
+                },
+                manifest: serde_json::from_str(&r.get::<String, _>("manifest"))?,
+                uri: r.get("uri"),
+                created_at: r.get("created_at"),
+            })
+        })
+        .transpose()
+    }
+
+    // ---- metrics ----------------------------------------------------------
+
+    async fn append_metrics(
+        &self,
+        run_id: &RunId,
+        step: u64,
+        values: &BTreeMap<String, f64>,
+    ) -> Result<()> {
+        let ts = now();
+        let step = step as i64;
+        let mut tx = self.pool.begin().await?;
+        for (key, value) in values {
+            sqlx::query(
+                "INSERT INTO metrics (run_id, step, key, value, ts) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id, key, step) DO UPDATE SET value = excluded.value",
+            )
+            .bind(&run_id.0)
+            .bind(step)
+            .bind(key)
+            .bind(value)
+            .bind(ts)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn metric_series(
+        &self,
+        run_id: &RunId,
+        keys: Option<&[String]>,
+        since_step: u64,
+        downsample: u32,
+    ) -> Result<MetricSeries> {
+        // Filtering by key list is done in Rust: the set is tiny and this
+        // avoids building a dynamic `IN (?, ?, ...)` clause.
+        let rows = sqlx::query(
+            "SELECT step, key, value FROM metrics
+             WHERE run_id = ?1 AND step >= ?2 ORDER BY key, step",
+        )
+        .bind(&run_id.0)
+        .bind(since_step as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let wanted: Option<std::collections::HashSet<&str>> =
+            keys.map(|ks| ks.iter().map(String::as_str).collect());
+        let mut series: BTreeMap<String, Vec<MetricPoint>> = BTreeMap::new();
+        for row in rows {
+            let key: String = row.get("key");
+            if wanted.as_ref().is_some_and(|w| !w.contains(key.as_str())) {
+                continue;
+            }
+            series.entry(key).or_default().push(MetricPoint {
+                step: row.get::<i64, _>("step") as u64,
+                value: row.get("value"),
+            });
+        }
+        if downsample > 0 {
+            for points in series.values_mut() {
+                downsample_in_place(points, downsample as usize);
+            }
+        }
+        Ok(MetricSeries {
+            run_id: run_id.clone(),
+            series,
+        })
+    }
+
+    // ---- checkpoints ------------------------------------------------------
+
+    async fn record_checkpoint(
+        &self,
+        run_id: &RunId,
+        step: u64,
+        uri: &str,
+        model_hash: &str,
+        meta: &CheckpointMeta,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO checkpoints (run_id, step, uri, model_hash, meta, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(run_id, step) DO UPDATE SET
+               uri = excluded.uri, model_hash = excluded.model_hash, meta = excluded.meta",
+        )
+        .bind(&run_id.0)
+        .bind(step as i64)
+        .bind(uri)
+        .bind(model_hash)
+        .bind(serde_json::to_string(meta)?)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn checkpoints(&self, run_id: &RunId) -> Result<Vec<CheckpointInfo>> {
+        let rows = sqlx::query("SELECT * FROM checkpoints WHERE run_id = ?1 ORDER BY step")
+            .bind(&run_id.0)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(checkpoint_from_row).collect()
+    }
+
+    async fn latest_checkpoint(&self, run_id: &RunId) -> Result<Option<CheckpointInfo>> {
+        let row =
+            sqlx::query("SELECT * FROM checkpoints WHERE run_id = ?1 ORDER BY step DESC LIMIT 1")
+                .bind(&run_id.0)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(checkpoint_from_row).transpose()
+    }
+
+    async fn pin_checkpoint(&self, run_id: &RunId, step: u64, name: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE checkpoints SET pinned = 1, pin_name = ?3 WHERE run_id = ?1 AND step = ?2",
+        )
+        .bind(&run_id.0)
+        .bind(step as i64)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// Stride-downsample to at most `max` points, always keeping the last point so
+/// the latest step is never dropped.
+fn downsample_in_place(points: &mut Vec<MetricPoint>, max: usize) {
+    if max == 0 || points.len() <= max {
+        return;
+    }
+    let stride = points.len().div_ceil(max);
+    let last = points.last().copied();
+    let mut kept: Vec<MetricPoint> = points.iter().step_by(stride).copied().collect();
+    if let Some(last) = last {
+        if kept.last() != Some(&last) {
+            kept.push(last);
+        }
+    }
+    *points = kept;
+}
+
+fn checkpoint_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CheckpointInfo> {
+    Ok(CheckpointInfo {
+        run_id: RunId(row.get("run_id")),
+        step: row.get::<i64, _>("step") as u64,
+        uri: row.get("uri"),
+        model_hash: row.get("model_hash"),
+        pinned: row.get::<i64, _>("pinned") == 1,
+        pin_name: row.get("pin_name"),
+        meta: serde_json::from_str(&row.get::<String, _>("meta"))?,
+        created_at: row.get("created_at"),
+    })
 }
 
 fn merge_field(value: &mut serde_json::Value, key: &str, field: serde_json::Value) {

@@ -1,20 +1,24 @@
-//! chuk-train-agent — M0 join loop (spec §7).
+//! chuk-train-agent — join loop + run execution (spec §7).
 //!
 //! Runs identically on Colab, a Vast container, or any Linux box:
 //!
 //!     chuk-train-agent --url wss://train.example.com/ws/agent --token <JOIN_TOKEN>
 //!
 //! Dials OUT to the control plane, registers detected hardware, heartbeats,
-//! executes assigned shell runs, streams stdout/stderr lines back, reconnects
-//! with exponential backoff.
+//! executes assigned shell and train runs, streams logs/metrics back, uploads
+//! checkpoints, and reconnects with exponential backoff.
 //!
-//! M0 semantics (deliberate): one run in flight; logs are dropped while the
-//! control plane is unreachable; if the session drops mid-run the child
-//! process is killed — the control plane requeues the run anyway, so this
-//! keeps both sides' view consistent until M1 adds buffering + resume.
+//! One run in flight; logs/metrics are dropped while the control plane is
+//! unreachable (buffered replay is a later milestone). If the session drops
+//! mid-run the child is killed; the control plane requeues, and a train run
+//! resumes from its last uploaded checkpoint.
 
+mod codeunit;
 mod hardware;
+mod httpclient;
 mod job;
+mod procio;
+mod train;
 
 use anyhow::{Context, Result};
 use chuk_train_proto::{
@@ -92,6 +96,9 @@ async fn session(
     worker_id: Option<WorkerId>,
     labels: &[String],
 ) -> Result<WorkerId> {
+    // REST origin for code-unit fetch and checkpoint upload, derived from the
+    // same host we dial the websocket on.
+    let origin = httpclient::origin_from_ws_url(url)?;
     let (socket, _response) = connect_async(url).await.context("connecting")?;
     let (mut sink, mut stream) = socket.split();
 
@@ -141,7 +148,7 @@ async fn session(
                         continue;
                     }
                     info!(run = %job.run_id, "assigned");
-                    current = Some(job::spawn(job, tx.clone()));
+                    current = Some(job::spawn(job, tx.clone(), origin.clone()));
                 }
                 Some(CpToAgent::Cancel { run_id }) => {
                     if let Some(job) = current.take() {

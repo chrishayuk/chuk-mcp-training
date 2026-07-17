@@ -11,8 +11,8 @@ mod sqlite;
 use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
-    EventKind, Hardware, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary, WorkerId,
-    WorkerInfo,
+    CheckpointInfo, CheckpointMeta, CodeRef, CodeUnitInfo, CodeUnitManifest, EventKind, Hardware,
+    MetricSeries, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary, WorkerId, WorkerInfo,
 };
 
 pub use sqlite::SqliteStore;
@@ -60,6 +60,44 @@ pub trait Store: Send + Sync {
         detail: serde_json::Value,
     ) -> Result<()>;
     async fn events(&self, run_id: &RunId) -> Result<Vec<RunEvent>>;
+
+    // code units (spec §11.1)
+    async fn register_code_unit(
+        &self,
+        code: &CodeRef,
+        manifest: &CodeUnitManifest,
+        uri: &str,
+    ) -> Result<()>;
+    async fn code_unit(&self, name: &str, sha: &str) -> Result<Option<CodeUnitInfo>>;
+
+    // metrics (spec §5.1 JSONL → §6 run_metrics)
+    async fn append_metrics(
+        &self,
+        run_id: &RunId,
+        step: u64,
+        values: &std::collections::BTreeMap<String, f64>,
+    ) -> Result<()>;
+    async fn metric_series(
+        &self,
+        run_id: &RunId,
+        keys: Option<&[String]>,
+        since_step: u64,
+        downsample: u32,
+    ) -> Result<MetricSeries>;
+
+    // checkpoints (spec §11.2)
+    async fn record_checkpoint(
+        &self,
+        run_id: &RunId,
+        step: u64,
+        uri: &str,
+        model_hash: &str,
+        meta: &CheckpointMeta,
+    ) -> Result<()>;
+    async fn checkpoints(&self, run_id: &RunId) -> Result<Vec<CheckpointInfo>>;
+    async fn latest_checkpoint(&self, run_id: &RunId) -> Result<Option<CheckpointInfo>>;
+    /// Pin a checkpoint by step; returns false if no such checkpoint exists.
+    async fn pin_checkpoint(&self, run_id: &RunId, step: u64, name: &str) -> Result<bool>;
 }
 
 /// Open a store from a URL-ish spec: `sqlite:path.db` (a bare path also means

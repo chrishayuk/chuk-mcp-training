@@ -1,0 +1,9 @@
+name = "stub-trainer"
+version = "0.1.0"
+python = "3.11"
+
+[entrypoints]
+train = "python3 train.py"
+
+[requires]
+min_vram_gb = 0

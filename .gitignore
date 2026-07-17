@@ -7,3 +7,4 @@
 *.db-wal
 .DS_Store
 .claude/settings.local.json
+/chuk_train_artifacts/

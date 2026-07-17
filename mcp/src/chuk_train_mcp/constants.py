@@ -14,6 +14,8 @@ DEFAULT_CP_URL: Final = "http://127.0.0.1:8700"
 API_FLEET: Final = "/api/fleet"
 API_RUNS: Final = "/api/runs"
 API_RUNS_SHELL: Final = "/api/runs/shell"
+API_CODE_UNITS: Final = "/api/code_units"
+API_ARTIFACT_URL: Final = "/api/artifact_url"
 
 
 def api_run(run_id: str) -> str:
@@ -28,9 +30,24 @@ def api_run_events(run_id: str) -> str:
     return f"{API_RUNS}/{run_id}/events"
 
 
+def api_run_metrics(run_id: str) -> str:
+    return f"{API_RUNS}/{run_id}/metrics"
+
+
+def api_run_checkpoints(run_id: str) -> str:
+    return f"{API_RUNS}/{run_id}/checkpoints"
+
+
+def api_run_checkpoint_pin(run_id: str) -> str:
+    return f"{API_RUNS}/{run_id}/checkpoints/pin"
+
+
 # Defaults mirrored from chuk-train-proto.
 DEFAULT_SHELL_TIMEOUT_S: Final = 600
+DEFAULT_TRAIN_TIMEOUT_S: Final = 12 * 3600
 DEFAULT_LOG_TAIL_LINES: Final = 100
 DEFAULT_RUN_LIST_LIMIT: Final = 50
+DEFAULT_METRIC_DOWNSAMPLE: Final = 500
+DEFAULT_ARTIFACT_URL_TTL_S: Final = 3600
 
 HTTP_TIMEOUT_S: Final = 30.0

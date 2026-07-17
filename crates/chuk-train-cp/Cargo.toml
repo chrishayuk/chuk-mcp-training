@@ -1,6 +1,6 @@
 [package]
 name = "chuk-train-cp"
-description = "chuk-mcp-training control plane daemon (M0): agent websocket, scheduler, run store, REST API, dashboard"
+description = "chuk-mcp-training control plane daemon: agent websocket, scheduler, run + artifact store, REST API, dashboard"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,10 +15,15 @@ anyhow = { workspace = true }
 async-trait = "0.1"
 axum = { workspace = true }
 futures-util = { workspace = true }
+hex = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 sqlx = { workspace = true }
+tar = "0.4"
 tokio = { workspace = true }
+toml = "0.8"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+zstd = "0.13"
