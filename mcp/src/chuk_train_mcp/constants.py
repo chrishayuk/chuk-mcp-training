@@ -16,6 +16,21 @@ API_RUNS: Final = "/api/runs"
 API_RUNS_SHELL: Final = "/api/runs/shell"
 API_CODE_UNITS: Final = "/api/code_units"
 API_ARTIFACT_URL: Final = "/api/artifact_url"
+API_PROVIDER_OFFERS: Final = "/api/provider_offers"
+API_PROVISION: Final = "/api/provision"
+API_SPEND: Final = "/api/spend"
+
+
+def api_worker_lease(worker_id: str) -> str:
+    return f"/api/workers/{worker_id}/lease"
+
+
+def api_worker_extend(worker_id: str) -> str:
+    return f"/api/workers/{worker_id}/extend"
+
+
+def api_worker_teardown(worker_id: str) -> str:
+    return f"/api/workers/{worker_id}/teardown"
 
 
 def api_run(run_id: str) -> str:

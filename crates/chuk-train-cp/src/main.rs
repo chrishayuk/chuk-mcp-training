@@ -13,6 +13,8 @@ mod config;
 mod dash;
 mod grant;
 mod hub;
+mod lease;
+mod provider;
 mod store;
 mod upload;
 mod ws;
@@ -28,12 +30,15 @@ use tracing::info;
 use crate::artifacts::{open_artifact_store, ArtifactStore};
 use crate::config::Config;
 use crate::hub::Hub;
+use crate::lease::LeaseManager;
+use crate::provider::build_providers;
 use crate::store::open_store;
 
 pub struct AppState {
     pub config: Config,
     pub hub: Arc<Hub>,
     pub artifacts: Arc<dyn ArtifactStore>,
+    pub leases: Arc<LeaseManager>,
 }
 
 #[tokio::main]
@@ -49,11 +54,24 @@ async fn main() -> Result<()> {
     let store: Arc<dyn store::Store> = Arc::from(open_store(&config.store_spec).await?);
     let artifacts: Arc<dyn ArtifactStore> = Arc::from(open_artifact_store(&config.artifacts_spec)?);
     let hub = Hub::new(store, artifacts.clone());
+    let providers = Arc::new(build_providers(
+        &config.providers,
+        config.agent_bin.clone(),
+        config.vast_api_key.clone(),
+    ));
+    info!(providers = ?providers.names(), "provider registry");
+    let leases = LeaseManager::new(hub.clone(), providers, config.clone());
+    // The lease clock and reconcile loop are the M2 cleanup guarantees; they
+    // run for the life of the process.
+    tokio::spawn(leases.clone().run_clock());
+    tokio::spawn(leases.clone().run_reconcile());
+
     let bind = (config.host, config.port);
     let state = Arc::new(AppState {
         config,
         hub,
         artifacts,
+        leases,
     });
 
     // Bearer-authenticated surface: the MCP server and dashboard.
@@ -70,6 +88,12 @@ async fn main() -> Result<()> {
         .route("/code_units", post(api::build_code_unit))
         .route("/artifact_url", get(api::artifact_url))
         .route("/blob/{*key}", get(api::blob))
+        .route("/provider_offers", get(api::provider_offers))
+        .route("/provision", post(api::provision))
+        .route("/workers/{worker_id}/lease", get(api::lease_status))
+        .route("/workers/{worker_id}/extend", post(api::extend_lease))
+        .route("/workers/{worker_id}/teardown", post(api::teardown))
+        .route("/spend", get(api::spend_status))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api::require_bearer,

@@ -30,11 +30,17 @@ from .constants import (
     api_run_events,
     api_run_logs,
     api_run_metrics,
+    api_worker_extend,
+    api_worker_lease,
+    api_worker_teardown,
     API_ARTIFACT_URL,
     API_CODE_UNITS,
     API_FLEET,
+    API_PROVIDER_OFFERS,
+    API_PROVISION,
     API_RUNS,
     API_RUNS_SHELL,
+    API_SPEND,
 )
 from .models import (
     BuildCodeUnitRequest,
@@ -42,16 +48,24 @@ from .models import (
     CodeRef,
     CodeUnitInfo,
     Envelope,
+    ExtendLeaseRequest,
+    Lease,
     LogsResponse,
     MetricSeries,
+    Offer,
     PinCheckpointRequest,
+    ProvisionRequest,
+    ProvisionResult,
     RunEvent,
     RunRecord,
     RunSummary,
     SignedUrl,
+    SpendReport,
     SubmitRunRequest,
     SubmitRunResponse,
     SubmitShellRequest,
+    TeardownRequest,
+    TeardownResult,
     TrainSpec,
     WorkerInfo,
 )
@@ -190,6 +204,61 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         return await _envelope(
             cp.get_model(API_ARTIFACT_URL, SignedUrl, params={_PARAM_KEY: key, _PARAM_TTL_S: ttl_s})
         )
+
+    # -- M2: leases + provisioning -----------------------------------------
+
+    @mcp.tool
+    async def provider_offers(
+        provider: str, gpu: str | None = None, max_price_hr: float | None = None
+    ) -> dict[str, Any]:
+        """Rentable GPU offers from a provider, optionally filtered."""
+        params: dict[str, Any] = {"provider": provider}
+        if gpu is not None:
+            params["gpu"] = gpu
+        if max_price_hr is not None:
+            params["max_price_hr"] = max_price_hr
+        return await _envelope(cp.get_list(API_PROVIDER_OFFERS, Offer, params=params))
+
+    @mcp.tool
+    async def provision(
+        provider: str,
+        lease_min: float,
+        offer_id: str | None = None,
+        gpu: str | None = None,
+        max_price_hr: float | None = None,
+    ) -> dict[str, Any]:
+        """Provision a leased worker (spec §3). The lease is a hard wall: the
+        control plane drains at T-drain and destroys the instance at T-0,
+        provider-verified, whether or not the agent responds."""
+        request = ProvisionRequest(
+            provider=provider, lease_min=lease_min, offer_id=offer_id, gpu=gpu,
+            max_price_hr=max_price_hr,
+        )
+        return await _envelope(cp.post_model(API_PROVISION, request, ProvisionResult))
+
+    @mcp.tool
+    async def lease_status(worker_id: str) -> dict[str, Any]:
+        """The worker's lease: budget, elapsed, extensions, state."""
+        return await _envelope(cp.get_model(api_worker_lease(worker_id), Lease))
+
+    @mcp.tool
+    async def extend_lease(worker_id: str, minutes: float, reason: str = "") -> dict[str, Any]:
+        """Extend a lease's wall — the only path past it (a budget decision)."""
+        request = ExtendLeaseRequest(minutes=minutes, reason=reason)
+        return await _envelope(cp.post_model(api_worker_extend(worker_id), request, Lease))
+
+    @mcp.tool
+    async def teardown(worker_id: str, force: bool = False) -> dict[str, Any]:
+        """Tear down a leased worker now: drain (unless force) then destroy,
+        provider-verified. Returns whether the instance was confirmed gone."""
+        request = TeardownRequest(force=force)
+        return await _envelope(cp.post_model(api_worker_teardown(worker_id), request, TeardownResult))
+
+    @mcp.tool
+    async def spend_status() -> dict[str, Any]:
+        """Committed (live leases) vs spent (realised) per provider, from the
+        ledger (spec §8)."""
+        return await _envelope(cp.get_model(API_SPEND, SpendReport))
 
     return mcp
 

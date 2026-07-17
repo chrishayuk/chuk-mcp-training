@@ -1,10 +1,14 @@
 # chuk-mcp-training
 
 MCP-controlled remote training harness for Colab and rented single GPUs.
-Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.4). This repo is at **M1**:
-train runs end-to-end — code units, metrics tailing, lineage-complete
-checkpoints, and resume-after-kill — on top of the M0 join loop / shell runs /
-log streaming / fleet. Verified locally against the **E0** and **E1** ladders.
+Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.4). This repo is at **M2**:
+leased workers with a hard wall — drain at T-drain, provider-verified destroy
+at T-0 (even with the agent hung), a reconcile loop that auto-kills orphaned
+instances, an idle reaper, and a cost ledger — on top of M1 train runs (code
+units, metrics, lineage checkpoints, resume) and the M0 join loop. Verified
+locally against the **E0**, **E1**, and **E2** ladders (E2 via a mock provider
+that launches real agent processes; the Vast driver awaits live-credential
+verification).
 
 **Stack:** Rust control plane + Rust worker agent; the MCP tool surface is
 Python on `chuk-mcp-server`, a thin client over the control plane's REST API.
@@ -19,10 +23,12 @@ on the Python side — shared names/numbers live in `chuk-train-proto`
   crosses a process boundary.
 - `crates/chuk-train-cp` — control plane daemon (axum + tokio + sqlx):
   `/ws/agent` (worker websocket), `/api/*` (bearer-auth REST + grant-auth
-  upload/fetch), `/` (dashboard stub), `/healthz`. Two adapter seams — the
-  metadata store (`sqlite:path.db`, `redis:` reserved) and the artifact blob
-  store (`file:/path`, `s3:`/`r2:` reserved). Builds code units, mints
-  run-scoped upload grants, ingests metrics + checkpoints, and resumes.
+  upload/fetch), `/` (dashboard stub), `/healthz`. Three adapter seams — the
+  metadata store (`sqlite:path.db`, `redis:` reserved), the artifact blob
+  store (`file:/path`, `s3:`/`r2:` reserved), and the provider registry
+  (`mock` now, `vast` skeleton). Builds code units, mints run-scoped upload
+  grants, ingests metrics + checkpoints, resumes, and runs the lease clock +
+  reconcile loop that enforce the wall and kill orphans.
 - `crates/chuk-train-agent` — worker agent binary: dials out, registers
   hardware, heartbeats, runs shell + train jobs, streams logs/metrics, fetches
   code units (cached by sha), uploads lineage-complete checkpoints, resumes,
@@ -105,9 +111,36 @@ A train entrypoint reads a handful of env vars — about five lines to adopt:
 
 See `examples/stub-trainer/train.py` for a minimal working example.
 
+## Leases + cleanup (E2)
+
+```bash
+# Provision a leased worker (mock launches a real agent process locally) …
+provider_offers(provider="mock")
+provision(provider="mock", lease_min=15, gpu="mock-t4", max_price_hr=0.10)
+# … it runs jobs until the wall. extend_lease is the only path past it.
+```
+
+A lease is a hard wall (spec §3). At T-drain the control plane sends the agent
+`drain` (and the agent self-drains on its own clock if the CP is dark); at T-0
+it destroys the provider instance and **verifies it is gone by polling the
+provider API — whether or not the agent ever responded**. A reconcile loop
+lists real instances every interval and auto-kills any the registry does not
+own (a hung agent, a dead tunnel, a wedged box). An idle reaper drains and
+destroys a worker sitting idle past its threshold. Every lease and teardown
+writes a cost record; `spend_status` reads the ledger.
+
+Local E2 uses the `mock` provider, which launches the agent binary as real
+processes, so provider-verified destroy is genuinely real (the OS process is
+provably gone) — including the `kill -STOP` hung-agent case. The `vast` driver
+is written to the same trait; a real 15-minute Vast lease is the live E2 test.
+
+Set `CHUK_TRAIN_PROVIDERS`, `CHUK_TRAIN_AGENT_BIN` (mock), `CHUK_TRAIN_VAST_API_KEY`
+(vast). `CHUK_TRAIN_RECONCILE_S`, `CHUK_TRAIN_IDLE_REAP_S`, and
+`CHUK_TRAIN_DRAIN_WINDOW_MIN` override timings for fast local runs.
+
 ## Current limits (deliberate — see spec §14)
 
-No lease walls, packing, budgets, or provider provisioning yet; one run in
-flight per worker; logs/metrics are dropped while the control plane is dark.
-A dropped train run resumes from its last uploaded checkpoint; a dropped shell
-run restarts. M2 adds leases + provable cleanup; M3 packing; M4 budgets.
+No packing or budgets/caps yet; one run in flight per worker; logs/metrics are
+dropped while the control plane is dark. A dropped train run resumes from its
+last uploaded checkpoint; a dropped shell run restarts. M3 adds the packing
+scheduler; M4 adds budget caps + the one-page dashboard + watchdog gates.

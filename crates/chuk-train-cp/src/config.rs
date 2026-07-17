@@ -1,9 +1,13 @@
 //! Control-plane configuration, sourced entirely from environment variables.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chuk_train_proto::{env, DEFAULT_PORT};
+use chuk_train_proto::{
+    env, AGENT_WS_PATH, DEFAULT_DRAIN_WINDOW_MIN, DEFAULT_IDLE_REAP, DEFAULT_PORT,
+    DEFAULT_RECONCILE_INTERVAL,
+};
 
 const DEFAULT_STORE_SPEC: &str = "sqlite:chuk_train.db";
 const DEFAULT_ARTIFACTS_SPEC: &str = "file:./chuk_train_artifacts";
@@ -12,6 +16,7 @@ const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 const FALLBACK_PORT_VAR: &str = "PORT";
 /// Public base URL for building fetchable artifact URLs (spec §6 artifact_url).
 const PUBLIC_URL_VAR: &str = "CHUK_TRAIN_PUBLIC_URL";
+const DEFAULT_PROVIDERS: &str = "mock";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -25,6 +30,21 @@ pub struct Config {
     pub public_url: String,
     pub host: IpAddr,
     pub port: u16,
+    // -- M2 lease/provider config -----------------------------------------
+    /// Comma-separated provider selection (e.g. `mock`, `mock,vast`).
+    pub providers: String,
+    /// Websocket URL provisioned workers dial back on.
+    pub agent_ws_url: String,
+    /// Agent binary the mock provider launches (None → auto-detect).
+    pub agent_bin: Option<String>,
+    /// Vast API key (VastProvider only).
+    pub vast_api_key: Option<String>,
+    /// Minutes reserved at the end of a lease for drain.
+    pub drain_window_min: f64,
+    /// How often the reconcile loop runs.
+    pub reconcile_interval: Duration,
+    /// Idle-reaper threshold.
+    pub idle_reap: Duration,
 }
 
 impl Config {
@@ -52,6 +72,23 @@ impl Config {
         // for local dev when no explicit public URL is set.
         let public_url =
             std::env::var(PUBLIC_URL_VAR).unwrap_or_else(|_| format!("http://127.0.0.1:{port}"));
+
+        let providers =
+            std::env::var(env::PROVIDERS).unwrap_or_else(|_| DEFAULT_PROVIDERS.to_owned());
+        let agent_ws_url = std::env::var(env::AGENT_WS_URL)
+            .unwrap_or_else(|_| format!("ws://127.0.0.1:{port}{AGENT_WS_PATH}"));
+        let agent_bin = std::env::var(env::AGENT_BIN).ok();
+        let vast_api_key = std::env::var(env::VAST_API_KEY).ok();
+        let reconcile_interval =
+            duration_from_env(env::RECONCILE_INTERVAL_S, DEFAULT_RECONCILE_INTERVAL)?;
+        let idle_reap = duration_from_env(env::IDLE_REAP_S, DEFAULT_IDLE_REAP)?;
+        let drain_window_min = match std::env::var(env::DRAIN_WINDOW_MIN) {
+            Ok(raw) => raw
+                .parse()
+                .with_context(|| format!("parsing {}", env::DRAIN_WINDOW_MIN))?,
+            Err(_) => DEFAULT_DRAIN_WINDOW_MIN,
+        };
+
         Ok(Self {
             api_token,
             join_token,
@@ -60,7 +97,24 @@ impl Config {
             public_url,
             host,
             port,
+            providers,
+            agent_ws_url,
+            agent_bin,
+            vast_api_key,
+            drain_window_min,
+            reconcile_interval,
+            idle_reap,
         })
+    }
+}
+
+fn duration_from_env(var: &str, default: Duration) -> Result<Duration> {
+    match std::env::var(var) {
+        Ok(raw) => {
+            let secs: f64 = raw.parse().with_context(|| format!("parsing {var}"))?;
+            Ok(Duration::from_secs_f64(secs))
+        }
+        Err(_) => Ok(default),
     }
 }
 

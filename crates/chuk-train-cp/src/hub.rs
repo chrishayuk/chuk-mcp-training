@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use chuk_train_proto::{
-    AgentToCp, CheckpointMeta, CpToAgent, EventKind, Hardware, JobAssignment, ResumeInfo, RunId,
-    RunSpec, RunState, UploadGrant, WorkerId,
+    AgentToCp, CheckpointMeta, CpToAgent, EventKind, Hardware, JobAssignment, LeaseState,
+    ResumeInfo, RunId, RunSpec, RunState, UploadGrant, WorkerId,
 };
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
@@ -46,6 +46,15 @@ impl Hub {
 
     pub fn grants(&self) -> &GrantTable {
         &self.grants
+    }
+
+    /// Send a control message to one worker if it is connected; returns false
+    /// if there is no live link (e.g. the agent is already gone).
+    pub async fn send_to(&self, worker_id: &WorkerId, msg: CpToAgent) -> bool {
+        match self.links.lock().await.get(worker_id) {
+            Some(tx) => tx.send(msg).is_ok(),
+            None => false,
+        }
     }
 
     // ---- connection lifecycle ---------------------------------------------
@@ -102,6 +111,14 @@ impl Hub {
                 continue;
             };
             if worker.current_run.is_some() {
+                continue;
+            }
+            // A draining worker takes no new work (spec §4: past T-drain).
+            if worker
+                .lease
+                .as_ref()
+                .is_some_and(|l| l.state == LeaseState::Draining)
+            {
                 continue;
             }
             let Some(run) = self.store.next_queued().await? else {
@@ -231,6 +248,12 @@ impl Hub {
                     .await?;
                 self.store.set_worker_run(worker_id, None).await?;
                 self.pump().await?;
+            }
+            AgentToCp::Drained => {
+                // The worker has flushed + uploaded and stopped work. The lease
+                // manager still owns the provider-verified destroy at T-0 — the
+                // wall never depends on this message arriving.
+                info!(worker = %worker_id, "worker drained");
             }
         }
         Ok(())

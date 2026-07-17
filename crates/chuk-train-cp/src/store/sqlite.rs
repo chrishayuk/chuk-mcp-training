@@ -6,8 +6,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
     CheckpointInfo, CheckpointMeta, CodeRef, CodeUnitInfo, CodeUnitManifest, EventKind, Hardware,
-    MetricPoint, MetricSeries, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary,
-    UnixSeconds, WorkerId, WorkerInfo, WorkerState,
+    Lease, LeaseExtension, LeaseState, LedgerEntry, MetricPoint, MetricSeries, RunEvent, RunId,
+    RunRecord, RunSpec, RunState, RunSummary, UnixSeconds, WorkerId, WorkerInfo, WorkerState,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -76,10 +76,31 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   created_at   REAL NOT NULL,
   PRIMARY KEY (run_id, step)
 );
-CREATE INDEX IF NOT EXISTS idx_runs_state  ON runs (state, created_at);
-CREATE INDEX IF NOT EXISTS idx_events_run  ON run_events (run_id, seq);
-CREATE INDEX IF NOT EXISTS idx_metrics_run ON metrics (run_id, key, step);
-CREATE INDEX IF NOT EXISTS idx_ckpt_run    ON checkpoints (run_id, step);
+CREATE TABLE IF NOT EXISTS leases (
+  worker_id        TEXT PRIMARY KEY,
+  provider         TEXT NOT NULL,
+  instance_id      TEXT NOT NULL,
+  price_hr         REAL NOT NULL,
+  granted_min      REAL NOT NULL,
+  drain_window_min REAL NOT NULL,
+  started_at       REAL NOT NULL,
+  state            TEXT NOT NULL,
+  extensions       TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS ledger (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts           REAL NOT NULL,
+  worker_id    TEXT NOT NULL,
+  provider     TEXT NOT NULL,
+  event        TEXT NOT NULL,
+  minutes      REAL NOT NULL,
+  cost         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runs_state   ON runs (state, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_run   ON run_events (run_id, seq);
+CREATE INDEX IF NOT EXISTS idx_metrics_run  ON metrics (run_id, key, step);
+CREATE INDEX IF NOT EXISTS idx_ckpt_run     ON checkpoints (run_id, step);
+CREATE INDEX IF NOT EXISTS idx_leases_state ON leases (state);
 "#;
 
 /// Length of generated run ids (hex chars of a UUID4).
@@ -181,14 +202,25 @@ impl Store for SqliteStore {
             .bind(&id.0)
             .fetch_optional(&self.pool)
             .await?;
-        row.map(worker_from_row).transpose()
+        let Some(mut worker) = row.map(worker_from_row).transpose()? else {
+            return Ok(None);
+        };
+        worker.lease = self.lease(id).await?;
+        Ok(Some(worker))
     }
 
     async fn fleet(&self) -> Result<Vec<WorkerInfo>> {
         let rows = sqlx::query("SELECT * FROM workers ORDER BY joined_at")
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter().map(worker_from_row).collect()
+        let mut workers: Vec<WorkerInfo> = rows
+            .into_iter()
+            .map(worker_from_row)
+            .collect::<Result<_>>()?;
+        for worker in &mut workers {
+            worker.lease = self.lease(&worker.id).await?;
+        }
+        Ok(workers)
     }
 
     // ---- runs -------------------------------------------------------------
@@ -512,6 +544,125 @@ impl Store for SqliteStore {
         .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    // ---- leases -----------------------------------------------------------
+
+    async fn create_lease(&self, lease: &Lease) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO leases
+               (worker_id, provider, instance_id, price_hr, granted_min, drain_window_min,
+                started_at, state, extensions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(worker_id) DO UPDATE SET
+               provider=excluded.provider, instance_id=excluded.instance_id,
+               price_hr=excluded.price_hr, granted_min=excluded.granted_min,
+               drain_window_min=excluded.drain_window_min, started_at=excluded.started_at,
+               state=excluded.state, extensions=excluded.extensions",
+        )
+        .bind(&lease.worker_id.0)
+        .bind(&lease.provider)
+        .bind(&lease.instance_id)
+        .bind(lease.price_hr)
+        .bind(lease.granted_min)
+        .bind(lease.drain_window_min)
+        .bind(lease.started_at)
+        .bind(lease.state.as_str())
+        .bind(serde_json::to_string(&lease.extensions)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn lease(&self, worker_id: &WorkerId) -> Result<Option<Lease>> {
+        let row = sqlx::query("SELECT * FROM leases WHERE worker_id = ?1")
+            .bind(&worker_id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(lease_from_row).transpose()
+    }
+
+    async fn live_leases(&self) -> Result<Vec<Lease>> {
+        let rows = sqlx::query("SELECT * FROM leases WHERE state != ?1")
+            .bind(LeaseState::Destroyed.as_str())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(lease_from_row).collect()
+    }
+
+    async fn set_lease_state(&self, worker_id: &WorkerId, state: LeaseState) -> Result<()> {
+        sqlx::query("UPDATE leases SET state = ?2 WHERE worker_id = ?1")
+            .bind(&worker_id.0)
+            .bind(state.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn extend_lease(
+        &self,
+        worker_id: &WorkerId,
+        ext: LeaseExtension,
+    ) -> Result<Option<Lease>> {
+        let Some(mut lease) = self.lease(worker_id).await? else {
+            return Ok(None);
+        };
+        lease.extensions.push(ext);
+        sqlx::query("UPDATE leases SET extensions = ?2 WHERE worker_id = ?1")
+            .bind(&worker_id.0)
+            .bind(serde_json::to_string(&lease.extensions)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(Some(lease))
+    }
+
+    // ---- ledger -----------------------------------------------------------
+
+    async fn ledger_append(&self, entry: &LedgerEntry) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO ledger (ts, worker_id, provider, event, minutes, cost)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(entry.ts)
+        .bind(&entry.worker_id.0)
+        .bind(&entry.provider)
+        .bind(&entry.event)
+        .bind(entry.minutes)
+        .bind(entry.cost)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn ledger_entries(&self) -> Result<Vec<LedgerEntry>> {
+        let rows = sqlx::query("SELECT * FROM ledger ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| LedgerEntry {
+                ts: r.get("ts"),
+                worker_id: WorkerId(r.get("worker_id")),
+                provider: r.get("provider"),
+                event: r.get("event"),
+                minutes: r.get("minutes"),
+                cost: r.get("cost"),
+            })
+            .collect())
+    }
+}
+
+fn lease_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Lease> {
+    Ok(Lease {
+        worker_id: WorkerId(row.get("worker_id")),
+        provider: row.get("provider"),
+        instance_id: row.get("instance_id"),
+        price_hr: row.get("price_hr"),
+        granted_min: row.get("granted_min"),
+        drain_window_min: row.get("drain_window_min"),
+        started_at: row.get("started_at"),
+        state: enum_from_string(row.get::<String, _>("state"))?,
+        extensions: serde_json::from_str(&row.get::<String, _>("extensions"))?,
+    })
 }
 
 /// Stride-downsample to at most `max` points, always keeping the last point so
@@ -569,6 +720,8 @@ fn worker_from_row(row: sqlx::sqlite::SqliteRow) -> Result<WorkerInfo> {
         joined_at: row.get("joined_at"),
         last_seen,
         heartbeat_age_s: ((now() - last_seen) * 10.0).round() / 10.0,
+        // Populated by worker()/fleet() from the leases table after conversion.
+        lease: None,
     })
 }
 

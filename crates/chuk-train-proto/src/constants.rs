@@ -39,6 +39,25 @@ pub const UPLOAD_GRANT_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Default TTL for a signed artifact URL handed to a reader (lazarus pulls).
 pub const DEFAULT_ARTIFACT_URL_TTL: Duration = Duration::from_secs(3600);
 
+// -- leases (spec §3) -------------------------------------------------------
+
+/// Minutes reserved at the end of a lease for checkpoint + upload (T-drain).
+pub const DEFAULT_DRAIN_WINDOW_MIN: f64 = 5.0;
+/// Below this remaining time the scheduler stops assigning non-atomic jobs.
+pub const ASSIGN_CUTOFF_MIN: f64 = 10.0;
+/// A leased worker idle (empty queue, nothing assignable) this long is
+/// drained + destroyed early — the lease is a ceiling, not a commitment.
+pub const DEFAULT_IDLE_REAP: Duration = Duration::from_secs(10 * 60);
+/// How often the lease manager re-checks every lease's clock.
+pub const LEASE_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the reconcile loop diffs provider instances against the registry.
+pub const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// After calling destroy, how long to keep polling provider status for `Gone`
+/// before raising an orphan alert.
+pub const DESTROY_VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often to poll provider status while verifying a destroy.
+pub const DESTROY_VERIFY_POLL: Duration = Duration::from_secs(2);
+
 /// Default number of log lines returned by the tail endpoint.
 pub const DEFAULT_LOG_TAIL_LINES: u32 = 100;
 /// Default page size for run listings.
@@ -92,6 +111,20 @@ pub mod env {
     pub const ARTIFACTS_DIR: &str = "CHUK_TRAIN_ARTIFACTS";
     /// Directory the agent caches extracted code units in, keyed by sha.
     pub const AGENT_CACHE_DIR: &str = "CHUK_TRAIN_CACHE";
+    /// Reconcile-loop interval override (seconds); short values speed tests.
+    pub const RECONCILE_INTERVAL_S: &str = "CHUK_TRAIN_RECONCILE_S";
+    /// Idle-reaper threshold override (seconds).
+    pub const IDLE_REAP_S: &str = "CHUK_TRAIN_IDLE_REAP_S";
+    /// Drain-window override (minutes); short values speed local lease tests.
+    pub const DRAIN_WINDOW_MIN: &str = "CHUK_TRAIN_DRAIN_WINDOW_MIN";
+    /// Provider selection for the mock/real driver registry (e.g. "mock,vast").
+    pub const PROVIDERS: &str = "CHUK_TRAIN_PROVIDERS";
+    /// Vast API key (VastProvider only; VPS-side, never on workers).
+    pub const VAST_API_KEY: &str = "CHUK_TRAIN_VAST_API_KEY";
+    /// Control-plane websocket URL provisioned workers dial back on.
+    pub const AGENT_WS_URL: &str = "CHUK_TRAIN_AGENT_WS_URL";
+    /// Path to the agent binary the mock provider launches as fake instances.
+    pub const AGENT_BIN: &str = "CHUK_TRAIN_AGENT_BIN";
 }
 
 /// Environment variables the harness exports to a train entrypoint — the

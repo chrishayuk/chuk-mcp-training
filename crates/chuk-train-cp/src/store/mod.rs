@@ -12,7 +12,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
     CheckpointInfo, CheckpointMeta, CodeRef, CodeUnitInfo, CodeUnitManifest, EventKind, Hardware,
-    MetricSeries, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary, WorkerId, WorkerInfo,
+    Lease, LeaseExtension, LeaseState, LedgerEntry, MetricSeries, RunEvent, RunId, RunRecord,
+    RunSpec, RunState, RunSummary, WorkerId, WorkerInfo,
 };
 
 pub use sqlite::SqliteStore;
@@ -98,6 +99,24 @@ pub trait Store: Send + Sync {
     async fn latest_checkpoint(&self, run_id: &RunId) -> Result<Option<CheckpointInfo>>;
     /// Pin a checkpoint by step; returns false if no such checkpoint exists.
     async fn pin_checkpoint(&self, run_id: &RunId, step: u64, name: &str) -> Result<bool>;
+
+    // leases (spec §3)
+    async fn create_lease(&self, lease: &Lease) -> Result<()>;
+    async fn lease(&self, worker_id: &WorkerId) -> Result<Option<Lease>>;
+    /// Leases not yet destroyed (active or draining) — what the lease manager
+    /// and reconcile loop iterate.
+    async fn live_leases(&self) -> Result<Vec<Lease>>;
+    async fn set_lease_state(&self, worker_id: &WorkerId, state: LeaseState) -> Result<()>;
+    /// Append an extension and return the updated lease (None if no lease).
+    async fn extend_lease(
+        &self,
+        worker_id: &WorkerId,
+        ext: LeaseExtension,
+    ) -> Result<Option<Lease>>;
+
+    // ledger (spec §8)
+    async fn ledger_append(&self, entry: &LedgerEntry) -> Result<()>;
+    async fn ledger_entries(&self) -> Result<Vec<LedgerEntry>>;
 }
 
 /// Open a store from a URL-ish spec: `sqlite:path.db` (a bare path also means

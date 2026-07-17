@@ -9,6 +9,7 @@ use crate::domain::{
     ArtifactKind, CodeRef, EventKind, Hardware, RunId, RunSpec, RunState, UnixSeconds, WorkerId,
     WorkerState,
 };
+use crate::lease::Lease;
 use crate::manifest::{CheckpointMeta, CodeUnitManifest};
 
 // ---------------------------------------------------------------------------
@@ -55,6 +56,9 @@ pub enum AgentToCp {
         run_id: RunId,
         code: i64,
     },
+    /// The worker has drained (flushed logs/metrics, uploaded, stopped work) in
+    /// response to a `Drain` or its own lease clock (spec §7).
+    Drained,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,10 +68,25 @@ pub enum AgentToCp {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CpToAgent {
-    Registered { worker_id: WorkerId },
-    Rejected { reason: String },
-    Assign { job: JobAssignment },
-    Cancel { run_id: RunId },
+    Registered {
+        worker_id: WorkerId,
+    },
+    Rejected {
+        reason: String,
+    },
+    Assign {
+        job: JobAssignment,
+    },
+    Cancel {
+        run_id: RunId,
+    },
+    /// Wind down before the lease wall: stop taking new work, checkpoint +
+    /// upload the current job, then report `Drained` (spec §7). `deadline` is
+    /// the T-0 wall as a unix timestamp; the control plane destroys at T-0
+    /// regardless of whether the agent answered.
+    Drain {
+        deadline: UnixSeconds,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +148,9 @@ pub struct WorkerInfo {
     pub joined_at: UnixSeconds,
     pub last_seen: UnixSeconds,
     pub heartbeat_age_s: f64,
+    /// The worker's lease, if it was provisioned under one (spec §3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<Lease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -248,6 +270,40 @@ pub struct ArtifactInfo {
     pub sha: String,
     pub uri: String,
     pub created_at: UnixSeconds,
+}
+
+// ---------------------------------------------------------------------------
+// M2 REST payloads: leases, provisioning, spend
+// ---------------------------------------------------------------------------
+
+/// `extend_lease(worker_id, minutes, reason)` request (spec §6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtendLeaseRequest {
+    pub minutes: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+/// `teardown(worker_id, force)` request (spec §6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TeardownRequest {
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// A spend summary line, per provider (spec §8, minimal for M2's ledger).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpendLine {
+    pub provider: String,
+    pub committed: f64,
+    pub spent: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpendReport {
+    pub lines: Vec<SpendLine>,
+    pub total_committed: f64,
+    pub total_spent: f64,
 }
 
 #[cfg(test)]

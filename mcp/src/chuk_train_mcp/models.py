@@ -159,6 +159,72 @@ class SignedUrl(BaseModel):
     expires_at: float
 
 
+# -- M2: leases, provisioning, spend ---------------------------------------
+
+
+class LeaseState(StrEnum):
+    ACTIVE = "active"
+    DRAINING = "draining"
+    DESTROYED = "destroyed"
+
+
+class InstanceStatus(StrEnum):
+    RUNNING = "running"
+    GONE = "gone"
+    UNKNOWN = "unknown"
+
+
+class LeaseExtension(BaseModel):
+    minutes: float
+    at: float
+    reason: str = ""
+
+
+class Lease(BaseModel):
+    worker_id: str
+    provider: str
+    instance_id: str
+    price_hr: float
+    granted_min: float
+    drain_window_min: float
+    started_at: float
+    state: LeaseState
+    extensions: list[LeaseExtension] = Field(default_factory=list)
+
+
+class Offer(BaseModel):
+    id: str
+    provider: str
+    gpu: str
+    price_hr: float
+    vram_gb: int | None = None
+    region: str | None = None
+
+
+class ProvisionResult(BaseModel):
+    worker_id: str
+    lease: Lease
+    bootstrap: str = ""
+
+
+class TeardownResult(BaseModel):
+    worker_id: str
+    destroyed: bool
+    status: InstanceStatus
+
+
+class SpendLine(BaseModel):
+    provider: str
+    committed: float
+    spent: float
+
+
+class SpendReport(BaseModel):
+    lines: list[SpendLine] = Field(default_factory=list)
+    total_committed: float
+    total_spent: float
+
+
 class WorkerInfo(BaseModel):
     id: str
     labels: list[str]
@@ -168,6 +234,7 @@ class WorkerInfo(BaseModel):
     joined_at: float
     last_seen: float
     heartbeat_age_s: float
+    lease: "Lease | None" = None
 
 
 class RunSummary(BaseModel):
@@ -218,6 +285,23 @@ class PinCheckpointRequest(BaseModel):
     name: str
 
 
+class ProvisionRequest(BaseModel):
+    provider: str
+    lease_min: float
+    offer_id: str | None = None
+    gpu: str | None = None
+    max_price_hr: float | None = None
+
+
+class ExtendLeaseRequest(BaseModel):
+    minutes: float
+    reason: str = ""
+
+
+class TeardownRequest(BaseModel):
+    force: bool = False
+
+
 class SubmitRunResponse(BaseModel):
     run_id: str
 
@@ -237,3 +321,7 @@ class Envelope(BaseModel):
     @classmethod
     def failure(cls, error: str, detail: str | None = None) -> dict[str, Any]:
         return cls(ok=False, error=error, detail=detail).model_dump(exclude_none=True)
+
+
+# WorkerInfo.lease forward-references Lease (defined later); resolve it now.
+WorkerInfo.model_rebuild()

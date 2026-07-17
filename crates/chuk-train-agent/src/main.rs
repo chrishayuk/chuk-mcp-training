@@ -22,8 +22,8 @@ mod train;
 
 use anyhow::{Context, Result};
 use chuk_train_proto::{
-    AgentToCp, CpToAgent, WorkerId, HEARTBEAT_INTERVAL, RECONNECT_BACKOFF_MAX,
-    RECONNECT_BACKOFF_MIN,
+    AgentToCp, CpToAgent, WorkerId, DEFAULT_DRAIN_WINDOW_MIN, HEARTBEAT_INTERVAL,
+    RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
 };
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -49,6 +49,14 @@ struct Args {
     /// Comma-separated labels, e.g. colab,t4
     #[arg(long, default_value = "")]
     labels: String,
+    /// Lease budget in minutes. The agent self-drains at T-drain even with no
+    /// connectivity (belt); the control plane destroys at T-0 (braces).
+    #[arg(long)]
+    lease_min: Option<f64>,
+    /// Drain window in minutes (how far before T-0 to self-drain); the control
+    /// plane passes its own value so belt and braces agree.
+    #[arg(long)]
+    drain_window_min: Option<f64>,
 }
 
 #[tokio::main]
@@ -68,10 +76,27 @@ async fn main() -> Result<()> {
         .map(str::to_owned)
         .collect();
 
+    // The self-drain deadline (belt): computed once from process start so it
+    // survives reconnects. The control plane's Drain at T-drain and destroy at
+    // T-0 are the authoritative braces.
+    let drain_window_min = args.drain_window_min.unwrap_or(DEFAULT_DRAIN_WINDOW_MIN);
+    let self_drain_at = args.lease_min.map(|minutes| {
+        let secs = (minutes * 60.0 - drain_window_min * 60.0).max(0.0);
+        tokio::time::Instant::now() + std::time::Duration::from_secs_f64(secs)
+    });
+
     let mut worker_id = args.worker_id.map(WorkerId::from);
     let mut backoff = RECONNECT_BACKOFF_MIN;
     loop {
-        match session(&args.url, &args.token, worker_id.clone(), &labels).await {
+        match session(
+            &args.url,
+            &args.token,
+            worker_id.clone(),
+            &labels,
+            self_drain_at,
+        )
+        .await
+        {
             Ok(assigned_id) => {
                 // Keep the id the control plane assigned so reconnects
                 // present the same worker.
@@ -95,6 +120,7 @@ async fn session(
     token: &str,
     worker_id: Option<WorkerId>,
     labels: &[String],
+    self_drain_at: Option<tokio::time::Instant>,
 ) -> Result<WorkerId> {
     // REST origin for code-unit fetch and checkpoint upload, derived from the
     // same host we dial the websocket on.
@@ -125,6 +151,8 @@ async fn session(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Current job slot; aborting the handle kills the child (kill_on_drop).
     let mut current: Option<job::RunningJob> = None;
+    // Once draining, take no new work and report Drained (spec §7).
+    let mut draining = false;
 
     let session_result = loop {
         tokio::select! {
@@ -132,6 +160,18 @@ async fn session(
                 if sink.send(to_frame(&AgentToCp::Heartbeat)?).await.is_err() {
                     break Ok(());
                 }
+            }
+            // Self-drain belt: fire once at T-drain even if the control plane is
+            // dark. `pending()` when there is no lease so the branch never fires.
+            _ = async {
+                match self_drain_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            }, if !draining => {
+                warn!("lease T-drain reached; self-draining");
+                draining = true;
+                tx.send(AgentToCp::Drained).ok();
             }
             msg = outbound.recv() => {
                 let msg = msg.expect("tx lives in this scope");
@@ -141,6 +181,10 @@ async fn session(
             }
             inbound = next_message(&mut stream) => match inbound {
                 Some(CpToAgent::Assign { job }) => {
+                    if draining {
+                        warn!(run = %job.run_id, "assign received while draining; ignoring");
+                        continue;
+                    }
                     if current.as_ref().is_some_and(|j| !j.is_finished()) {
                         // The control plane never double-assigns; if it does,
                         // refuse loudly rather than corrupt the slot.
@@ -149,6 +193,11 @@ async fn session(
                     }
                     info!(run = %job.run_id, "assigned");
                     current = Some(job::spawn(job, tx.clone(), origin.clone()));
+                }
+                Some(CpToAgent::Drain { deadline }) => {
+                    info!(deadline, "drain requested by control plane");
+                    draining = true;
+                    tx.send(AgentToCp::Drained).ok();
                 }
                 Some(CpToAgent::Cancel { run_id }) => {
                     if let Some(job) = current.take() {
