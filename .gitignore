@@ -8,3 +8,7 @@
 .DS_Store
 .claude/settings.local.json
 /chuk_train_artifacts/
+# Local secrets/config — never commit; .env.example is the committed template.
+.env
+.env.*
+!.env.example

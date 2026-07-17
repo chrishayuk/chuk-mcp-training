@@ -6,9 +6,14 @@ import os
 from typing import Any, TypeVar
 
 import httpx
+from dotenv import find_dotenv, load_dotenv
 from pydantic import BaseModel, TypeAdapter
 
 from .constants import DEFAULT_CP_URL, ENV_API_TOKEN, ENV_CP_URL, HTTP_TIMEOUT_S
+
+# Load .env (searched upward from cwd) for local runs; harmless if none exists
+# or the vars are already set in the environment (existing vars win).
+load_dotenv(find_dotenv(usecwd=True))
 
 M = TypeVar("M", bound=BaseModel)
 

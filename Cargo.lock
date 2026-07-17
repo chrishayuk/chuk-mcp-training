@@ -257,6 +257,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chuk-train-proto",
+ "dotenvy",
  "futures-util",
  "hex",
  "reqwest",
