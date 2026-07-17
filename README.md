@@ -59,25 +59,24 @@ cd mcp && uv sync && CHUK_TRAIN_URL=http://127.0.0.1:8700 \
 
 Dashboard: <http://127.0.0.1:8700/> (paste the API token into the token box).
 
-## Deploy (Fly)
+## First real run: Colab (E0)
+
+Colab is the proving backend (spec §14) — units already paid for, no rental.
+Full runbook: **[docs/E0-colab.md](docs/E0-colab.md)**. In short:
 
 ```bash
 fly launch --no-deploy --copy-config -c deploy/fly.toml
-fly volumes create chuk_train_data --size 1
-fly secrets set CHUK_TRAIN_API_TOKEN=$(openssl rand -hex 24) \
-                CHUK_TRAIN_JOIN_TOKEN=$(openssl rand -hex 24)
+fly volumes create chuk_train_data --size 1 -c deploy/fly.toml
+fly secrets set -c deploy/fly.toml CHUK_TRAIN_API_TOKEN=$(openssl rand -hex 24) \
+                                   CHUK_TRAIN_JOIN_TOKEN=$(openssl rand -hex 24)
 fly deploy -c deploy/fly.toml --dockerfile deploy/Dockerfile
 ```
 
-Build the agent for workers (linux x86_64, static):
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-cargo build --release -p chuk-train-agent --target x86_64-unknown-linux-musl
-```
-
-Host the binary anywhere reachable, fill in `bootstrap/colab_cell.py`, paste it
-into a Colab notebook → the T4 appears in `fleet` and on the dashboard. That's E0.
+The Fly image builds both binaries and the **control plane serves the agent**
+at `/agent/linux-x86_64` — so the Colab cell needs only the Fly URL + join
+token. Fill those into `bootstrap/colab_cell.py`, paste it into a T4 notebook,
+and the worker appears in `fleet`. Submit the E0 probe (`nvidia-smi` + a matmul
+throughput run) with `submit_shell` and watch it stream via `tail_logs`.
 
 ## Train a run (E1)
 

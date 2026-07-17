@@ -1,23 +1,29 @@
-# --- chuk-train E0 bootstrap: paste this into one Colab cell -----------------
-# Downloads the static agent binary and joins this notebook's GPU to the fleet.
-# Until a GitHub release exists, host the binary anywhere reachable (R2 works)
-# and point AGENT_BINARY_URL at it. Build it with:
-#   cargo build --release -p chuk-train-agent --target x86_64-unknown-linux-musl
-
-CP_WSS_URL = "wss://YOUR-APP.fly.dev/ws/agent"
-JOIN_TOKEN = "PASTE_JOIN_TOKEN"
-AGENT_BINARY_URL = "https://YOUR-HOST/chuk-train-agent-x86_64-unknown-linux-musl"
-LABELS = "colab"
+# ── chuk-train · Colab worker bootstrap (E0) ────────────────────────────────
+# Paste this into ONE cell of a Colab notebook set to a GPU runtime (T4).
+# It downloads the agent from your control plane and joins the fleet. The cell
+# blocks while the agent runs — keep it running for the session's lifetime.
+#
+# Fill in two values from your Fly deploy:
+CP_URL = "https://YOUR-APP.fly.dev"     # your control plane
+JOIN_TOKEN = "PASTE_JOIN_TOKEN"         # the CHUK_TRAIN_JOIN_TOKEN fly secret
+LABELS = "colab,t4"                     # shows up in `fleet`
 
 import os
 import stat
 import subprocess
 import urllib.request
 
-AGENT_PATH = "/tmp/chuk-train-agent"
-urllib.request.urlretrieve(AGENT_BINARY_URL, AGENT_PATH)
-os.chmod(AGENT_PATH, os.stat(AGENT_PATH).st_mode | stat.S_IEXEC)
+base = CP_URL.rstrip("/")
+agent_path = "/tmp/chuk-train-agent"
+
+# 1. Download the agent binary the control plane serves (public, no auth).
+urllib.request.urlretrieve(base + "/agent/linux-x86_64", agent_path)
+os.chmod(agent_path, os.stat(agent_path).st_mode | stat.S_IEXEC)
+
+# 2. Derive the websocket URL and dial home (blocks; the agent runs here).
+ws_url = base.replace("https://", "wss://").replace("http://", "ws://") + "/ws/agent"
+print(f"[chuk-train] joining {ws_url} as '{LABELS}'…")
 subprocess.run(
-    [AGENT_PATH, "--url", CP_WSS_URL, "--token", JOIN_TOKEN, "--labels", LABELS],
+    [agent_path, "--url", ws_url, "--token", JOIN_TOKEN, "--labels", LABELS],
     check=False,
 )

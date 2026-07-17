@@ -24,7 +24,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::routing::{get, post, put};
 use axum::Router;
-use chuk_train_proto::{AGENT_WS_PATH, API_PREFIX, HEALTH_PATH};
+use chuk_train_proto::{AGENT_DOWNLOAD_PATH, AGENT_WS_PATH, API_PREFIX, HEALTH_PATH};
 use tracing::info;
 
 use crate::artifacts::{open_artifact_store, ArtifactStore};
@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(dash::page))
         .route(HEALTH_PATH, get(api::healthz))
+        .route(AGENT_DOWNLOAD_PATH, get(api::serve_agent))
         .route(AGENT_WS_PATH, get(ws::agent_ws))
         .nest(API_PREFIX, api_bearer.merge(api_grant))
         .with_state(state);

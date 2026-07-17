@@ -7,6 +7,10 @@ primary_region = "lhr"
 
 [env]
 CHUK_TRAIN_STORE = "sqlite:/data/chuk_train.db"
+CHUK_TRAIN_ARTIFACTS = "file:/data/artifacts"
+# Set after first deploy so artifact URLs + provisioned workers dial the real host:
+#   fly secrets set CHUK_TRAIN_PUBLIC_URL=https://<app>.fly.dev \
+#                   CHUK_TRAIN_AGENT_WS_URL=wss://<app>.fly.dev/ws/agent
 
 [http_service]
 internal_port = 8700

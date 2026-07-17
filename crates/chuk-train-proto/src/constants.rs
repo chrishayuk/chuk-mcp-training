@@ -11,6 +11,8 @@ pub const AGENT_WS_PATH: &str = "/ws/agent";
 pub const API_PREFIX: &str = "/api";
 /// Unauthenticated liveness probe.
 pub const HEALTH_PATH: &str = "/healthz";
+/// Unauthenticated download of the worker agent binary (public code, spec §12).
+pub const AGENT_DOWNLOAD_PATH: &str = "/agent/linux-x86_64";
 
 /// How often a connected agent sends a heartbeat.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
