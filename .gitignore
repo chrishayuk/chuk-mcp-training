@@ -1,0 +1,9 @@
+/target
+**/__pycache__/
+*.py[cod]
+.venv/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+.claude/settings.local.json

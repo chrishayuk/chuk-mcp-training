@@ -1,0 +1,24 @@
+[package]
+name = "chuk-train-cp"
+description = "chuk-mcp-training control plane daemon (M0): agent websocket, scheduler, run store, REST API, dashboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "chuk-train-cp"
+path = "src/main.rs"
+
+[dependencies]
+chuk-train-proto = { workspace = true }
+anyhow = { workspace = true }
+async-trait = "0.1"
+axum = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

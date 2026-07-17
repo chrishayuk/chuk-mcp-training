@@ -1,0 +1,10 @@
+[package]
+name = "chuk-train-proto"
+description = "Shared wire protocol, domain types, and constants for chuk-mcp-training"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

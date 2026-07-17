@@ -1,0 +1,21 @@
+[package]
+name = "chuk-train-agent"
+description = "chuk-train worker agent: dials out to the control plane, registers hardware, executes assigned runs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "chuk-train-agent"
+path = "src/main.rs"
+
+[dependencies]
+chuk-train-proto = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

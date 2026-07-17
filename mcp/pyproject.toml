@@ -1,0 +1,20 @@
+[project]
+name = "chuk-train-mcp"
+version = "0.1.0"
+description = "MCP tool surface for chuk-mcp-training — chuk-mcp-server thin client over the Rust control plane's REST API"
+requires-python = ">=3.11"
+dependencies = [
+    "chuk-mcp-server>=0.25.6",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+]
+
+[project.scripts]
+chuk-train-mcp = "chuk_train_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chuk_train_mcp"]

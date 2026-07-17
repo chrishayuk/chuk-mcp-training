@@ -1,0 +1,615 @@
+# chuk-mcp-training — Specification v0.4
+
+**MCP-controlled remote training harness for Colab and rented single GPUs**
+Built on `chuk-mcp-server` · Workers: Google Colab, Vast.ai, Lambda Cloud
+
+v0.4 changes: **proving-experiment ladder E0–E5** (§15) — small, real experiments at
+v11 scale that validate each milestone using assets that already exist; control plane
+hosted on **Fly.io** (§13) for remote dashboard access and UI control from anywhere.
+v0.3: unified artifact model (§11) — deployable code units, lineage-complete
+checkpoints, logs as retained artifacts.
+v0.2: control plane off the Mac; leases with hard walls and guaranteed cleanup; packing
+scheduler; cost governance and dashboard; lazarus reduced to the artifact contract.
+
+---
+
+## 1. Overview
+
+`chuk-mcp-training` is a control plane, exposed as an MCP server, that provisions
+**leased** GPU workers, packs queued experiments into those leases, and tears workers
+down — guaranteed — when the lease expires. A single pip-installable worker agent
+(`chuk-train-agent`) runs identically inside a Colab notebook, a Vast.ai container, or a
+Lambda instance, dials **out** to the control plane, and executes assigned jobs
+back-to-back until its lease ends.
+
+Session kinds: `train` (async job → checkpoints → metrics), `eval` (batch evaluation /
+panel deck against a checkpoint), `shell` (escape hatch, off by default).
+
+**chuk-mcp-lazarus stays a separate server.** The only coupling is the artifact
+contract (§10): the harness writes checkpoints with verifiable metadata; lazarus (on the
+Mac) reads them via one `load_checkpoint(run_id, step)` tool. No shared code, no proxy.
+
+### Design principles
+
+1. **Workers dial out, always.** All worker↔control-plane traffic is one outbound
+   websocket. No worker-side listener, ever.
+2. **One agent, every backend.** Only provisioning differs per provider; everything after
+   `agent --join <token>` is identical.
+3. **A lease is a wall.** Every worker is provisioned with a runtime budget. When it
+   expires: drain, checkpoint, upload, destroy. The only way past the wall is an explicit
+   `extend_lease` MCP call, which is a budget decision, not a default.
+4. **Pack the lease.** A rented GPU-hour is an asset to fill. The scheduler runs as many
+   queued experiments as fit, back-to-back, and pours leftover time into resumable
+   training slices. Utilization (busy GPU-min / leased GPU-min) is a first-class metric.
+5. **Teardown never depends on the agent.** Cleanup is control-plane-driven against the
+   provider API, idempotent, verified, and backed by a reconcile loop. A hung agent, a
+   dead tunnel, or a wedged instance still gets destroyed and stops billing.
+6. **Checkpoint-first.** Both backends preempt; every train job checkpoints on a step
+   schedule *and* on drain. A preempted or drained job is a re-queued job.
+7. **Multi-seed is first-class.** Sweeps fan out; cross-seed variance is queryable.
+8. **Gates as code.** Panel criteria are registered and evaluated by the control plane
+   from streamed metrics; watchdog gates auto-stop runaway runs.
+9. **chuk conventions.** `chuk-mcp-server`, `@tool`, Pydantic schemas, error envelopes.
+
+---
+
+## 2. Architecture
+
+```
+   Mac (client only)                        small VPS (always-on)
+   ┌──────────────────┐   MCP (HTTP)   ┌────────────────────────────────┐
+   │ Claude / mcp-cli ├───────────────►│ chuk-mcp-training              │
+   │ chuk-mcp-lazarus │                │  lease manager · packing sched │
+   │  (reads ckpts)   │                │  job queue · run registry      │
+   └────────┬─────────┘                │  metrics store · gate engine   │
+            │ signed URLs              │  budget/cost engine            │
+            ▼                          │  web dashboard (same process)  │
+   Artifact store (R2/B2) ◄────────────┤  provider drivers · reconciler │
+            ▲                          └───────┬────────────────────────┘
+            │ scoped uploads                   │ outbound WSS (agents join)
+   ┌────────┴──────────┬───────────────────────┴──────┐
+   ▼                   ▼                              ▼
+ Colab notebook    Vast.ai instance             Lambda instance
+ chuk-train-agent  chuk-train-agent             chuk-train-agent
+```
+
+The VPS is the only always-on component (SQLite + websocket server + static dashboard —
+a £4/mo box is enough). The Mac is purely a client: it drives the MCP tools, views the
+dashboard, and pulls checkpoints for lazarus. Provider API keys and store-registration
+credentials live only on the VPS; workers receive scoped, expiring upload tokens per job.
+
+---
+
+## 3. Leases
+
+A **lease** is the contract between a worker and its budget.
+
+```jsonc
+{
+  "worker_id": "vast-8821",
+  "provider": "vast",
+  "price_hr": 0.38,                 // dollars; colab leases price in compute units
+  "granted_min": 60,                // the runtime budget
+  "started_at": "...",
+  "drain_window_min": 5,            // reserved at the end for checkpoint + upload
+  "extensions": []                  // each: {minutes, granted_by, at, projected_cost}
+}
+```
+
+Lifecycle:
+
+- **T-10 min** — scheduler stops assigning jobs whose estimate doesn't fit; only
+  short atomic jobs or resumable slices may still start.
+- **T-drain** (default T-5) — `drain` sent to the agent: running train jobs get
+  `checkpoint_now` + stop; eval jobs get a grace period then kill; agent flushes logs
+  and metrics, uploads, reports `drained`.
+- **T-0** — control plane calls provider `destroy`, **whether or not the agent
+  responded**. Destroy is verified via the provider API (instance status polled until
+  gone); failure to verify raises an orphan alert and retries.
+- **Reconcile loop** (every 10 min, always) — list instances at each provider, diff
+  against the registry. Any billed instance the registry doesn't own, or owns but
+  believes destroyed, is an **orphan**: alert + auto-kill (configurable, default on).
+
+`extend_lease(worker_id, minutes)` is the *only* path past the wall. It re-checks the
+budget (projected additional spend vs remaining cap), records who/when/why in the lease,
+and reschedules the wall. Colab leases can be extended within platform limits only; the
+lease there is our own wall layered under Colab's session limits and priced in compute
+units.
+
+Idle reaper: a leased worker with an empty queue and no assignable jobs for
+`idle_reap_min` (default 10) is drained and destroyed early — the lease is a *ceiling*,
+not a commitment to burn.
+
+---
+
+## 4. Packing scheduler
+
+The queue holds many small jobs (spokes, seeds, evals, corpus builds — the hub-and-spoke
+programme is exactly this shape). The scheduler's objective: **maximize useful GPU-min
+per leased GPU-min.**
+
+**Job classes**
+
+- `atomic` — must complete within a single lease (evals, probes, corpus generation,
+  short finetunes). Carries `est_minutes` (stated on first submit; thereafter learned:
+  measured wall-time of prior runs of the same config/entrypoint, p90).
+- `resumable` — train jobs that slice across leases via checkpoints. These are the
+  **filler of last resort**: they can absorb any remaining lease time, run until drain,
+  checkpoint, and requeue with `from_step` advanced.
+
+**Assignment rule** (on worker-free or job-complete):
+
+1. Filter queue to jobs whose `requirements` fit the worker (VRAM, disk, labels).
+2. Prefer the highest-priority `atomic` job with `est_minutes × safety_factor`
+   (default 1.25) ≤ remaining lease minutes (before drain window).
+3. If none fit, assign the highest-priority `resumable` job — any remaining time is
+   useful time for it.
+4. If the queue is truly empty → idle reaper countdown starts.
+
+An atomic job that overruns its estimate into the drain window is killed at drain and
+marked `overran` (its learned estimate updates; it re-queues only if flagged
+`retry_on_overrun`). This is deliberate: the wall is the wall.
+
+**Batch submission**: `submit_batch([specs...])` enqueues a set with shared labels and a
+target lease plan — the control plane responds with a packing preview: "these 9 jobs ≈
+2× 60-min A6000 leases at ~$0.80 total; 1 resumable filler". You approve the provision
+(or it auto-provisions under `auto_provision` policy with a spend cap).
+
+**Utilization** is computed per lease and per provider-month:
+`busy_min / granted_min`, with drain and env-prep time broken out (env prep is overhead
+worth watching — image caching / pre-baked Vast templates are the fix if it grows).
+
+---
+
+## 5. Job model
+
+### 5.1 JobSpec (kind = train)
+
+```jsonc
+{
+  "name": "cn7-r1.1-masked-s81",
+  "kind": "train",
+  "class": "resumable",                  // "atomic" | "resumable"
+  "est_minutes": 90,                     // required for atomic; advisory for resumable
+  "priority": 5,                         // 1 (low) .. 9 (high)
+  "code": "cn7-trainer@sha256:ab12…",   // deployable code unit (§11); sugar form:
+                                         //   "repo": "…", "commit": "d045561" →
+                                         //   resolved + built into a unit at submit time
+  "entrypoint": "train",                 // named entrypoint from the unit's manifest
+  "config": "configs/r1_1_masked.yaml",
+  "overrides": { "seed": 81 },
+  "artifacts_in": [
+    { "name": "v11-base", "kind": "checkpoint" },
+    { "name": "r1.1-corpus", "kind": "dataset" }
+  ],
+  "requirements": { "min_vram_gb": 16, "cuda": true, "disk_gb": 30 },
+  "checkpoint": { "every_steps": 500, "keep_last": 3, "keep_every": 5000 },
+  "max_hours": 12,                       // cumulative across slices
+  "max_cost": 4.00,                      // cumulative; checkpoint-then-kill at cap
+  "labels": ["cn7", "spoke:numeracy"]
+}
+```
+
+Script contract unchanged: `$CHUK_CONFIG`, metrics JSONL to `$CHUK_METRICS`, checkpoints
+to `$CHUK_CKPT_DIR`, exit 0. Additionally the harness exports `$CHUK_RESUME_CKPT` when a
+slice resumes. ~5 lines to adopt.
+
+### 5.2 SweepSpec
+
+```jsonc
+{ "template": { ...JobSpec... },
+  "axes": { "overrides.seed": [80, 81, 82] },
+  "concurrency": 2 }
+```
+
+Sweep children inherit class/estimates; `sweep_status` aggregates cross-seed
+mean/std/range at matched steps; sweep-scope gates supported (multi-seed W_f rule).
+
+### 5.3 Lifecycle events
+
+`created, queued, assigned(worker, lease), started, sliced(from_step, to_step),
+heartbeat_lost, preempted, drained, resumed(from_step), checkpoint(step, uri, hash),
+gate_evaluated(gate, verdict), overran, cost_capped, completed, failed(reason),
+cancelled` — append-only per run; the provenance record.
+
+---
+
+## 6. MCP tool surface
+
+All chuk-mcp-server `@tool`, error envelopes throughout.
+
+### Leases, fleet, provisioning
+
+```python
+@tool
+def provider_offers(provider: str, gpu: str | None = None,
+                    max_price_hr: float | None = None) -> list[Offer]
+@tool
+def provision(provider: str, lease_min: int, offer_id: str | None = None,
+              gpu: str | None = None, max_price_hr: float | None = None) -> ProvisionResult
+              # returns worker ref + lease; colab → bootstrap cell text (lease still enforced)
+@tool
+def fleet() -> list[WorkerInfo]        # gpu, price_hr, lease remaining, current job, util
+@tool
+def lease_status(worker_id: str) -> Lease
+@tool
+def extend_lease(worker_id: str, minutes: int, reason: str = "") -> Lease
+@tool
+def teardown(worker_id: str, force: bool = False) -> Ack   # drain-first unless force
+```
+
+### Runs, sweeps, batches
+
+```python
+@tool
+def submit_run(spec: JobSpec, confirm_cost: bool = False) -> RunRef
+@tool
+def submit_sweep(spec: SweepSpec, confirm_cost: bool = False) -> SweepRef
+@tool
+def submit_batch(specs: list[JobSpec], auto_provision: bool = False,
+                 spend_cap: float | None = None) -> BatchPlan   # packing preview
+@tool
+def run_status(run_id: str) -> RunStatus
+@tool
+def sweep_status(sweep_id: str) -> SweepStatus
+@tool
+def run_metrics(run_id: str, keys: list[str] | None = None,
+                since_step: int = 0, downsample: int = 500) -> MetricSeries
+@tool
+def tail_logs(run_id: str, lines: int = 100) -> LogChunk
+@tool
+def stop_run(run_id: str, checkpoint_first: bool = True) -> Ack
+@tool
+def resume_run(run_id: str, from_step: int | None = None) -> RunRef
+@tool
+def run_events(run_id: str) -> list[Event]
+```
+
+### Budgets & spend
+
+```python
+@tool
+def spend_status(period: str = "month") -> SpendReport
+     # per provider + per label: spent, committed (live leases), projected, cap, headroom
+@tool
+def set_budget(scope: str, cap: float, period: str = "month") -> Ack
+     # scope: "provider:vast" | "label:cn7" | "global"; colab caps in compute units
+@tool
+def utilization(period: str = "month") -> UtilReport   # busy/granted, overhead breakdown
+```
+
+### Checkpoints, artifacts, gates
+
+```python
+@tool
+def list_checkpoints(run_id: str) -> list[CheckpointInfo]
+@tool
+def pin_checkpoint(run_id: str, step: int, name: str) -> Ack
+@tool
+def build_code_unit(repo: str, commit: str, name: str | None = None) -> CodeUnitRef
+     # tarball + uv.lock + manifest, hashed, uploaded; agents cache by hash
+@tool
+def register_artifact(name: str, kind: str, uri: str, hash: str) -> Ack
+@tool
+def list_artifacts(kind: str | None = None, name: str | None = None) -> list[ArtifactInfo]
+@tool
+def artifact_lineage(ref: str, direction: str = "up") -> LineageGraph
+     # "up": everything this was built from; "down": everything built from this
+@tool
+def artifact_url(name: str, ttl_min: int = 60) -> SignedUrl    # lazarus pulls via this
+@tool
+def register_gate(scope_id: str, name: str, expr: str, scope: str = "run",
+                  action: str = "record") -> Ack   # action: "record" | "stop_run"
+@tool
+def check_gates(scope_id: str) -> list[GateVerdict]
+```
+
+Watchdogs are gates with `action="stop_run"`: `isnan(last(loss))`,
+`no_improve(loss, 120min)`, `last(grad_norm) > 1e3`. Auto-stop always checkpoints first.
+
+---
+
+## 7. Agent protocol
+
+Single outbound WSS; JSON messages; per-worker monotonic sequence numbers; reconnect
+replays from last acked seq. **The agent must tolerate a dark control plane**: if the
+websocket drops, it keeps executing the current job, keeps checkpointing on schedule,
+buffers metrics/logs to disk, and reconciles on reconnect. Local lease enforcement: the
+agent knows its own wall time and self-drains at T-drain even with no connectivity —
+belt; the provider-API destroy at T-0 is braces.
+
+Worker → CP: `register, heartbeat, log, metric, checkpoint_uploaded, job_started,
+job_exited(code), drained`.
+CP → worker: `assign(job), cancel(job), checkpoint_now, drain(deadline), resume(from),
+credentials(scoped, expiring)`.
+
+Heartbeat loss > 90s ⇒ `unreachable`; running resumable job on an unreachable worker
+past 10 min ⇒ `preempted` + re-queue (the checkpoint schedule bounds the loss).
+
+---
+
+## 8. Cost governance
+
+- **Budget objects**: global, per-provider, per-label caps per period. `provision`,
+  `extend_lease`, and `auto_provision` all check *projected* spend (live leases count as
+  committed) against headroom and refuse on breach.
+- **Pre-flight estimates**: submissions above a configurable threshold require
+  `confirm_cost=True`; sweeps and batches show the multiplied total.
+- **Per-job `max_cost`**: cumulative across slices; breach ⇒ checkpoint-then-kill,
+  event `cost_capped`.
+- **Colab compute units**: tracked as their own currency; per-GPU-class burn rates
+  configurable (they drift); dashboard gauge shows estimated units remaining.
+- **The three leaks, closed**: forgotten instances (lease wall + idle reaper + reconcile
+  orphan-kill), runaway runs (watchdog gates + max_hours/max_cost), sweep multiplication
+  (pre-flight multiplied estimate + confirm flag).
+- **Ledger**: every lease and extension writes a cost record; `spend_status` is computed
+  from the ledger, not from provider billing APIs (those reconcile monthly as a check).
+
+---
+
+## 9. Dashboard
+
+Served by the control plane process itself (FastAPI + htmx/SSE; no Grafana stack to
+babysit; metrics JSONL remains exportable if that ever changes). One page, four bands:
+
+1. **Fleet** — per worker: GPU, $/hr ticking cost, lease remaining (countdown), current
+   job, utilization bar, **kill button** (one click, unconditional, drain-first with a
+   force option).
+2. **Runs** — live loss sparklines, step rate, last checkpoint age; sweeps show seed
+   bands (mean ± range) on shared axes.
+3. **Money** — budget burn-down per provider and per label; committed vs spent vs
+   projected month-end; Colab units gauge.
+4. **Health** — gate verdict board (panel + watchdogs), orphan alerts, queue depth,
+   utilization trend.
+
+The MCP tools (`fleet`, `spend_status`, `run_metrics`, `check_gates`) are the same
+queries — conversational surface and dashboard read one store.
+
+---
+
+## 10. Lazarus integration (artifact contract only)
+
+Separate servers; the entire interface is the checkpoint layout:
+
+```
+runs/<run_id>/ckpt/step_<n>/
+  model.safetensors
+  optim.pt                 # optional; excluded from lazarus pulls
+  meta.json                # commit, config_hash, seed, step, tokenizer_hash, arch
+```
+
+chuk-mcp-lazarus gains one tool, `load_checkpoint(run_id, step | pin_name)`, which
+resolves via `artifact_url`, downloads `model.safetensors` + `meta.json`, **verifies
+tokenizer_hash against the local tokenizer artifact and refuses mismatches** (the CN-7
+day-1 class of bug becomes a load-time error), and loads into the existing MLX path.
+
+What this buys immediately: training-dynamics archaeology — any of the lazarus tool
+surface (fingerprint rank, probes, decode_residual) run against step 0/5k/10k/…
+checkpoints on the Mac, async, on owned hardware. Live on-GPU probing and
+lazarus-on-rented-GPU are explicitly out of scope for this repo; if wanted later they are
+new decisions, not latent features here.
+
+---
+
+## 11. Artifact model & storage
+
+Everything the rig moves is a **typed, content-addressed artifact with recorded
+lineage**. Kinds: `code`, `env`, `dataset`, `checkpoint`, `metrics`, `logs`, `deck`
+(panel/eval outputs). Identity is the content hash; names and pins are pointers.
+
+### 11.1 Code units — the deployable unit
+
+"Clone repo + pip install" fails three ways at once: it's repeated per lease (env-prep
+overhead), it drifts (unpinned transitive deps make yesterday's run unreproducible), and
+it can't be containerized uniformly (Vast is docker-first, Colab can't run docker). The
+deployable unit is therefore **Python-level, with the container as an optional cache**:
+
+```
+code unit  =  tarball of repo@commit
+           +  uv.lock (fully pinned, hashes included)
+           +  unit.toml manifest:
+                name, version
+                entrypoints = { train = "python train.py",
+                                eval_deck = "python eval.py", … }
+                python = "3.11"
+                requires = { cuda = ">=12", min_vram_gb = 16 }   # defaults for jobs
+unit id    =  sha256 over the tarball
+```
+
+- Built by `build_code_unit(repo, commit)` on the control plane (or CI on push) →
+  `artifacts/code/<name>/<sha>/`.
+- **Agents cache by hash** — a warm worker starts the next packed job in seconds; this
+  is where the packing scheduler's env-prep overhead goes to die.
+- On Vast, an `env` artifact may map the unit's dep-set to a pre-baked docker image
+  (image digest recorded); on Colab the same unit installs from the lockfile into the
+  session. **Same hash, two substrates, one behaviour.**
+- JobSpec accepts `repo`+`commit` sugar (resolved to a unit at submit) so quick
+  iteration never requires a manual build step.
+
+### 11.2 Checkpoints — lineage-complete
+
+`meta.json` grows from "enough to load" to "enough to reproduce":
+
+```jsonc
+{
+  "step": 15000, "seed": 81, "arch": "tinymodel-v11",
+  "code": "cn7-trainer@sha256:ab12…",
+  "config_hash": "…", "tokenizer_hash": "…",
+  "parent_checkpoint": "v11-base@sha256:…",        // resume/base lineage
+  "datasets": ["r1.1-corpus@sha256:…"],
+  "run_id": "…", "slices": [[0, 9500], [9500, 15000]]
+}
+```
+
+Every number on a panel is mechanically traceable to exact code, corpus, tokenizer,
+base, and seed. The tokenizer-hash check stays a load-time refusal in lazarus.
+
+### 11.3 Logs & metrics as artifacts
+
+Live logs stream over the agent websocket; at drain/completion each slice's log is
+compressed and uploaded (`logs` kind), indexed by run + slice. `tail_logs` serves live
+from the stream, historical from the artifact. Retention per kind: logs 90 days,
+metrics indefinite (small), checkpoints per keep-policy, **code units indefinite** —
+they are the reproducibility substrate. `pin` exempts anything from retention.
+
+### 11.4 Lineage queries
+
+`artifact_lineage(ref)` walks the graph both ways. "Up" answers *what produced this
+checkpoint*. "Down" answers *what did this corpus contaminate* — the query you reach
+for the day a corpus bug is found, returning every run, checkpoint, and panel deck
+downstream of the bad hash.
+
+### 11.5 Storage layout (S3-compatible; R2 preferred for zero egress)
+
+```
+s3://chuk-train/
+  artifacts/
+    code/<name>/<sha>/{unit.tar.zst, unit.toml, uv.lock}
+    env/<name>/<sha>.json                # docker image digest / colab install recipe
+    datasets/<name>/<sha>/...
+    decks/<name>/<sha>/...
+  runs/<run_id>/
+    spec.json
+    events.jsonl
+    metrics.jsonl.zst
+    logs/slice_<k>.log.zst
+    ckpt/step_<n>/{model.safetensors, optim.pt, meta.json}
+  pins/<name>  -> artifact or checkpoint ref
+  ledger/<yyyy-mm>.jsonl                 # cost records
+```
+
+Workers upload with credentials scoped to `runs/<run_id>/` and read scoped to declared
+`artifacts_in` plus their assigned code unit. Reads (Mac pulling checkpoints) dominate
+long-term — R2's zero egress is the argument. ~500MB/checkpoint with optimizer state at
+115M scale.
+
+---
+
+## 12. Security
+
+- Join tokens: single-use, short-lived, minted per provision; exchanged for a worker
+  credential bound to worker id + lease.
+- Provider keys, HF tokens, store-admin credentials: VPS only, never on workers.
+- `shell` sessions: off by default, explicit server-config allow.
+- Rented GPUs are untrusted hardware: only public code/data ships to them.
+- Dashboard + MCP HTTP endpoint behind auth (token header; optionally Cloudflare Access
+  in front of the VPS).
+
+---
+
+## 13. Rig topology
+
+- **Control plane on Fly.io**: one `shared-cpu-1x` machine (a few $/mo), Dockerfile +
+  `fly.toml`, **auto-stop OFF** (agents need the WSS endpoint up 24/7). SQLite on a Fly
+  volume; nightly snapshot to R2 (`ledger/` and `events.jsonl` are mirrored there
+  anyway, so the machine is rebuildable from the repo + one restore). Secrets (provider
+  keys, R2 creds) via `fly secrets`. DNS: `train.chukai.io` → Fly app (WSS for agents;
+  HTTPS for MCP endpoint + dashboard). This is what makes the dashboard reachable from
+  anywhere — phone included — and MCP control possible remotely.
+- **Auth**: Fly gives TLS, not auth — the app enforces a bearer token on the MCP
+  endpoint and session auth on the dashboard; optionally Cloudflare Access in front of
+  the domain for a second layer. Agent WSS auth is the join-token exchange, unchanged.
+- **Alternative**: any small always-on VPS works identically; nothing in the design is
+  Fly-specific beyond the deploy files.
+- **Mac (M3 Max)**: client only — mcp-cli/Claude driving tools, dashboard in a browser,
+  chuk-mcp-lazarus pulling checkpoints. Nothing breaks when it sleeps.
+- **Artifact store**: R2/B2, off-site; the home uplink is never in the checkpoint path.
+- **Workers**: ephemeral by construction — leased, packed, drained, destroyed.
+- **Backups**: nightly SQLite snapshot + `ledger/` already in object storage; the VPS is
+  rebuildable from a repo + one restore.
+
+---
+
+## 14. Build order
+
+**Colab is the proving backend** — the account already exists, the marginal cost is
+units already paid for, and E0/E1 exercise the entire agent/checkpoint/resume machinery
+without renting anything. No dollar leaves the building until M2/E2.
+
+1. **M0** — Fly control plane skeleton: registry, queue, WSS endpoint; agent join +
+   heartbeat; `fleet`, `tail_logs`. Prove the pull loop on a Colab T4.
+2. **M1** — `train` end-to-end: code-unit build + agent hash-cache, JobSpec, metrics
+   tailing, checkpoint upload with lineage `meta.json`, resume-after-kill on Colab
+   (close the tab; job re-queues and resumes from the uploaded checkpoint).
+3. **M2** — **leases + cleanup**: lease walls, drain protocol, provider-verified destroy,
+   reconcile loop + orphan kill, idle reaper. Vast driver (`provider_offers`,
+   `provision`, `teardown`). *Test: rent 15 min on Vast, confirm the instance is
+   provably gone at T-0 with the agent deliberately hung.*
+4. **M3** — **packing**: job classes, learned estimates, assignment rule, resumable
+   slicing, `submit_batch` preview, utilization metric. *Test: 6 short evals + 1
+   resumable train packed into one 60-min lease, ≥85% utilization.*
+5. **M4** — budgets + dashboard: ledger, caps, `spend_status`, watchdog gates, the
+   one-page dashboard.
+6. **M5** — sweeps + panel gates; lazarus `load_checkpoint` + tokenizer-hash
+   verification; first training-dynamics probe curve. Lambda driver.
+
+M2 before M3 deliberately: **cleanup is trusted before packing makes leases busy.**
+
+---
+
+## 15. Proving experiments (E0–E5)
+
+Principle: **prove the rig at v11 scale** — 115M params, TinyStories, jobs measured in
+minutes, checkpoints ~500MB. Every experiment uses assets that already exist (v11 base,
+R1.1-style corpus, frozen greedy-continuation deck, W_f fitting code). Nothing larger
+runs until E5 passes. Each E gates its milestone; the milestone isn't done until its E
+is green.
+
+- **E0 · join loop** *(gates M0)* — bootstrap the agent on a Colab T4; `fleet` shows
+  it with correct GPU/VRAM; a `shell` job (allow-flagged for this test only) runs
+  `nvidia-smi` plus a 30-second matmul throughput probe; logs stream live through
+  `tail_logs`. Minutes; costs only Colab units.
+
+- **E1 · first real job** *(gates M1)* — single-seed W_f finetune on v11 (the CN-1
+  addressing fit) as an `atomic` job on Colab: code unit built from the existing repo,
+  `v11-base` and the corpus registered as artifacts, checkpoint lands in R2 with full
+  lineage `meta.json` (tokenizer hash included). Then the resume test: **close the
+  Colab tab mid-run** — job re-queues, resumes from the uploaded checkpoint, completes.
+  Acceptance: final novel|seen rank matches a Mac-run reference within seed noise
+  (~90s–30min of GPU; the {93, 208} variance lesson says compare distributions, not
+  points).
+
+- **E2 · the wall** *(gates M2)* — cheapest Vast GPU on a **15-minute lease**; one
+  frozen greedy-continuation deck as an atomic eval. Then re-run with the agent
+  deliberately hung (`kill -STOP` on the process): confirm provider-verified destroy at
+  T-0, reconcile loop reports zero orphans, and the ledger shows total spend ≈ $0.10.
+  This is the experiment that earns trust in cleanup before packing makes leases busy.
+
+- **E3 · packing showcase** *(gates M3)* — one 60-minute Vast lease packed with: a
+  3-seed W_f sweep (atomic; estimates learned from E1) + two panel-deck evals + a
+  resumable R1.1-style midtrain slice as filler. Acceptance: ≥85% utilization,
+  cross-seed std reported by `sweep_status` (the multi-seed W_f gate as a query), the
+  filler slice checkpointed and re-queued at drain. This experiment **is** the current
+  manual workflow, mechanized — if E3 is green the rig already pays rent.
+
+- **E4 · money & watchdogs** *(gates M4)* — submit a deliberately diverging run (10×
+  LR): the watchdog gate checkpoints-then-kills within its window and the event log
+  shows why. Set a $1 cap on a test label and submit a batch projected at $2:
+  `submit_batch` refuses with the projection. Sanity-check the Colab units gauge
+  against observed unit drain over one session.
+
+- **E5 · first new science** *(gates M5)* — an R1.1 remix midtrain (3 seeds) run
+  entirely on the rig with save-every checkpoints; panel gates registered and evaluated
+  by the control plane; lazarus `load_checkpoint` pulls the step ladder to the Mac and
+  produces the first **training-dynamics curve** — fingerprint rank vs training step
+  (when does addressing form?). Acceptance: a result quotable in the CN log whose
+  provenance comes entirely from `artifact_lineage`, with no hand-kept notes required.
+
+E0–E2 should cost under a pound total; E3–E5 a few pounds. The ladder is deliberately
+boring until E5 — the rig earns the right to run new science by first re-running old
+science identically.
+
+---
+
+## 16. Open questions
+
+- Name: `chuk-mcp-training` stands now that lazarus is fully separate.
+- Estimate learning: p90 of prior wall-times per (entrypoint, config-hash, gpu-class) —
+  is gpu-class normalization needed day one, or only once the fleet is heterogeneous?
+- Auto-provision policy: allow the scheduler to rent under a cap when queue depth × est
+  time exceeds a threshold, or keep provisioning strictly human/MCP-initiated? (v0.2
+  default: strictly initiated; `auto_provision` exists but ships off.)
+- Vast template images: pre-baked docker image with common deps to cut env-prep overhead
+  — measure first via the utilization overhead breakout.
+- Colab unit burn rates: config table vs scraped — start with a config table and
+  reconcile against observed unit drain.
