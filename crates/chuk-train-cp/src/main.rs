@@ -8,6 +8,7 @@
 
 mod api;
 mod artifacts;
+mod auth;
 mod codeunit;
 mod config;
 mod dash;
@@ -116,7 +117,10 @@ async fn main() -> Result<()> {
         .layer(axum::extract::DefaultBodyLimit::disable());
 
     let app = Router::new()
-        .route("/", get(dash::page))
+        .route("/", get(dash::dashboard))
+        .route("/auth/login", get(auth::login))
+        .route("/auth/callback", get(auth::callback))
+        .route("/auth/logout", get(auth::logout))
         .route(HEALTH_PATH, get(api::healthz))
         .route(AGENT_DOWNLOAD_PATH, get(api::serve_agent))
         .route(AGENT_WS_PATH, get(ws::agent_ws))

@@ -62,8 +62,11 @@ Things we've hit or know are soft, roughly by priority:
   destroy) and confirm the Vast driver against the live API.
 - **Retention + pinning** — enforce checkpoint keep-policies (`keep_last`/`keep_every`)
   and `pin` exemptions; nothing prunes R2 yet.
-- **Auth hardening** — Cloudflare Access in front of the dashboard/MCP endpoint (spec
-  §12); rotate join/API tokens; scope grants tighter.
+- **Auth hardening** — the dashboard is gated by app-level **Google OAuth** (email
+  allowlist; session cookie), keeping MCP/agents on tokens. Remaining: Cloudflare Access
+  as an outer layer if wanted (the Cloudflare plugin at
+  `developers.cloudflare.com/agent-setup` can configure it); rotate join/API tokens;
+  scope grants tighter.
 - **Observability** — structured request logging, a `/metrics` endpoint, orphan/gate
   alerting beyond log lines.
 - **Tests** — integration tests for the agent↔CP protocol and the lease state machine;

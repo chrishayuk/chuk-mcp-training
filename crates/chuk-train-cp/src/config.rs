@@ -45,6 +45,21 @@ pub struct Config {
     pub reconcile_interval: Duration,
     /// Idle-reaper threshold.
     pub idle_reap: Duration,
+    // -- dashboard auth (Google OAuth) ------------------------------------
+    /// Google OAuth client id/secret; when both are set, the dashboard is
+    /// gated behind Google sign-in. When unset, the dashboard falls back to
+    /// the API-token box (local dev).
+    pub google_client_id: Option<String>,
+    pub google_client_secret: Option<String>,
+    /// Emails permitted to view the dashboard.
+    pub allowed_emails: Vec<String>,
+}
+
+impl Config {
+    /// Dashboard Google sign-in is enforced only when a client is configured.
+    pub fn auth_enabled(&self) -> bool {
+        self.google_client_id.is_some() && self.google_client_secret.is_some()
+    }
 }
 
 impl Config {
@@ -89,6 +104,13 @@ impl Config {
             Err(_) => DEFAULT_DRAIN_WINDOW_MIN,
         };
 
+        let allowed_emails = std::env::var(env::ALLOWED_EMAILS)
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         Ok(Self {
             api_token,
             join_token,
@@ -104,6 +126,13 @@ impl Config {
             drain_window_min,
             reconcile_interval,
             idle_reap,
+            google_client_id: std::env::var(env::GOOGLE_CLIENT_ID)
+                .ok()
+                .filter(|s| !s.is_empty()),
+            google_client_secret: std::env::var(env::GOOGLE_CLIENT_SECRET)
+                .ok()
+                .filter(|s| !s.is_empty()),
+            allowed_emails,
         })
     }
 }

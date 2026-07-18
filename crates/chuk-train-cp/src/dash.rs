@@ -4,12 +4,41 @@
 //! localStorage. Reads the same `/api/*` the MCP tools do; state-changing
 //! actions (teardown) go through the bearer API.
 
-use axum::response::Html;
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+
+use crate::AppState;
 
 const REFRESH_MS: u32 = 5000;
 
-pub async fn page() -> Html<String> {
-    Html(PAGE.replace("{REFRESH_MS}", &REFRESH_MS.to_string()))
+/// Serve the dashboard. When Google sign-in is configured, a valid session
+/// cookie is required (else redirect to login); otherwise the API-token box is
+/// shown (local dev).
+pub async fn dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if state.config.auth_enabled() {
+        match crate::auth::session_email(&state, &headers) {
+            Some(email) => Html(render(Some(&email), true)).into_response(),
+            None => Redirect::to("/auth/login").into_response(),
+        }
+    } else {
+        Html(render(None, false)).into_response()
+    }
+}
+
+fn render(user: Option<&str>, auth_enabled: bool) -> String {
+    let header_right = if auth_enabled {
+        format!(
+            r#"<span class="sub">{}</span> <a class="logout" href="/auth/logout">sign out</a>"#,
+            user.unwrap_or("")
+        )
+    } else {
+        r#"<input id="tok" type="password" placeholder="API token" autocomplete="off">"#.to_owned()
+    };
+    PAGE.replace("{REFRESH_MS}", &REFRESH_MS.to_string())
+        .replace("{HEADER_RIGHT}", &header_right)
 }
 
 const PAGE: &str = r####"<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -33,6 +62,9 @@ header .spacer{flex:1}
 header input{background:var(--surface);color:var(--ink);border:1px solid var(--ring);
   border-radius:6px;padding:.35rem .55rem;width:20rem;font-family:inherit}
 header .dot{font-size:.8rem;color:var(--muted)}
+header .logout{color:var(--muted);text-decoration:none;font-size:.85rem;
+  border:1px solid var(--ring);border-radius:6px;padding:.3rem .6rem}
+header .logout:hover{color:var(--ink);border-color:var(--ink2)}
 main{padding:1.25rem 1.5rem;max-width:1200px;margin:0 auto}
 section{margin-bottom:1.75rem}
 h2{font-size:.78rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
@@ -65,7 +97,7 @@ td.num{font-variant-numeric:tabular-nums}
   <h1>chuk-mcp-training</h1><span class="sub">operator dashboard</span>
   <span class="spacer"></span>
   <span class="dot" id="beat">—</span>
-  <input id="tok" type="password" placeholder="API token" autocomplete="off">
+  {HEADER_RIGHT}
 </header>
 <main>
   <section id="health"><h2>Health</h2><div class="tiles" id="healthTiles"></div></section>
@@ -78,11 +110,17 @@ td.num{font-variant-numeric:tabular-nums}
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const $ = id => document.getElementById(id);
-$("tok").value = localStorage.tok || "";
-$("tok").addEventListener("change", e => { localStorage.tok = e.target.value; tick(); });
+const tokBox = $("tok");                 // absent when signed in via Google (cookie auth)
+if (tokBox){
+  tokBox.value = localStorage.tok || "";
+  tokBox.addEventListener("change", e => { localStorage.tok = e.target.value; tick(); });
+}
 
 async function api(path, opts){
-  const headers = {Authorization: "Bearer " + (localStorage.tok || "")};
+  // Same-origin cookie carries the Google session; the bearer token is only
+  // needed when the dashboard is token-gated (no sign-in configured).
+  const headers = {};
+  if (localStorage.tok) headers.Authorization = "Bearer " + localStorage.tok;
   if (opts && opts.body) headers["Content-Type"] = "application/json";
   for (let attempt = 0; attempt < 2; attempt++){
     try{

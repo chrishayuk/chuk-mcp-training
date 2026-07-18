@@ -58,13 +58,17 @@ pub async fn require_bearer(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let authorized = request
+    let by_token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix(BEARER_PREFIX))
         .is_some_and(|token| token == state.config.api_token);
-    if !authorized {
+    // A logged-in dashboard (Google session cookie) may read/act without the
+    // API token; MCP + agents keep using the token.
+    let by_session = state.config.auth_enabled()
+        && crate::auth::session_email(&state, request.headers()).is_some();
+    if !(by_token || by_session) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(ApiError {

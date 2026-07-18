@@ -133,6 +133,12 @@ pub mod env {
     pub const S3_SECRET_ACCESS_KEY: &str = "CHUK_TRAIN_S3_SECRET_ACCESS_KEY";
     /// Control-plane websocket URL provisioned workers dial back on.
     pub const AGENT_WS_URL: &str = "CHUK_TRAIN_AGENT_WS_URL";
+    /// Google OAuth web-client id (dashboard sign-in). Auth is off if unset.
+    pub const GOOGLE_CLIENT_ID: &str = "CHUK_TRAIN_GOOGLE_CLIENT_ID";
+    /// Google OAuth web-client secret.
+    pub const GOOGLE_CLIENT_SECRET: &str = "CHUK_TRAIN_GOOGLE_CLIENT_SECRET";
+    /// Comma-separated allowlist of emails permitted to view the dashboard.
+    pub const ALLOWED_EMAILS: &str = "CHUK_TRAIN_ALLOWED_EMAILS";
     /// Path to the agent binary the mock provider launches as fake instances.
     pub const AGENT_BIN: &str = "CHUK_TRAIN_AGENT_BIN";
 }
