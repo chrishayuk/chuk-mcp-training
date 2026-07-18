@@ -1,15 +1,39 @@
-# chuk-mcp-training — Specification v0.4
+# chuk-mcp-training — Specification v0.5
 
 **MCP-controlled remote training harness for Colab and rented single GPUs**
-Built on `chuk-mcp-server` · Workers: Google Colab, Vast.ai, Lambda Cloud
+Control plane + worker agent in **Rust** (axum · tokio · sqlx) · MCP tool surface in
+**Python** on `chuk-mcp-server` (thin client over the control plane's REST API) ·
+Workers: Google Colab, Vast.ai, Lambda Cloud
 
-v0.4 changes: **proving-experiment ladder E0–E5** (§15) — small, real experiments at
-v11 scale that validate each milestone using assets that already exist; control plane
-hosted on **Fly.io** (§13) for remote dashboard access and UI control from anywhere.
-v0.3: unified artifact model (§11) — deployable code units, lineage-complete
-checkpoints, logs as retained artifacts.
-v0.2: control plane off the Mac; leases with hard walls and guaranteed cleanup; packing
+v0.5 changes (implementation reality): the control plane and agent are **Rust**, not a
+Python/FastAPI process — only the MCP tool surface is Python. The dashboard (§9) is
+served by the Rust control plane (static HTML + fetch/SSE), not FastAPI+htmx. The
+artifact store (§11.5) runs on **Cloudflare R2** with **presigned direct transfer**
+(workers PUT/GET checkpoints straight to R2; bytes never touch the control plane). Adds
+a `colab_cell` tool (the control plane generates the paste-ready bootstrap cell) and
+serves the agent binary itself at `/agent/linux-x86_64`. See **§0 Implementation status**.
+v0.4: **proving-experiment ladder E0–E5** (§15); control plane hosted on **Fly.io** (§13).
+v0.3: unified artifact model (§11) — deployable code units, lineage-complete checkpoints.
+v0.2: control plane off the Mac; leases with hard walls + guaranteed cleanup; packing
 scheduler; cost governance and dashboard; lazarus reduced to the artifact contract.
+
+---
+
+## 0. Implementation status (v0.5, 2026-07-18)
+
+| Milestone | State | Gate | Proven |
+|-----------|-------|------|--------|
+| **M0** join loop, fleet, shell, logs | ✅ done | E0 | **on real Colab T4** — agent joins, `nvidia-smi` + matmul probe, live logs |
+| **M1** train: code units, metrics, lineage checkpoints, resume | ✅ done | E1 | **core on real Colab T4** — v11 (115M) trains on CUDA, metrics stream, 3× ~460 MB checkpoints to R2 with full lineage; **resume test pending** (needs a mid-run tab bounce) |
+| **M2** leases + provable cleanup | ✅ done | E2 | **locally via a mock provider** (launches real agent processes: drain, T-0 verified destroy with the agent hung, reconcile/orphan-kill, ledger); **live Vast E2 not yet run** (costs $) |
+| **M3** packing scheduler | ⬜ not started | E3 | — |
+| **M4** budgets + dashboard | 🟡 partial | E4 | ledger + `spend_status` done (in M2); **caps, watchdog gates, and the one-page dashboard not done** (only a M0 stub dashboard exists) |
+| **M5** sweeps + panel gates + lazarus `load_checkpoint` + dynamics curve | ⬜ not started | E5 | — |
+
+Deployed: control plane on Fly (`chuk-mcp-training.fly.dev`), SQLite on a volume,
+artifacts on R2. Providers: `mock` (tested), `vast` (skeleton, untested against the live
+API). Not yet built: the packing scheduler (M3), budget caps + watchdog gates + the
+real dashboard (M4), sweeps + lazarus integration + Lambda driver (M5).
 
 ---
 
@@ -526,21 +550,26 @@ long-term — R2's zero egress is the argument. ~500MB/checkpoint with optimizer
 units already paid for, and E0/E1 exercise the entire agent/checkpoint/resume machinery
 without renting anything. No dollar leaves the building until M2/E2.
 
-1. **M0** — Fly control plane skeleton: registry, queue, WSS endpoint; agent join +
-   heartbeat; `fleet`, `tail_logs`. Prove the pull loop on a Colab T4.
-2. **M1** — `train` end-to-end: code-unit build + agent hash-cache, JobSpec, metrics
+1. **M0** ✅ — Fly control plane skeleton: registry, queue, WSS endpoint; agent join +
+   heartbeat; `fleet`, `tail_logs`. Prove the pull loop on a Colab T4. *(E0 green on a
+   real Colab T4.)*
+2. **M1** ✅ — `train` end-to-end: code-unit build + agent hash-cache, JobSpec, metrics
    tailing, checkpoint upload with lineage `meta.json`, resume-after-kill on Colab
-   (close the tab; job re-queues and resumes from the uploaded checkpoint).
-3. **M2** — **leases + cleanup**: lease walls, drain protocol, provider-verified destroy,
+   (close the tab; job re-queues and resumes from the uploaded checkpoint). *(E1 core
+   green on a real Colab T4: v11 trains, checkpoints to R2 with lineage; the tab-bounce
+   resume test is the remaining check.)*
+3. **M2** ✅ — **leases + cleanup**: lease walls, drain protocol, provider-verified destroy,
    reconcile loop + orphan kill, idle reaper. Vast driver (`provider_offers`,
    `provision`, `teardown`). *Test: rent 15 min on Vast, confirm the instance is
-   provably gone at T-0 with the agent deliberately hung.*
-4. **M3** — **packing**: job classes, learned estimates, assignment rule, resumable
+   provably gone at T-0 with the agent deliberately hung.* *(Verified locally via a mock
+   provider that launches real agent processes; the live Vast E2 has not been run.)*
+4. **M3** ⬜ — **packing**: job classes, learned estimates, assignment rule, resumable
    slicing, `submit_batch` preview, utilization metric. *Test: 6 short evals + 1
    resumable train packed into one 60-min lease, ≥85% utilization.*
-5. **M4** — budgets + dashboard: ledger, caps, `spend_status`, watchdog gates, the
-   one-page dashboard.
-6. **M5** — sweeps + panel gates; lazarus `load_checkpoint` + tokenizer-hash
+5. **M4** 🟡 — budgets + dashboard: ledger, caps, `spend_status`, watchdog gates, the
+   one-page dashboard. *(Ledger + `spend_status` done in M2; caps, watchdog gates, and
+   the real dashboard remain — only a M0 stub dashboard exists.)*
+6. **M5** ⬜ — sweeps + panel gates; lazarus `load_checkpoint` + tokenizer-hash
    verification; first training-dynamics probe curve. Lambda driver.
 
 M2 before M3 deliberately: **cleanup is trusted before packing makes leases busy.**

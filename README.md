@@ -1,14 +1,17 @@
 # chuk-mcp-training
 
 MCP-controlled remote training harness for Colab and rented single GPUs.
-Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.4). This repo is at **M2**:
-leased workers with a hard wall — drain at T-drain, provider-verified destroy
-at T-0 (even with the agent hung), a reconcile loop that auto-kills orphaned
-instances, an idle reaper, and a cost ledger — on top of M1 train runs (code
-units, metrics, lineage checkpoints, resume) and the M0 join loop. Verified
-locally against the **E0**, **E1**, and **E2** ladders (E2 via a mock provider
-that launches real agent processes; the Vast driver awaits live-credential
-verification).
+Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.5) · status + plan: `ROADMAP.md`.
+
+Milestones **M0–M2** are built; the control plane is deployed on Fly
+(`chuk-mcp-training.fly.dev`) with checkpoints in Cloudflare R2. Proven on real
+hardware: **E0** (agent joins a Colab T4, `nvidia-smi` + matmul probe, live
+logs) and the core of **E1** (v11 — 115M params — trains on the T4, metrics
+stream, ~460 MB checkpoints upload directly to R2 with lineage-complete
+`meta.json`). **M2** (leases, drain, provider-verified destroy, reconcile /
+orphan-kill, ledger) is verified locally via a mock provider that launches real
+agent processes; the live Vast E2 hasn't been run. Next: finish the E1 resume
+test, then M4 (dashboard + budget caps) and M3 (packing). See `ROADMAP.md`.
 
 **Stack:** Rust control plane + Rust worker agent; the MCP tool surface is
 Python on `chuk-mcp-server`, a thin client over the control plane's REST API.
