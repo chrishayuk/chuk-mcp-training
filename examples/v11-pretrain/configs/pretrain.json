@@ -1,0 +1,10 @@
+{
+  "total_tokens": 300000,
+  "batch_size": 8,
+  "seq_len": 256,
+  "lr": 3e-4,
+  "seed": 42,
+  "checkpoint_every_steps": 50,
+  "log_every_steps": 10,
+  "dataset": "roneneldan/TinyStories"
+}
