@@ -7,10 +7,12 @@ primary_region = "lhr"
 
 [env]
 CHUK_TRAIN_STORE = "sqlite:/data/chuk_train.db"
-CHUK_TRAIN_ARTIFACTS = "file:/data/artifacts"
-# Set after first deploy so artifact URLs + provisioned workers dial the real host:
-#   fly secrets set CHUK_TRAIN_PUBLIC_URL=https://<app>.fly.dev \
-#                   CHUK_TRAIN_AGENT_WS_URL=wss://<app>.fly.dev/ws/agent
+# Artifacts (checkpoints) live in R2, not on this box (spec §11.5). Set via
+# `fly secrets` so the credentials stay off the repo:
+#   fly secrets set CHUK_TRAIN_ARTIFACTS=r2://<bucket> \
+#     CHUK_TRAIN_S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com \
+#     CHUK_TRAIN_S3_ACCESS_KEY_ID=... CHUK_TRAIN_S3_SECRET_ACCESS_KEY=...
+# Also (already set): CHUK_TRAIN_PUBLIC_URL, CHUK_TRAIN_AGENT_WS_URL.
 
 [http_service]
 internal_port = 8700
