@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any, TypeVar
 
@@ -10,6 +11,12 @@ from dotenv import find_dotenv, load_dotenv
 from pydantic import BaseModel, TypeAdapter
 
 from .constants import DEFAULT_CP_URL, ENV_API_TOKEN, ENV_CP_URL, HTTP_TIMEOUT_S
+
+# Retry transient failures — connection errors, timeouts, 5xx — with backoff.
+# The shared Fly machine occasionally errors briefly (e.g. during checkpoint
+# ingest); 4xx (bad token, not found) are not retried.
+_MAX_ATTEMPTS = 4
+_RETRY_BACKOFF_S = 0.25
 
 # Load .env (searched upward from cwd) for local runs; harmless if none exists
 # or the vars are already set in the environment (existing vars win).
@@ -47,13 +54,22 @@ class ControlPlaneClient:
     async def _request(self, method: str, path: str, *,
                        params: dict[str, Any] | None = None,
                        json: dict[str, Any] | None = None) -> Any:
-        try:
-            response = await self._http().request(method, path, params=params, json=json)
-        except httpx.HTTPError as exc:
-            raise ControlPlaneError("request_failed", repr(exc)) from exc
-        if response.status_code >= 400:
-            raise ControlPlaneError(f"http_{response.status_code}", response.text[:500])
-        return response.json()
+        last: ControlPlaneError | None = None
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                response = await self._http().request(method, path, params=params, json=json)
+            except httpx.HTTPError as exc:
+                last = ControlPlaneError("request_failed", repr(exc))
+            else:
+                if response.status_code < 400:
+                    return response.json()
+                error = ControlPlaneError(f"http_{response.status_code}", response.text[:500])
+                if response.status_code < 500:
+                    raise error  # client error — retrying won't help
+                last = error
+            if attempt < _MAX_ATTEMPTS - 1:
+                await asyncio.sleep(_RETRY_BACKOFF_S * (2 ** attempt))
+        raise last  # exhausted retries on a transient failure
 
     async def get_model(self, path: str, model: type[M],
                         params: dict[str, Any] | None = None) -> M:
