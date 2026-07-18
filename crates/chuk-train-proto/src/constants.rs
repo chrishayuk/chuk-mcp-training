@@ -123,6 +123,14 @@ pub mod env {
     pub const PROVIDERS: &str = "CHUK_TRAIN_PROVIDERS";
     /// Vast API key (VastProvider only; VPS-side, never on workers).
     pub const VAST_API_KEY: &str = "CHUK_TRAIN_VAST_API_KEY";
+    /// S3/R2 endpoint, e.g. `https://<account>.r2.cloudflarestorage.com`.
+    pub const S3_ENDPOINT: &str = "CHUK_TRAIN_S3_ENDPOINT";
+    /// S3/R2 signing region (R2 uses `auto`).
+    pub const S3_REGION: &str = "CHUK_TRAIN_S3_REGION";
+    /// S3/R2 access key id (R2 API token access key).
+    pub const S3_ACCESS_KEY_ID: &str = "CHUK_TRAIN_S3_ACCESS_KEY_ID";
+    /// S3/R2 secret access key (R2 API token secret).
+    pub const S3_SECRET_ACCESS_KEY: &str = "CHUK_TRAIN_S3_SECRET_ACCESS_KEY";
     /// Control-plane websocket URL provisioned workers dial back on.
     pub const AGENT_WS_URL: &str = "CHUK_TRAIN_AGENT_WS_URL";
     /// Path to the agent binary the mock provider launches as fake instances.

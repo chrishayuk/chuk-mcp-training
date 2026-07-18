@@ -509,7 +509,7 @@ pub async fn artifact_url(
 ) -> Response {
     let ttl =
         std::time::Duration::from_secs(params.ttl_s.unwrap_or(DEFAULT_ARTIFACT_URL_TTL.as_secs()));
-    let native = match state.artifacts.presign_get(&params.key, ttl) {
+    let native = match state.artifacts.presign_get(&params.key, ttl).await {
         Ok(url) => url,
         Err(error) => return bad_request(&error.to_string()),
     };

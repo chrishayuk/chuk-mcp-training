@@ -9,7 +9,9 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chuk_train_proto::ApiError;
+use chuk_train_proto::{
+    ApiError, BlobMethod, BlobUrlRequest, BlobUrlResponse, API_PREFIX, DEFAULT_ARTIFACT_URL_TTL,
+};
 
 use crate::grant::Grant;
 use crate::AppState;
@@ -60,6 +62,65 @@ pub async fn fetch(
         )
             .into_response(),
     }
+}
+
+/// `POST /api/blob_url` — where should the worker transfer this blob? With an
+/// S3/R2 backend this is a presigned URL the worker hits directly; with the
+/// filesystem backend it points back at this control plane's upload/fetch.
+pub async fn blob_url(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<BlobUrlRequest>,
+) -> Response {
+    let Some(grant) = authorize(&state, &headers) else {
+        return unauthorized();
+    };
+    let allowed = match req.method {
+        BlobMethod::Put => grant.may_write(&req.key),
+        BlobMethod::Get => grant.may_read(&req.key),
+    };
+    if !allowed {
+        return forbidden();
+    }
+
+    let presigned = match req.method {
+        BlobMethod::Put => {
+            state
+                .artifacts
+                .presign_put(&req.key, DEFAULT_ARTIFACT_URL_TTL)
+                .await
+        }
+        BlobMethod::Get => {
+            state
+                .artifacts
+                .presign_get(&req.key, DEFAULT_ARTIFACT_URL_TTL)
+                .await
+        }
+    };
+    let response = match presigned {
+        Ok(Some(signed)) => BlobUrlResponse {
+            url: signed.url,
+            requires_grant_header: false,
+        },
+        Ok(None) => {
+            // Filesystem backend: fall back to transferring through the control
+            // plane, which needs the grant token on the request.
+            let action = match req.method {
+                BlobMethod::Put => "upload",
+                BlobMethod::Get => "fetch",
+            };
+            let base = state.config.public_url.trim_end_matches('/');
+            BlobUrlResponse {
+                url: format!("{base}{API_PREFIX}/{action}/{}", req.key),
+                requires_grant_header: true,
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, key = req.key, "presign failed");
+            return internal();
+        }
+    };
+    Json(response).into_response()
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> Option<Grant> {

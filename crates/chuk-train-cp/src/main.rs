@@ -105,9 +105,15 @@ async fn main() -> Result<()> {
         ));
 
     // Grant-authenticated surface: workers uploading/fetching their own blobs.
+    // Checkpoints are ~440 MB at 115M scale (spec §11.5), so the default 2 MB
+    // body limit is disabled here. (Streaming to disk / direct-to-R2 is the
+    // proper scale fix; buffered upload with adequate machine RAM suffices for
+    // the proving runs.)
     let api_grant = Router::new()
         .route("/upload/{*key}", put(upload::upload))
-        .route("/fetch/{*key}", get(upload::fetch));
+        .route("/fetch/{*key}", get(upload::fetch))
+        .route("/blob_url", post(upload::blob_url))
+        .layer(axum::extract::DefaultBodyLimit::disable());
 
     let app = Router::new()
         .route("/", get(dash::page))

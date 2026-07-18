@@ -1,11 +1,14 @@
 //! Artifact blob store: content-addressed byte storage behind an adapter
 //! trait, mirroring the metadata `Store` seam.
 //!
-//! M1 ships the filesystem backend (one Fly volume). `s3:` / `r2:` is reserved
-//! for the off-box backend the spec argues for (§11.5, R2 zero-egress) — it
-//! slots in behind this trait without touching callers.
+//! Backends: filesystem (`file:`, local dev — a control-plane volume) and
+//! S3-compatible (`s3:` / `r2:`, spec §11.5 — R2 preferred for zero egress).
+//! With the S3 backend, workers upload/download **directly** via presigned
+//! URLs (spec §12: scoped, expiring), so ~500 MB checkpoints never transit the
+//! control plane.
 
 mod fs;
+mod s3;
 
 /// Store-relative key layout lives in the shared protocol crate so the agent
 /// uploads to the exact paths the control plane serves.
@@ -19,6 +22,7 @@ use chuk_train_proto::SignedUrl;
 use sha2::{Digest, Sha256};
 
 pub use fs::FsArtifactStore;
+pub use s3::S3ArtifactStore;
 
 const SCHEME_FILE: &str = "file:";
 const SCHEME_S3: &str = "s3:";
@@ -35,21 +39,30 @@ pub trait ArtifactStore: Send + Sync {
     async fn exists(&self, key: &str) -> Result<bool>;
     /// The durable storage uri for `key` (no existence check).
     fn uri(&self, key: &str) -> String;
-    /// A backend-native time-limited fetch URL, or `None` when the backend has
-    /// none (the filesystem backend has none — the control plane serves those
-    /// bytes from its own authenticated `/api/blob` endpoint instead).
-    fn presign_get(&self, _key: &str, _ttl: Duration) -> Result<Option<SignedUrl>> {
+    /// A time-limited direct-download URL, or `None` when the backend has none
+    /// (the filesystem backend has none — the control plane serves those bytes
+    /// itself). Agents and lazarus fetch large artifacts through this.
+    async fn presign_get(&self, _key: &str, _ttl: Duration) -> Result<Option<SignedUrl>> {
+        Ok(None)
+    }
+    /// A time-limited direct-upload URL, or `None` when the backend has none
+    /// (filesystem — the agent falls back to uploading through the control
+    /// plane). Workers PUT checkpoint bytes straight to this.
+    async fn presign_put(&self, _key: &str, _ttl: Duration) -> Result<Option<SignedUrl>> {
         Ok(None)
     }
 }
 
 /// Open an artifact store from a URL-ish spec: `file:/path` (or a bare path)
-/// for the filesystem backend; `s3:`/`r2:` reserved.
+/// for the filesystem backend; `s3://bucket` / `r2://bucket` for S3-compatible
+/// (endpoint, region, and credentials come from the environment).
 pub fn open_artifact_store(spec: &str) -> Result<Box<dyn ArtifactStore>> {
-    if spec.starts_with(SCHEME_S3) || spec.starts_with(SCHEME_R2) {
-        anyhow::bail!(
-            "s3/r2 artifact backend is reserved for a later milestone; use file: for now"
-        );
+    if let Some(bucket) = spec
+        .strip_prefix(SCHEME_S3)
+        .or_else(|| spec.strip_prefix(SCHEME_R2))
+    {
+        let bucket = bucket.trim_start_matches('/');
+        return Ok(Box::new(S3ArtifactStore::from_env(bucket)?));
     }
     let root = spec.strip_prefix(SCHEME_FILE).unwrap_or(spec);
     Ok(Box::new(FsArtifactStore::new(root)))

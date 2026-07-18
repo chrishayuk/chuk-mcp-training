@@ -1,8 +1,14 @@
 //! Grant-authorised blob transfer against the control plane's REST API.
 //! The agent holds only a run-scoped grant token — never the API token.
+//!
+//! Every transfer is presign-first: the agent asks the control plane where to
+//! send/get a blob (`/api/blob_url`). With an S3/R2 backend that is a presigned
+//! URL the agent hits directly, so ~500 MB checkpoints never transit the
+//! control plane; with the filesystem backend it points back at the control
+//! plane and the agent attaches its grant token.
 
 use anyhow::{Context, Result};
-use chuk_train_proto::API_PREFIX;
+use chuk_train_proto::{BlobMethod, BlobUrlRequest, BlobUrlResponse, API_PREFIX};
 
 const BEARER_PREFIX: &str = "Bearer ";
 
@@ -23,38 +29,55 @@ impl HttpClient {
         }
     }
 
-    fn url(&self, action: &str, key: &str) -> String {
-        format!("{}{API_PREFIX}/{action}/{key}", self.origin)
+    fn bearer(&self) -> String {
+        format!("{BEARER_PREFIX}{}", self.token)
     }
 
-    /// `GET /api/fetch/<key>` — download a blob the grant may read.
-    pub async fn fetch(&self, key: &str) -> Result<Vec<u8>> {
-        let response = self
+    /// Ask the control plane where to transfer `key` in the given direction.
+    async fn blob_url(&self, method: BlobMethod, key: &str) -> Result<BlobUrlResponse> {
+        let plan = self
             .http
-            .get(self.url("fetch", key))
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("{BEARER_PREFIX}{}", self.token),
-            )
+            .post(format!("{}{API_PREFIX}/blob_url", self.origin))
+            .header(reqwest::header::AUTHORIZATION, self.bearer())
+            .json(&BlobUrlRequest {
+                key: key.to_owned(),
+                method,
+            })
             .send()
             .await
-            .with_context(|| format!("fetching {key}"))?;
-        let response = response
+            .with_context(|| format!("requesting blob url for {key}"))?
+            .error_for_status()
+            .with_context(|| format!("requesting blob url for {key}"))?
+            .json::<BlobUrlResponse>()
+            .await
+            .with_context(|| format!("parsing blob url for {key}"))?;
+        Ok(plan)
+    }
+
+    /// Download a blob the grant may read (code unit, resume checkpoint).
+    pub async fn fetch(&self, key: &str) -> Result<Vec<u8>> {
+        let plan = self.blob_url(BlobMethod::Get, key).await?;
+        let mut req = self.http.get(&plan.url);
+        if plan.requires_grant_header {
+            req = req.header(reqwest::header::AUTHORIZATION, self.bearer());
+        }
+        let response = req
+            .send()
+            .await
+            .with_context(|| format!("fetching {key}"))?
             .error_for_status()
             .with_context(|| format!("fetching {key}"))?;
         Ok(response.bytes().await?.to_vec())
     }
 
-    /// `PUT /api/upload/<key>` — upload a blob into the grant's run tree.
+    /// Upload a blob into the grant's run tree (a checkpoint file).
     pub async fn upload(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
-        self.http
-            .put(self.url("upload", key))
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("{BEARER_PREFIX}{}", self.token),
-            )
-            .body(bytes)
-            .send()
+        let plan = self.blob_url(BlobMethod::Put, key).await?;
+        let mut req = self.http.put(&plan.url).body(bytes);
+        if plan.requires_grant_header {
+            req = req.header(reqwest::header::AUTHORIZATION, self.bearer());
+        }
+        req.send()
             .await
             .with_context(|| format!("uploading {key}"))?
             .error_for_status()

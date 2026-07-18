@@ -13,6 +13,8 @@ path = "src/main.rs"
 chuk-train-proto = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
+aws-sdk-s3 = "1"
+aws-smithy-types = "1"
 axum = { workspace = true }
 dotenvy = "0.15"
 futures-util = { workspace = true }

@@ -314,6 +314,32 @@ pub struct ColabCell {
     pub cell: String,
 }
 
+/// Which direction a worker wants to transfer a blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobMethod {
+    Put,
+    Get,
+}
+
+/// A worker asking the control plane where to transfer a blob (spec §12).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobUrlRequest {
+    pub key: String,
+    pub method: BlobMethod,
+}
+
+/// Where to transfer it. With an S3/R2 backend `url` is a presigned URL the
+/// worker hits directly (bytes bypass the control plane); with the filesystem
+/// backend it points back at the control plane's own upload/fetch endpoint and
+/// `requires_grant_header` is set so the worker attaches its grant token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobUrlResponse {
+    pub url: String,
+    #[serde(default)]
+    pub requires_grant_header: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
