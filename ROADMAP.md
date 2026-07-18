@@ -9,7 +9,7 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 | # | Scope | Code | Proven | Gate |
 |---|-------|------|--------|------|
 | **M0** | join loop, fleet, shell runs, log streaming | ✅ | ✅ **real Colab T4** (E0) | E0 |
-| **M1** | train: code units, metrics, lineage checkpoints, resume | ✅ | 🟡 **core on real Colab T4** — resume test pending | E1 |
+| **M1** | train: code units, metrics, lineage checkpoints, resume | ✅ | ✅ **real Colab T4** (E1) — v11 trains, R2 checkpoints, resume passed | E1 |
 | **M2** | leases, drain, provider-verified destroy, reconcile/orphan-kill, ledger | ✅ | 🟡 **mock provider locally** — live Vast pending | E2 |
 | **M3** | packing scheduler (job classes, learned estimates, `submit_batch`, utilization) | ⬜ | — | E3 |
 | **M4** | budget caps, watchdog gates, one-page dashboard | 🟡 ledger+`spend_status` only | — | E4 |
@@ -26,11 +26,12 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 
 ## Immediate next steps
 
-1. **Finish E1** — the resume test: a longer v11 slice, bounce the Colab cell mid-run,
-   confirm it resumes from the R2 checkpoint and the `slices` list records both halves.
-2. **Hardening** (cross-cutting — see below).
-3. **M4 dashboard** — the one-page operator view (spec §9); high leverage now that real
+1. **M4 dashboard** — the one-page operator view (spec §9); high leverage now that real
    runs produce fleet/metrics/spend to look at.
+2. **Hardening** (cross-cutting — see below); MCP client retry/backoff first.
+3. **Live Vast E2** and **M3 packing** when there's rented-GPU pressure.
+
+*(E0 and E1 are done — both proven on a real Colab T4, including E1's resume test.)*
 
 ## Then, by milestone
 

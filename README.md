@@ -6,12 +6,14 @@ Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.5) · status + plan: `ROADMAP.m
 Milestones **M0–M2** are built; the control plane is deployed on Fly
 (`chuk-mcp-training.fly.dev`) with checkpoints in Cloudflare R2. Proven on real
 hardware: **E0** (agent joins a Colab T4, `nvidia-smi` + matmul probe, live
-logs) and the core of **E1** (v11 — 115M params — trains on the T4, metrics
-stream, ~460 MB checkpoints upload directly to R2 with lineage-complete
-`meta.json`). **M2** (leases, drain, provider-verified destroy, reconcile /
-orphan-kill, ledger) is verified locally via a mock provider that launches real
-agent processes; the live Vast E2 hasn't been run. Next: finish the E1 resume
-test, then M4 (dashboard + budget caps) and M3 (packing). See `ROADMAP.md`.
+logs) and **E1** (v11 — 115M params — trains on the T4, metrics stream, ~460 MB
+checkpoints upload directly to R2 with lineage-complete `meta.json`, and the
+resume test passes — bounce the Colab cell mid-run and it resumes from the R2
+checkpoint, `slices [[0,80],[80,390]]`). **M2** (leases, drain,
+provider-verified destroy, reconcile / orphan-kill, ledger) is verified locally
+via a mock provider that launches real agent processes; the live Vast E2 hasn't
+been run. Next: M4 (dashboard + budget caps), then M3 (packing). See
+`ROADMAP.md`.
 
 **Stack:** Rust control plane + Rust worker agent; the MCP tool surface is
 Python on `chuk-mcp-server`, a thin client over the control plane's REST API.

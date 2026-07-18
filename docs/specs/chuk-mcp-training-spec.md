@@ -24,7 +24,7 @@ scheduler; cost governance and dashboard; lazarus reduced to the artifact contra
 | Milestone | State | Gate | Proven |
 |-----------|-------|------|--------|
 | **M0** join loop, fleet, shell, logs | ✅ done | E0 | **on real Colab T4** — agent joins, `nvidia-smi` + matmul probe, live logs |
-| **M1** train: code units, metrics, lineage checkpoints, resume | ✅ done | E1 | **core on real Colab T4** — v11 (115M) trains on CUDA, metrics stream, 3× ~460 MB checkpoints to R2 with full lineage; **resume test pending** (needs a mid-run tab bounce) |
+| **M1** train: code units, metrics, lineage checkpoints, resume | ✅ done | E1 | ✅ **on real Colab T4** — v11 (115M) trains on CUDA, metrics stream, ~460 MB checkpoints to R2 with full lineage, **resume test passed** (bounced the cell mid-run → resumed from the R2 checkpoint → completed; `slices [[0,80],[80,390]]`) |
 | **M2** leases + provable cleanup | ✅ done | E2 | **locally via a mock provider** (launches real agent processes: drain, T-0 verified destroy with the agent hung, reconcile/orphan-kill, ledger); **live Vast E2 not yet run** (costs $) |
 | **M3** packing scheduler | ⬜ not started | E3 | — |
 | **M4** budgets + dashboard | 🟡 partial | E4 | ledger + `spend_status` done (in M2); **caps, watchdog gates, and the one-page dashboard not done** (only a M0 stub dashboard exists) |
@@ -555,9 +555,9 @@ without renting anything. No dollar leaves the building until M2/E2.
    real Colab T4.)*
 2. **M1** ✅ — `train` end-to-end: code-unit build + agent hash-cache, JobSpec, metrics
    tailing, checkpoint upload with lineage `meta.json`, resume-after-kill on Colab
-   (close the tab; job re-queues and resumes from the uploaded checkpoint). *(E1 core
-   green on a real Colab T4: v11 trains, checkpoints to R2 with lineage; the tab-bounce
-   resume test is the remaining check.)*
+   (close the tab; job re-queues and resumes from the uploaded checkpoint). *(E1 green on
+   a real Colab T4: v11 trains, checkpoints to R2 with lineage, and the tab-bounce resume
+   test passed — `slices [[0,80],[80,390]]`.)*
 3. **M2** ✅ — **leases + cleanup**: lease walls, drain protocol, provider-verified destroy,
    reconcile loop + orphan kill, idle reaper. Vast driver (`provider_offers`,
    `provision`, `teardown`). *Test: rent 15 min on Vast, confirm the instance is
