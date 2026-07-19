@@ -156,10 +156,19 @@ candidate *Requirements-aware assignment* / *generalized bootstrap* items feed i
   dark; a disk-backed outbound buffer + monotonic seq/ack makes "tolerate a dark CP" real.
 
 **Product / UX**
+- **Overview → drill-in screen hierarchy + a real-time telemetry tab** (M, high value) — restructure
+  the per-run view into *progressive disclosure*: the overview shows a brief, latest-value summary of
+  each signal (loss, logs tail, CPU/mem/GPU, checkpoints, events), and each is a click-through to its
+  own detailed screen you can drill into. A dedicated **Telemetry tab** streams CPU / memory / GPU
+  utilization (+ mem/temp/power) in real time the way tokens/sec streams today — consuming the `sys/*`
+  metric namespace (chuk-compute M4), not crammed into the overview. Detailed screens per signal:
+  full historical **logs** view (search/filter/follow), a metrics explorer (pick/compare series), a
+  telemetry board (per-device curves), checkpoints, and events. Pairs with **Live dashboard push
+  (SSE)** below so the detailed screens are truly live rather than 2s-polled.
 - **Notifications** (S–M) — run complete/fail, gate trip, orphan kill, budget breach to a
   webhook/Slack/email sink; turns the rig from pull to push. Orphan kills only warn to the log today.
 - **Live dashboard push (SSE)** (S–M) — the per-run view polls five endpoints every 2s; relay
-  the already-streamed logs/metrics over one SSE stream. Add a full historical-log view.
+  the already-streamed logs/metrics/`sys/*` over one SSE stream. Add a full historical-log view.
 - **Submit-run / provision from the dashboard** (M) — it's read-only except teardown + access;
   an offers browser + submit form makes it usable without an MCP client.
 - **Artifact & lineage browsing** (M–L) — `list_artifacts`/`artifact_lineage`/`register_artifact`
