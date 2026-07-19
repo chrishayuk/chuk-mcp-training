@@ -89,13 +89,25 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// A rule pairing an output class with a glob and when to upload matches.
+/// A rule pairing an output class with a glob and when to upload matches. The
+/// worker uploads each matched file to `key_prefix` joined with the match's path
+/// relative to the glob's fixed (wildcard-free) base, then reports one
+/// [`crate::WorkerToCp::Artifact`] per top-level match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputRule {
     pub class: ArtifactClass,
-    /// Glob, relative to the sandbox, matching the files to collect.
+    /// Glob matching files or directories to collect (may contain
+    /// [`SANDBOX_PLACEHOLDER`]).
     pub glob: String,
     pub upload: UploadPolicy,
+    /// Store-key prefix the worker uploads matched files under, so the control
+    /// plane owns the storage layout while the worker stays domain-free.
+    pub key_prefix: String,
+    /// When set, a matched **directory** is collected only once it contains this
+    /// marker file — the producer's "this output is complete" signal, so a
+    /// half-written directory is never uploaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_marker: Option<String>,
 }
 
 /// When the worker uploads an output matching an [`OutputRule`].
@@ -224,6 +236,8 @@ mod tests {
                 class: ArtifactClass::from("report"),
                 glob: "out/*.json".into(),
                 upload: UploadPolicy::OnExit,
+                key_prefix: "reports/j2".into(),
+                ready_marker: None,
             }],
             metrics_file: Some("${SANDBOX}/metrics.jsonl".into()),
             max_runtime_secs: Some(120),

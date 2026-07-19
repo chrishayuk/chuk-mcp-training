@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use chuk_compute_wire as wire;
 use chuk_train_proto::{
     script_env, RunId, ShellSpec, TrainSpec, CHECKPOINT_DIR_PREFIX, CHECKPOINT_META_FILE,
-    CHECKPOINT_MODEL_FILE,
+    CHECKPOINT_MODEL_FILE, CHECKPOINT_READY_MARKER, CKPT_HOT_PREFIX,
 };
 use serde_json::Value;
 
@@ -95,6 +95,11 @@ pub fn train_job(run_id: &RunId, train: &TrainSpec, staging: &TrainStaging<'_>) 
         class: wire::ArtifactClass::from(ARTIFACT_CHECKPOINT),
         glob: sandboxed(&format!("{CKPT_SUBDIR}/{CHECKPOINT_DIR_PREFIX}*")),
         upload: wire::UploadPolicy::OnAppearance,
+        // Uploads land at the same ckpt-hot/<run>/step_N/ keys as today, so the
+        // retrieval + archive paths are unchanged; a dir is collected only once
+        // the trainer has touched its .ready marker.
+        key_prefix: format!("{CKPT_HOT_PREFIX}/{}", run_id.0),
+        ready_marker: Some(CHECKPOINT_READY_MARKER.to_owned()),
     }];
     job.metrics_file = Some(sandboxed(METRICS_FILE));
     job.grant = Some(staging.grant.to_owned());
@@ -153,22 +158,24 @@ fn script_environment(run_id: &RunId, train: &TrainSpec, resuming: bool) -> BTre
 /// The code unit (unpacked) plus, when resuming, the prior checkpoint's model +
 /// meta staged into the resume dir.
 fn train_inputs(staging: &TrainStaging<'_>) -> Vec<wire::InputArtifact> {
+    // Dests are sandbox-rooted (like the command/env/globs) so the worker
+    // resolves them to the same absolute place the entrypoint cd's into.
     let mut inputs = vec![wire::InputArtifact {
         uri: staging.code_unit_uri.to_owned(),
-        dest: UNIT_SUBDIR.to_owned(),
+        dest: sandboxed(UNIT_SUBDIR),
         sha256: None,
         unpack: true,
     }];
     if let Some(resume) = &staging.resume {
         inputs.push(wire::InputArtifact {
             uri: resume.model_uri.to_owned(),
-            dest: format!("{RESUME_SUBDIR}/{CHECKPOINT_MODEL_FILE}"),
+            dest: sandboxed(&format!("{RESUME_SUBDIR}/{CHECKPOINT_MODEL_FILE}")),
             sha256: None,
             unpack: false,
         });
         inputs.push(wire::InputArtifact {
             uri: resume.meta_uri.to_owned(),
-            dest: format!("{RESUME_SUBDIR}/{CHECKPOINT_META_FILE}"),
+            dest: sandboxed(&format!("{RESUME_SUBDIR}/{CHECKPOINT_META_FILE}")),
             sha256: None,
             unpack: false,
         });
@@ -272,7 +279,7 @@ mod tests {
         let job = train_job(&RunId::from("RUN-4"), &train_spec(), &staging);
         assert_eq!(job.inputs.len(), 1);
         let unit = &job.inputs[0];
-        assert_eq!(unit.dest, "unit");
+        assert_eq!(unit.dest, "${SANDBOX}/unit");
         assert!(unit.unpack);
         assert_eq!(unit.uri, "https://store/code");
 
@@ -281,6 +288,9 @@ mod tests {
         assert_eq!(out.class.as_str(), ARTIFACT_CHECKPOINT);
         assert_eq!(out.glob, "${SANDBOX}/ckpt/step_*");
         assert_eq!(out.upload, wire::UploadPolicy::OnAppearance);
+        // Uploads keep the existing ckpt-hot key layout; .ready gates collection.
+        assert_eq!(out.key_prefix, "ckpt-hot/RUN-4");
+        assert_eq!(out.ready_marker.as_deref(), Some(".ready"));
     }
 
     #[test]
@@ -298,8 +308,8 @@ mod tests {
         assert_eq!(job.env[script_env::RESUME_CKPT], "${SANDBOX}/resume");
         // unit + model + meta, none of the resume files unpacked.
         assert_eq!(job.inputs.len(), 3);
-        assert_eq!(job.inputs[1].dest, "resume/model.safetensors");
-        assert_eq!(job.inputs[2].dest, "resume/meta.json");
+        assert_eq!(job.inputs[1].dest, "${SANDBOX}/resume/model.safetensors");
+        assert_eq!(job.inputs[2].dest, "${SANDBOX}/resume/meta.json");
         assert!(!job.inputs[1].unpack && !job.inputs[2].unpack);
     }
 

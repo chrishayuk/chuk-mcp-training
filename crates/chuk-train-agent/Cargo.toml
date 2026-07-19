@@ -1,6 +1,6 @@
 [package]
 name = "chuk-train-agent"
-description = "chuk-train worker agent: dials out to the control plane, registers hardware, executes assigned runs"
+description = "chuk-compute worker: dials out to the control plane, advertises its capabilities, and executes assigned jobs generically"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,9 @@ name = "chuk-train-agent"
 path = "src/main.rs"
 
 [dependencies]
+chuk-compute-wire = { workspace = true }
+# Kept only for a few generic, domain-free constants (heartbeat interval,
+# reconnect backoff, exit codes, output-scan interval) during the M1 transition.
 chuk-train-proto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

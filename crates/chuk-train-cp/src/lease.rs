@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use chuk_compute_wire as wire;
 use chuk_train_proto::{
-    CpToAgent, Instance, InstanceStatus, Lease, LeaseExtension, LeaseState, LedgerEntry,
+    Instance, InstanceStatus, Lease, LeaseExtension, LeaseState, LedgerEntry,
     ProvisionRequest, ProvisionResult, TeardownResult, WorkerId, DESTROY_VERIFY_POLL,
     DESTROY_VERIFY_TIMEOUT, LEASE_TICK_INTERVAL,
 };
@@ -237,7 +238,7 @@ impl LeaseManager {
         let deadline = lease.started_at + lease.wall_secs();
         let sent = self
             .hub
-            .send_to(&lease.worker_id, CpToAgent::Drain { deadline })
+            .send_to(&lease.worker_id, wire::CpToWorker::Drain { deadline })
             .await;
         info!(worker = %lease.worker_id, delivered = sent, "drain sent");
         Ok(())
