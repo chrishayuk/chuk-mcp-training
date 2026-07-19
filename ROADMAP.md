@@ -110,9 +110,13 @@ agent/MCP-deployment platform never colonizes the rig. Sequencing (spec §11):
   (lineage merge moved CP-side). **Parity proven** on the local demo — a train run completes with
   lineage-complete checkpoints, and the E1 resume path yields slices `[[0,10],[10,40]]`. CI runs the
   guards. Single-target build retained (M2 changes that).
-- **M2 — target matrix + bootstrap** — build `x86_64`/`aarch64` musl + `aarch64-apple-darwin`;
-  serve `/agent/{os}-{arch}` + `.sha256` + `/agent/version`; one `install.sh` (rustup-style)
-  the Colab cell and Vast onstart wrap. Retires the hardcoded `/agent/linux-x86_64`.
+- **M2 — target matrix + bootstrap** ✅ **done** — the CP serves `/agent/{triple}` + `.sha256`
+  + `/agent/version` + `/install.sh` (allowlisted targets; retired the hardcoded
+  `/agent/linux-x86_64`). One rustup-style `install.sh` (uname → triple → download + verify +
+  exec) is the single bootstrap the Colab cell + Vast onstart wrap. CI matrix cross-builds all
+  three targets (zigbuild + macOS). **Proven: the Mac joins via `curl <CP>/install.sh | sh`.**
+  Follow-up: bake the aarch64-musl + darwin CI artifacts into the deployed image (serves x86_64
+  today; the Mac builds locally / from CI).
 - **M3 — persistent worker class** — long-lived revocable tokens, reconnect-with-resume, metric
   spool/replay against a high-water mark, hand-rolled self-update; **the Mac joins** (no wall,
   no teardown — `WorkerClass` an enum so destroying a persistent worker is unrepresentable).

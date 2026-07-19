@@ -132,11 +132,14 @@ fly secrets set -c deploy/fly.toml CHUK_TRAIN_API_TOKEN=$(openssl rand -hex 24) 
 fly deploy -c deploy/fly.toml --dockerfile deploy/Dockerfile
 ```
 
-The Fly image builds both binaries and the **control plane serves the agent**
-at `/agent/linux-x86_64` — so the Colab cell needs only the Fly URL + join
-token. Fill those into `bootstrap/colab_cell.py`, paste it into a T4 notebook,
-and the worker appears in `fleet`. Submit the E0 probe (`nvidia-smi` + a matmul
-throughput run) with `submit_shell` and watch it stream via `tail_logs`.
+The Fly image builds both binaries and the **control plane serves the worker per
+target** at `/agent/{triple}` (+ `.sha256`), with a one-shot **`/install.sh`** that
+detects the box's target, downloads + checksum-verifies the matching worker, and
+joins — so the Colab cell needs only the Fly URL + join token. Fill those into
+`bootstrap/colab_cell.py` (a one-line `curl … | sh` over `/install.sh`), paste it
+into a T4 notebook, and the worker appears in `fleet`. Submit the E0 probe
+(`nvidia-smi` + a matmul throughput run) with `submit_shell` and watch it stream
+via `tail_logs`.
 
 ## Train a run (E1)
 

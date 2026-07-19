@@ -38,8 +38,9 @@ fly secrets set -c deploy/fly.toml \
 Sanity check:
 
 ```bash
-curl -s https://$APP.fly.dev/healthz            # {"ok":true}
-curl -sI https://$APP.fly.dev/agent/linux-x86_64 | grep -i content-length   # ~5.7 MB
+curl -s  https://$APP.fly.dev/healthz            # {"ok":true}
+curl -s  https://$APP.fly.dev/agent/version      # {"version":"…"}
+curl -sI https://$APP.fly.dev/agent/x86_64-unknown-linux-musl | grep -i content-length  # ~5.7 MB
 ```
 
 Read the two secret values back for the next steps:

@@ -254,9 +254,15 @@ the Hello handshake, batch jobs, and the current single-target build. The contro
 `RunSpec`→`Job` and interprets `Artifact` events back into checkpoints (lineage merge moved
 control-plane-side). **Behaviour parity proven** on the local demo: a train run completes with
 lineage-complete checkpoints, and the E1 resume path yields slices `[[0,10],[10,40]]`. CI runs
-both lexical guards. M2 — target matrix, bootstrap
-script, `/agent/{os}-{arch}` serving, checksum + version endpoints. M3 — persistent worker class:
-long-lived tokens, reconnect with resume, metric spool, self-update; the Mac joins. M4 — `sys/*`
+both lexical guards. **M2 — DONE** — the control plane serves per-target binaries at
+`/agent/<triple>` (+ `.sha256`, `/agent/version`, `/install.sh`), validated against a
+`SUPPORTED_TARGETS` allowlist; `scripts/install.sh` (rustup-style: uname → triple → download +
+verify + exec) is the single bootstrap the Colab cell and Vast onstart wrap; a CI matrix
+cross-builds all three targets (zigbuild for linux-musl, macOS runner for darwin). **Proven: the
+Mac joins via `curl <CP>/install.sh | sh`.** (Follow-up: bake the aarch64-musl + darwin CI
+artifacts into the deployed image — it currently serves x86_64.) M3 — persistent worker class:
+long-lived tokens, reconnect with resume, metric spool, self-update; the Mac joins *without a
+lease wall*. M4 — `sys/*`
 sampler (NVML + sysinfo first; macmon-based MPS once the Mac is on). M5 — service jobs, registry,
 `needs` wiring, secrets; LARQL-on-Mac as first service, cell-runtime second. M6 — campaigns with
 budgets and the bench template's pinning gate. M7 — first RL composition: controller job + rollout
