@@ -1,0 +1,13 @@
+[package]
+name = "chuk-compute-wire"
+description = "Compute-generic worker/control-plane wire protocol for the chuk compute fabric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Substrate crate (chuk-compute-spec.md): serde-only, no transport, no CP
+# internals, no domain vocabulary. A lexical guard test enforces that the
+# training domain never leaks in (tests/no_domain_vocabulary.rs).
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
