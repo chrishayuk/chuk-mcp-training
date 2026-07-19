@@ -79,3 +79,22 @@ jobs:
         with:
           name: ${{ matrix.target }}
           path: target/${{ matrix.target }}/release/chuk-compute-worker
+
+  # Production deploy to Fly. Runs only on a push to main, and only after clippy +
+  # tests AND every worker target (incl. the musl cross-builds) are green — so a
+  # broken commit never reaches production. Needs the FLY_API_TOKEN repo secret.
+  deploy:
+    name: fly deploy
+    needs: [check, build-targets]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy
+        run: flyctl deploy -c deploy/fly.toml --dockerfile deploy/Dockerfile --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
