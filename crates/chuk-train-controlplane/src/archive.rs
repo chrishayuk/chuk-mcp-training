@@ -78,7 +78,7 @@ impl Archiver {
         }
         let step = final_ckpt.step;
         // Drive layout mirrors the run: chuk-train/runs/<run_id>/… — sortable and
-        // browsable (run ids are RUN-YYYYMMDD-…).
+        // browsable (execution ids are EXEC-YYYYMMDD-…).
         let run_folder = format!("{ARCHIVE_ROOT_FOLDER}/runs/{}", run_id.0);
         let ckpt_folder = format!("{run_folder}/ckpt/{CHECKPOINT_DIR_PREFIX}{step}");
         let mut drive_ids: BTreeMap<String, String> = BTreeMap::new();

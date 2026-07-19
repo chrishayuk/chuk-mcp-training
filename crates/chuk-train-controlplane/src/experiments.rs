@@ -5,11 +5,20 @@
 //! slow or down experiments-server logs a warning and never blocks or fails a
 //! run. The harness's own store stays the source of truth (design principle 10).
 //!
-//! The experiments-server is the research system-of-record; it *always mints its
-//! own* `RUN-…` id, so we send our run id as the run `slug` + `harness_session_id`
-//! and persist the id it returns on our run row (`experiments_run_id`) to address
-//! later lifecycle/artifact reports. Their id-space and ours are parallel and
-//! independent; `harness_session_id` links them.
+//! The experiments-server is the research system-of-record; its `RUN-…` ids name
+//! *logical runs*, while ours (`EXEC-…`) name *execution attempts* — two parallel,
+//! independent namespaces. A submitted run reports in one of two modes:
+//!
+//! - **Attached** — the caller supplied an `experiment_ref` (an existing logical
+//!   `RUN-…`). We report *into* that run: link our execution to it
+//!   (`harness_session_id` = our `EXEC-…` id) and address later lifecycle/artifact
+//!   reports at it. We never mint a second run for the same intent.
+//! - **Unattached** — no ref. We create a fresh run on their side (they mint the
+//!   `RUN-…`), send our id as its `slug` + `harness_session_id`, and persist the
+//!   minted id on our run row.
+//!
+//! Either way the minted/attached id is stored as `experiments_run_id`, and the
+//! harness's own store stays the source of truth.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -88,10 +97,16 @@ impl Experiments {
 
     /// Mirror a freshly-submitted run. Only **train** runs are reported; shell
     /// probes are skipped (and their later transitions no-op, having no id).
-    pub async fn report_created(&self, run_id: RunId, spec: RunSpec) {
+    /// With an `experiment_ref` we attach to that existing logical run; without
+    /// one we create a fresh run on the experiments-server.
+    pub async fn report_created(&self, run_id: RunId, spec: RunSpec, experiment_ref: Option<String>) {
         let RunSpec::Train(train) = spec else { return };
-        if let Err(e) = self.try_create(&run_id, &train).await {
-            warn!(run = %run_id.0, error = %e, "experiments: create run failed (mirror only)");
+        let result = match experiment_ref {
+            Some(ext) => self.try_attach(&run_id, &train, &ext).await,
+            None => self.try_create(&run_id, &train).await,
+        };
+        if let Err(e) = result {
+            warn!(run = %run_id.0, error = %e, "experiments: report-created failed (mirror only)");
         }
     }
 
@@ -171,22 +186,24 @@ impl Experiments {
             anyhow::bail!("create run: {status} {}", body_of(resp).await);
         }
         let created: CreatedRun = resp.json().await.context("parse created run")?;
-        // Link back: our id as the correlation field, plus any W&B out-link.
-        let mut patch = json!({ "harness_session_id": run_id.0 });
-        if let Some(url) = train
-            .links
-            .iter()
-            .find(|l| l.kind.eq_ignore_ascii_case(LINK_KIND_WANDB))
-            .map(|l| l.url.clone())
-        {
-            patch["wandb_url"] = json!(url);
-        }
         // Best-effort; the primary link is `slug` = our id even if this PATCH fails.
-        if let Err(e) = self.patch_run(&created.id, patch).await {
+        if let Err(e) = self.patch_run(&created.id, linkback_patch(run_id, train)).await {
             warn!(run = %run_id.0, ext = %created.id, error = %e, "experiments: linkback patch failed");
         }
         self.store.set_experiments_run_id(run_id, &created.id).await?;
         info!(run = %run_id.0, ext = %created.id, "experiments: run mirrored");
+        Ok(())
+    }
+
+    /// Attach this execution to a logical run the caller already created on the
+    /// experiments-server (`ext`). Unlike [`Self::try_create`], we did not mint
+    /// the run, so the linkback PATCH doubles as an existence check: if it fails
+    /// we bail *without* recording the id, rather than committing to a bad ref
+    /// that would make every later report warn.
+    async fn try_attach(&self, run_id: &RunId, train: &TrainSpec, ext: &str) -> Result<()> {
+        self.patch_run(ext, linkback_patch(run_id, train)).await?;
+        self.store.set_experiments_run_id(run_id, ext).await?;
+        info!(run = %run_id.0, ext = %ext, "experiments: execution attached to existing run");
         Ok(())
     }
 
@@ -312,6 +329,22 @@ struct CreatedRun {
     id: String,
 }
 
+/// The linkback body applied to the experiments-server run (whether freshly
+/// created or attached): our execution id as the correlation field, plus any
+/// Weights & Biases out-link declared on the run.
+fn linkback_patch(run_id: &RunId, train: &TrainSpec) -> Value {
+    let mut patch = json!({ "harness_session_id": run_id.0 });
+    if let Some(url) = train
+        .links
+        .iter()
+        .find(|l| l.kind.eq_ignore_ascii_case(LINK_KIND_WANDB))
+        .map(|l| l.url.clone())
+    {
+        patch["wandb_url"] = json!(url);
+    }
+    patch
+}
+
 /// Read a response body for an error message, tolerating a read failure.
 async fn body_of(resp: reqwest::Response) -> String {
     resp.text().await.unwrap_or_default()
@@ -385,5 +418,37 @@ mod tests {
         assert_eq!(map_status(RunState::Failed), Some("failed"));
         assert_eq!(map_status(RunState::Queued), None);
         assert_eq!(map_status(RunState::Assigned), None);
+    }
+
+    fn train_with_links(links: Value) -> TrainSpec {
+        serde_json::from_value(json!({
+            "code": { "name": "gpt-nano", "sha": "abc123" },
+            "entrypoint": "train",
+            "links": links,
+        }))
+        .expect("valid TrainSpec")
+    }
+
+    #[test]
+    fn linkback_carries_execution_id_and_wandb() {
+        let run = RunId("EXEC-20260718-160217-00397".into());
+        let train = train_with_links(json!([
+            { "kind": "wandb", "label": "W&B", "url": "https://wandb.ai/x/y" },
+        ]));
+        let patch = linkback_patch(&run, &train);
+        assert_eq!(patch["harness_session_id"], json!(run.0));
+        assert_eq!(patch["wandb_url"], json!("https://wandb.ai/x/y"));
+    }
+
+    #[test]
+    fn linkback_omits_wandb_when_absent() {
+        let run = RunId("EXEC-20260718-160217-00397".into());
+        // A non-wandb out-link must not be mistaken for the W&B url.
+        let train = train_with_links(json!([
+            { "kind": "exp", "label": "Experiment", "url": "https://exp/RUN-1" },
+        ]));
+        let patch = linkback_patch(&run, &train);
+        assert_eq!(patch["harness_session_id"], json!(run.0));
+        assert!(patch.get("wandb_url").is_none());
     }
 }

@@ -248,6 +248,9 @@ class RunSummary(BaseModel):
     state: RunState
     worker_id: str | None = None
     exit_code: int | None = None
+    # The experiments-server logical run (RUN-…) this EXEC-… execution belongs
+    # to, if any; None for an unattached scratch run.
+    experiment_ref: str | None = None
     created_at: float
     updated_at: float
 
@@ -276,6 +279,10 @@ class SubmitShellRequest(BaseModel):
 class SubmitRunRequest(BaseModel):
     name: str
     spec: TrainSpec
+    # Optional external parent: the experiments-server logical run (RUN-…) this
+    # execution realises. When set, the CP's mirror reports into it instead of
+    # minting a new run. Omit for an unattached scratch run.
+    experiment_ref: str | None = None
 
 
 class BuildCodeUnitRequest(BaseModel):

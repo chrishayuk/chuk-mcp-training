@@ -46,8 +46,15 @@ pub trait Store: Send + Sync {
     async fn fleet(&self) -> Result<Vec<WorkerInfo>>;
 
     // runs
-    async fn create_run(&self, name: &str, spec: &RunSpec) -> Result<RunId>;
-    /// Next value of the monotonic run sequence (the 5-digit id tail).
+    /// Create a queued run. `experiment_ref` is the optional external parent —
+    /// the experiments-server logical run (`RUN-…`) this execution realises.
+    async fn create_run(
+        &self,
+        name: &str,
+        spec: &RunSpec,
+        experiment_ref: Option<&str>,
+    ) -> Result<RunId>;
+    /// Next value of the monotonic execution sequence (the 5-digit id tail).
     async fn next_run_seq(&self) -> Result<i64>;
     /// Persist the chuk-experiments-server run id this run is mirrored to
     /// (spec §11.6), so later lifecycle/artifact reports can address it.

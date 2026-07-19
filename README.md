@@ -218,8 +218,10 @@ behind **Google sign-in** (session cookie; the API-token box is the local-dev
 fallback). It has an overview (fleet/runs/spend/health with filters + pagination)
 and a per-run view: live loss curve + metric toggles, streamed logs, config,
 checkpoints with full metadata + download, events, and out-links (W&B /
-experiments-server). Runs get sortable `RUN-YYYYMMDD-HHMMSS-NNNNN` ids (a
-store-backed 5-digit sequence, the same shape chuk-experiments-server mints).
+experiments-server). Executions get sortable `EXEC-YYYYMMDD-HHMMSS-NNNNN` ids (a
+store-backed 5-digit sequence) — deliberately distinct from chuk-experiments-server's
+`RUN-…` *logical run* ids: ours names an execution attempt, theirs the research run.
+A run may carry an `experiment_ref` pointing at the logical `RUN-…` it realises.
 
 **Access (RBAC):** users have a role — sysadmin › admin › write › read — in a
 team (single default team; multi-team scaffolded). `read`/`write`/`admin` mirror

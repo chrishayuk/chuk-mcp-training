@@ -156,12 +156,17 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         seed: int | None = None,
         arch: str | None = None,
         timeout_s: int = DEFAULT_TRAIN_TIMEOUT_S,
+        experiment_ref: str | None = None,
     ) -> dict[str, Any]:
         """Queue a train run against a built code unit (spec §5.1 JobSpec).
 
         code_name/code_sha come from build_code_unit. The run is assigned to an
         idle worker, checkpoints upload with lineage, and it resumes from its
         last checkpoint if the worker is lost mid-run.
+
+        Pass experiment_ref to attach this execution to an existing
+        experiments-server logical run (its RUN-… id): the CP reports into that
+        run rather than minting a new one. Omit it for an unattached scratch run.
         """
         spec = TrainSpec(
             code=CodeRef(name=code_name, sha=code_sha),
@@ -172,7 +177,7 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
             arch=arch,
             timeout_s=timeout_s,
         )
-        request = SubmitRunRequest(name=name, spec=spec)
+        request = SubmitRunRequest(name=name, spec=spec, experiment_ref=experiment_ref)
         return await _envelope(cp.post_model(API_RUNS, request, SubmitRunResponse))
 
     @mcp.tool

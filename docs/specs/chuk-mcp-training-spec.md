@@ -592,12 +592,18 @@ and live-proven, with the tiering/retrieval job pending.
 [chuk-experiments-server](https://github.com/chrishayuk/chuk-experiments-server) is the
 research **system of record** (programme → experiment → run → result/artifact). The harness
 reports into it as an **optional, gated mirror** — never a dependency (design principle 10).
-When `CHUK_EXPERIMENTS_URL` + a WRITE API key are configured, the control plane:
+When `CHUK_EXPERIMENTS_URL` + a WRITE API key are configured, the control plane reports in
+one of two modes, decided at submit time by the run's `experiment_ref`:
 
-- **on run submit** — POSTs to `/v1/experiments/{slug}/runs` (a configurable default
-  experiment; programme auto-creates). The server **mints its own** `RUN-…` id, so we send
-  **our** run id as the `slug` and, via a follow-up `PATCH /v1/runs/{id}`, as
-  `harness_session_id`; we store their returned id on our run row for later calls.
+- **on run submit, unattached** (no `experiment_ref`) — POSTs to `/v1/experiments/{slug}/runs`
+  (a configurable default experiment; programme auto-creates). The server **mints its own**
+  `RUN-…` id, so we send **our** execution id as the `slug` and, via a follow-up
+  `PATCH /v1/runs/{id}`, as `harness_session_id`; we store their returned id on our run row.
+- **on run submit, attached** (`experiment_ref` = an existing logical `RUN-…`) — we **report
+  into that run** instead of minting a second one: a single linkback `PATCH /v1/runs/{ref}`
+  (`harness_session_id` = our `EXEC-…` id, `wandb_url`), and we record the ref as the run's
+  experiments-server id. The PATCH doubles as an existence check — if it fails we don't commit
+  to the ref. This keeps intent (their logical run) and execution (our attempt) one-to-many.
 - **on lifecycle transitions** — `PATCH /v1/runs/{id}` with the mapped `status`
   (queued/running/completed/failed/killed/cancelled), `started_at`/`ended_at`, `cost_usd`,
   `wandb_url`.
@@ -606,11 +612,13 @@ When `CHUK_EXPERIMENTS_URL` + a WRITE API key are configured, the control plane:
   superset as `meta`); optional `result` rows for final metrics and `/v1/pins` for
   `latest`/`best`.
 
-Unset ⇒ a complete no-op; the harness's own store + queue remain authoritative. Their run
-ids and ours share the same `RUN-YYYYMMDD-HHMMSS-NNNNN` shape but are **parallel, independent
-id-spaces** (each from its own store sequence), linked by `harness_session_id`. Their
-`/v1/queue` claim/lease contract (workers *pull* work the experiments-server enqueued) is a
-possible **later opt-in** execution mode — an add-on, never a replacement for our own queue.
+Unset ⇒ a complete no-op; the harness's own store + queue remain authoritative. The two id
+namespaces are **deliberately distinct**: ours are `EXEC-YYYYMMDD-HHMMSS-NNNNN` execution
+attempts, theirs are `RUN-…` logical research runs. They are linked explicitly — by
+`experiment_ref` (our → their parent) and `harness_session_id` (their → our execution) — never
+conflated by a shared shape. Their `/v1/queue` claim/lease contract (workers *pull* work the
+experiments-server enqueued) is a possible **later opt-in** execution mode — an add-on, never a
+replacement for our own queue.
 
 Every report is **fire-and-forget**, spawned off the run's critical path (a slow or down
 experiments-server logs a warning and never blocks or fails a run). Built and verified

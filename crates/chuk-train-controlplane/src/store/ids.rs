@@ -9,11 +9,15 @@
 use anyhow::Result;
 use chuk_train_proto::{MetricPoint, UnixSeconds};
 
-/// Run ids are `RUN-YYYYMMDD-HHMMSS-{5-digit sequence}` (UTC) — self-describing,
-/// chronologically sortable, and **matching chuk-experiments-server's format**
-/// (which reports/records these same runs). The sequence comes from a
-/// store-backed monotonic counter, so it's stable and collision-free.
-const RUN_ID_PREFIX: &str = "RUN-";
+/// Our run ids are `EXEC-YYYYMMDD-HHMMSS-{5-digit sequence}` (UTC) —
+/// self-describing, chronologically sortable, and **deliberately distinct from
+/// chuk-experiments-server's `RUN-…` ids**. Ours names an *execution attempt*
+/// (this seed ran here, disconnected, resumed, finished); theirs names a
+/// *research run* (the logical experiment). The two live in independent
+/// namespaces, linked by an explicit parent reference — never conflated by a
+/// shared prefix. The sequence comes from a store-backed monotonic counter, so
+/// it's stable and collision-free.
+const EXEC_ID_PREFIX: &str = "EXEC-";
 /// Zero-pad width of the sequence tail (grows past 5 digits after 99999).
 const RUN_ID_SEQ_WIDTH: usize = 5;
 
@@ -31,7 +35,7 @@ pub(super) fn now() -> UnixSeconds {
 pub(super) fn new_run_id(at: UnixSeconds, seq: i64) -> String {
     let (y, m, d, hh, mm, ss) = utc_parts(at as i64);
     format!(
-        "{RUN_ID_PREFIX}{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}-{seq:0width$}",
+        "{EXEC_ID_PREFIX}{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}-{seq:0width$}",
         width = RUN_ID_SEQ_WIDTH
     )
 }
@@ -125,15 +129,18 @@ mod id_tests {
     }
 
     #[test]
-    fn run_id_matches_experiments_server_format() {
-        // RUN-YYYYMMDD-HHMMSS-{5-digit sequence}, e.g. RUN-20260718-160217-00397.
+    fn exec_id_is_distinct_from_experiments_run_ids() {
+        // EXEC-YYYYMMDD-HHMMSS-{5-digit sequence}, e.g. EXEC-20260718-160217-00397.
         let id = new_run_id(1_609_459_200.0, 397); // 2021-01-01T00:00:00Z, seq 397
-        assert_eq!(id, "RUN-20210101-000000-00397");
+        assert_eq!(id, "EXEC-20210101-000000-00397");
+        // Deliberately NOT the experiments-server's `RUN-…` shape: an execution
+        // attempt must never be mistaken for a logical research run.
+        assert!(!id.starts_with("RUN-"));
         // Sequences past 99999 keep growing (lpad, no truncation).
-        assert_eq!(new_run_id(1_609_459_200.0, 100_000), "RUN-20210101-000000-100000");
+        assert_eq!(new_run_id(1_609_459_200.0, 100_000), "EXEC-20210101-000000-100000");
         // Lexical order over the timestamp portion tracks wall-clock time.
         let later = new_run_id(1_609_545_600.0, 1); // +1 day
-        let stamp = |s: &str| s[..RUN_ID_PREFIX.len() + 8].to_owned();
+        let stamp = |s: &str| s[..EXEC_ID_PREFIX.len() + 8].to_owned();
         assert!(stamp(&later) > stamp(&id));
     }
 }

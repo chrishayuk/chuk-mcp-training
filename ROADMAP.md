@@ -198,13 +198,14 @@ candidate *Requirements-aware assignment* / *generalized bootstrap* items feed i
 experiments-server owns the **research record** (what/why/concluded/evidence), the harness owns
 **execution** (what ran, where, did it survive, checkpoints/cost). Keep the boundary
 unmistakable — the harness reports **observations, never conclusions**.*
-- **Distinct logical-run vs execution IDs** (S, decide first) — today both mint `RUN-YYYYMMDD-…`
-  in the same shape (we deliberately aligned them, ID #44), linked by `harness_session_id`. The
-  review argues that's a hazard: a *research run* ("evaluate CN-7 over seeds 80–82") and an
-  *execution attempt* ("seed 81, disconnected at 9.5k, resumed, done at 15k") are different things
-  and shouldn't share a name+format across independent namespaces. Proposal: the harness uses its
-  own `EXEC-…` (or keeps `RUN-…` but visually distinct) and accepts the experiments-server run id
-  as an **external parent reference**. ⚠️ This *reverses* ID #44 — a call to make with the user.
+- **Distinct logical-run vs execution IDs** ✅ *done (2026-07-19) — supersedes ID #44.* The
+  harness now mints `EXEC-YYYYMMDD-HHMMSS-NNNNN` execution ids (same store-backed 5-digit
+  sequence, deliberately **not** the experiments-server's `RUN-…` shape), and a run carries an
+  optional `experiment_ref` — the external parent reference to the logical `RUN-…` it realises.
+  The reporting mirror uses it: with a ref it reports *into* that run (one-to-many intent→attempts)
+  instead of minting a second run. `submit_run` (REST + MCP) takes `experiment_ref`; a shell probe
+  is always unattached. *Still open (rec #3):* making the reference **required** on formal training
+  jobs (vs the current opt-in), with an explicit scratch-run mode.
 - **Durable reporting outbox** (S–M) — see the item above under *operational hardening*; the review
   independently flags the fire-and-forget mirror as the thing to fix so completed metrics/artifacts
   eventually land instead of being lost on a transient error. Do this one.

@@ -55,6 +55,12 @@ pub struct RunSummary {
     pub worker_id: Option<WorkerId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i64>,
+    /// The experiments-server *logical run* this execution belongs to, if any
+    /// (its `RUN-…` id). Our own id (`EXEC-…`) names the execution attempt; this
+    /// is the external parent reference to the research run it realises. `None`
+    /// for an unattached scratch run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment_ref: Option<String>,
     pub created_at: UnixSeconds,
     pub updated_at: UnixSeconds,
 }
@@ -112,6 +118,11 @@ pub struct CodeUnitInfo {
 pub struct SubmitRunRequest {
     pub name: String,
     pub spec: RunSpec,
+    /// Optional external parent: the experiments-server *logical run* (`RUN-…`)
+    /// this execution realises. When set, the reporting mirror reports *into*
+    /// that run instead of minting a new one. Omit for an unattached scratch run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

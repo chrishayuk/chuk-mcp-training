@@ -98,10 +98,11 @@ impl Hub {
 
     // ---- experiments-server mirror (best-effort, fire-and-forget) ----------
 
-    fn mirror_created(&self, run_id: &RunId, spec: &RunSpec) {
+    fn mirror_created(&self, run_id: &RunId, spec: &RunSpec, experiment_ref: Option<&str>) {
         if let Some(exp) = &self.experiments {
             let (exp, run_id, spec) = (exp.clone(), run_id.clone(), spec.clone());
-            tokio::spawn(async move { exp.report_created(run_id, spec).await });
+            let experiment_ref = experiment_ref.map(str::to_owned);
+            tokio::spawn(async move { exp.report_created(run_id, spec, experiment_ref).await });
         }
     }
 
@@ -503,9 +504,14 @@ impl Hub {
 
     // ---- submissions -------------------------------------------------------
 
-    pub async fn submit(&self, name: &str, spec: &RunSpec) -> Result<RunId> {
-        let run_id = self.store.create_run(name, spec).await?;
-        self.mirror_created(&run_id, spec);
+    pub async fn submit(
+        &self,
+        name: &str,
+        spec: &RunSpec,
+        experiment_ref: Option<&str>,
+    ) -> Result<RunId> {
+        let run_id = self.store.create_run(name, spec, experiment_ref).await?;
+        self.mirror_created(&run_id, spec, experiment_ref);
         self.pump().await?;
         Ok(run_id)
     }

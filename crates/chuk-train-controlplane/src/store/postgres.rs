@@ -54,15 +54,16 @@ CREATE TABLE IF NOT EXISTS workers (
   last_seen    double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runs (
-  id           text PRIMARY KEY,
-  name         text NOT NULL,
-  kind         text NOT NULL,
-  spec         text NOT NULL,
-  state        text NOT NULL,
-  worker_id    text,
-  exit_code    bigint,
-  created_at   double precision NOT NULL,
-  updated_at   double precision NOT NULL
+  id             text PRIMARY KEY,
+  name           text NOT NULL,
+  kind           text NOT NULL,
+  spec           text NOT NULL,
+  state          text NOT NULL,
+  worker_id      text,
+  exit_code      bigint,
+  experiment_ref text,
+  created_at     double precision NOT NULL,
+  updated_at     double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS run_logs (
   run_id       text NOT NULL,
@@ -174,9 +175,11 @@ ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS location text NOT NULL DEFAULT 
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS drive_file_ids text;
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS archived_at double precision;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS experiments_run_id text;
--- Monotonic run sequence (the 5-digit run-id tail). Matches
--- chuk-experiments-server's run_ref_seq so the two systems mint the same shape.
-CREATE SEQUENCE IF NOT EXISTS run_ref_seq;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS experiment_ref text;
+-- Monotonic execution sequence (the 5-digit tail of our EXEC-… ids). Ours
+-- alone — deliberately independent of chuk-experiments-server's run_ref_seq,
+-- since our execution ids no longer share their run-id shape.
+CREATE SEQUENCE IF NOT EXISTS exec_ref_seq;
 "#;
 
 pub struct PgStore {
@@ -286,8 +289,8 @@ impl Store for PgStore {
 
     async fn next_run_seq(&self) -> Result<i64> {
         // nextval() is atomic across sessions (even through Neon's pooler), so
-        // the run sequence stays gap-tolerant but never collides.
-        let row = sqlx::query("SELECT nextval('run_ref_seq') AS value")
+        // the execution sequence stays gap-tolerant but never collides.
+        let row = sqlx::query("SELECT nextval('exec_ref_seq') AS value")
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<i64, _>("value"))
@@ -310,17 +313,23 @@ impl Store for PgStore {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("experiments_run_id")))
     }
 
-    async fn create_run(&self, name: &str, spec: &RunSpec) -> Result<RunId> {
+    async fn create_run(
+        &self,
+        name: &str,
+        spec: &RunSpec,
+        experiment_ref: Option<&str>,
+    ) -> Result<RunId> {
         let run_id = RunId(new_run_id(now(), self.next_run_seq().await?));
         sqlx::query(
-            "INSERT INTO runs (id, name, kind, spec, state, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $6)",
+            "INSERT INTO runs (id, name, kind, spec, state, experiment_ref, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
         )
         .bind(&run_id.0)
         .bind(name)
         .bind(spec.kind_str())
         .bind(serde_json::to_string(spec)?)
         .bind(RunState::Queued.as_str())
+        .bind(experiment_ref)
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -1081,6 +1090,7 @@ fn run_from_row(row: &PgRow) -> Result<RunRecord> {
             state: enum_from_string(row.get::<String, _>("state"))?,
             worker_id: row.get::<Option<String>, _>("worker_id").map(WorkerId),
             exit_code: row.get("exit_code"),
+            experiment_ref: row.get("experiment_ref"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         },
@@ -1154,8 +1164,8 @@ mod pg_live {
 
         // runs + events + transition + sortable id
         let spec = RunSpec::Shell(ShellSpec { command: "echo hi".into(), timeout_s: 60 });
-        let run_id = store.create_run("pg-live", &spec).await.expect("create_run");
-        assert!(run_id.0.starts_with("RUN-"), "{}", run_id.0);
+        let run_id = store.create_run("pg-live", &spec, None).await.expect("create_run");
+        assert!(run_id.0.starts_with("EXEC-"), "{}", run_id.0);
         let rec = store.run(&run_id).await.expect("run").expect("some");
         assert_eq!(rec.summary.name, "pg-live");
         assert!(matches!(rec.summary.state, RunState::Queued));

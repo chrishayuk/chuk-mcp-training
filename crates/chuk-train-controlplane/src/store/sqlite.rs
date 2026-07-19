@@ -18,7 +18,8 @@ use super::ids::{
 };
 use super::Store;
 
-/// Counter row name backing the monotonic run sequence (the run-id tail).
+/// Counter row name backing the monotonic execution sequence (the 5-digit tail
+/// of our `EXEC-…` ids).
 const RUN_SEQ_COUNTER: &str = "run_seq";
 
 const SCHEMA: &str = r#"
@@ -32,15 +33,16 @@ CREATE TABLE IF NOT EXISTS workers (
   last_seen    REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runs (
-  id           TEXT PRIMARY KEY,
-  name         TEXT NOT NULL,
-  kind         TEXT NOT NULL,
-  spec         TEXT NOT NULL,
-  state        TEXT NOT NULL,
-  worker_id    TEXT,
-  exit_code    INTEGER,
-  created_at   REAL NOT NULL,
-  updated_at   REAL NOT NULL
+  id             TEXT PRIMARY KEY,
+  name           TEXT NOT NULL,
+  kind           TEXT NOT NULL,
+  spec           TEXT NOT NULL,
+  state          TEXT NOT NULL,
+  worker_id      TEXT,
+  exit_code      INTEGER,
+  experiment_ref TEXT,
+  created_at     REAL NOT NULL,
+  updated_at     REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS run_logs (
   run_id       TEXT NOT NULL,
@@ -177,6 +179,7 @@ impl SqliteStore {
             "ALTER TABLE checkpoints ADD COLUMN drive_file_ids TEXT",
             "ALTER TABLE checkpoints ADD COLUMN archived_at REAL",
             "ALTER TABLE runs ADD COLUMN experiments_run_id TEXT",
+            "ALTER TABLE runs ADD COLUMN experiment_ref TEXT",
         ] {
             let _ = sqlx::query(stmt).execute(&pool).await;
         }
@@ -296,17 +299,23 @@ impl Store for SqliteStore {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("experiments_run_id")))
     }
 
-    async fn create_run(&self, name: &str, spec: &RunSpec) -> Result<RunId> {
+    async fn create_run(
+        &self,
+        name: &str,
+        spec: &RunSpec,
+        experiment_ref: Option<&str>,
+    ) -> Result<RunId> {
         let run_id = RunId(new_run_id(now(), self.next_run_seq().await?));
         sqlx::query(
-            "INSERT INTO runs (id, name, kind, spec, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            "INSERT INTO runs (id, name, kind, spec, state, experiment_ref, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         )
         .bind(&run_id.0)
         .bind(name)
         .bind(spec.kind_str())
         .bind(serde_json::to_string(spec)?)
         .bind(RunState::Queued.as_str())
+        .bind(experiment_ref)
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -1058,9 +1067,54 @@ fn run_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RunRecord> {
             state: enum_from_string(row.get::<String, _>("state"))?,
             worker_id: row.get::<Option<String>, _>("worker_id").map(WorkerId),
             exit_code: row.get("exit_code"),
+            experiment_ref: row.get("experiment_ref"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         },
         spec,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chuk_train_proto::ShellSpec;
+
+    async fn mem_store() -> SqliteStore {
+        // A private in-memory db; the single pooled connection keeps it alive
+        // for the whole test.
+        SqliteStore::open(":memory:").await.expect("open :memory:")
+    }
+
+    fn shell_spec() -> RunSpec {
+        RunSpec::Shell(ShellSpec { command: "echo hi".into(), timeout_s: 60 })
+    }
+
+    #[tokio::test]
+    async fn our_ids_use_the_exec_prefix() {
+        let store = mem_store().await;
+        let id = store.create_run("r", &shell_spec(), None).await.expect("create");
+        assert!(id.0.starts_with("EXEC-"), "{}", id.0);
+    }
+
+    #[tokio::test]
+    async fn experiment_ref_round_trips_the_external_parent() {
+        let store = mem_store().await;
+        let attached = store
+            .create_run("attached", &shell_spec(), Some("RUN-20260718-160217-00042"))
+            .await
+            .expect("create attached");
+        let scratch = store
+            .create_run("scratch", &shell_spec(), None)
+            .await
+            .expect("create scratch");
+
+        let attached = store.run(&attached).await.expect("run").expect("some");
+        assert_eq!(
+            attached.summary.experiment_ref.as_deref(),
+            Some("RUN-20260718-160217-00042"),
+        );
+        let scratch = store.run(&scratch).await.expect("run").expect("some");
+        assert_eq!(scratch.summary.experiment_ref, None);
+    }
 }

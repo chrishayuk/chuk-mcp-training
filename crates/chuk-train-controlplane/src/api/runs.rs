@@ -38,7 +38,9 @@ pub async fn submit_shell(
         command: request.command,
         timeout_s: request.timeout_s.unwrap_or(DEFAULT_SHELL_TIMEOUT.as_secs()),
     });
-    match state.hub.submit(&request.name, &spec).await {
+    // A shell probe is always an unattached scratch run — never mirrored to an
+    // experiments-server logical run.
+    match state.hub.submit(&request.name, &spec, None).await {
         Ok(run_id) => Json(SubmitRunResponse { run_id }).into_response(),
         Err(error) => internal(error),
     }
@@ -146,7 +148,11 @@ pub async fn submit_run(
     if let Err(resp) = require_role(&ctx, Role::Write) {
         return resp;
     }
-    match state.hub.submit(&request.name, &request.spec).await {
+    match state
+        .hub
+        .submit(&request.name, &request.spec, request.experiment_ref.as_deref())
+        .await
+    {
         Ok(run_id) => Json(SubmitRunResponse { run_id }).into_response(),
         Err(error) => internal(error),
     }
