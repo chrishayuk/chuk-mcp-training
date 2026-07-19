@@ -21,9 +21,11 @@ their final checkpoint + logs to Drive, R2 lifecycle expires the hot copies,
 retrieval resolves R2 *or* Drive, with `archive_run`/`archive_runs`/`archive_status`
 MCP tools); and **RBAC** — users + roles (sysadmin › admin › write › read) in a
 team, with **self-service scoped MCP API keys** (any signed-in user mints their
-own ≤ their role; admins manage the team). Next M-work: M4 budget caps +
-watchdogs and an **optional** chuk-experiments-server reporting mirror, then M3
-packing. See `ROADMAP.md`.
+own ≤ their role; admins manage the team); and an **optional
+chuk-experiments-server reporting mirror** (gated off by default — when
+configured, run lifecycle + checkpoints-as-artifacts + final-metrics-as-results
+mirror into the experiments registry, best-effort). Next M-work: M4 budget caps +
+watchdogs, then M3 packing. See `ROADMAP.md`.
 
 **Runs standalone.** Every external tier is gated and optional — no R2 (falls
 back to `file:`), no Drive (archive tier off), no Google auth (API-token box),

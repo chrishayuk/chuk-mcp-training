@@ -51,11 +51,13 @@ Colab run's final checkpoint + logs + metrics tiered to Drive, promoted to `ckpt
 R2, and streamed back through the retrieval resolver. **RBAC** (§12) is live: users +
 roles (sysadmin › admin › write › read) in a team, with **self-service** scoped MCP API
 keys (any signed-in user mints their own ≤ their role; admins manage the team) from the
-dashboard's Access screen. Providers: `mock` (tested), `vast` (skeleton, untested against
-the live API). Not yet built: the packing scheduler (M3), budget caps + watchdog gates
-(M4), the optional chuk-experiments-server reporting mirror (§11.6), sweeps + lazarus
-integration + Lambda driver (M5). (The R2 lifecycle rules that expire the hot copies need
-an Admin R/W R2 token, or a manual dashboard config.)
+dashboard's Access screen. The **chuk-experiments-server reporting mirror** (§11.6) is built
+and verified end-to-end — optional and gated (off unless configured), it mirrors run
+lifecycle + checkpoints (as artifacts) + final metrics (as results). Providers: `mock`
+(tested), `vast` (skeleton, untested against the live API). Not yet built: the packing
+scheduler (M3), budget caps + watchdog gates (M4), sweeps + lazarus integration + Lambda
+driver (M5). (The R2 lifecycle rules that expire the hot copies need an Admin R/W R2 token,
+or a manual dashboard config.)
 
 ---
 
@@ -561,7 +563,7 @@ R2 *or* Drive transparently. Auth is a long-lived offline refresh token, minted 
 `DriveClient` (token refresh, folder-ensure, resumable upload/download/delete) is built
 and live-proven, with the tiering/retrieval job pending.
 
-### 11.6 chuk-experiments-server reporting (optional mirror — planned)
+### 11.6 chuk-experiments-server reporting (optional mirror)
 
 [chuk-experiments-server](https://github.com/chrishayuk/chuk-experiments-server) is the
 research **system of record** (programme → experiment → run → result/artifact). The harness
@@ -585,6 +587,12 @@ ids and ours share the same `RUN-YYYYMMDD-HHMMSS-NNNNN` shape but are **parallel
 id-spaces** (each from its own store sequence), linked by `harness_session_id`. Their
 `/v1/queue` claim/lease contract (workers *pull* work the experiments-server enqueued) is a
 possible **later opt-in** execution mode — an add-on, never a replacement for our own queue.
+
+Every report is **fire-and-forget**, spawned off the run's critical path (a slow or down
+experiments-server logs a warning and never blocks or fails a run). Built and verified
+end-to-end (`crates/chuk-train-cp/src/experiments.rs`). *Known limitation:* a transient
+failure drops that one update (no retry) — a durable outbox with retry is future work, so
+the mirror is best-effort, not a guaranteed-consistent replica.
 
 ---
 

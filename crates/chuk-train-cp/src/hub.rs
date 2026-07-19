@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::artifacts::{keys, ArtifactStore};
+use crate::experiments::Experiments;
 use crate::grant::GrantTable;
 use crate::store::Store;
 
@@ -30,18 +31,52 @@ pub type AgentTx = mpsc::UnboundedSender<CpToAgent>;
 pub struct Hub {
     pub store: Arc<dyn Store>,
     pub artifacts: Arc<dyn ArtifactStore>,
+    /// chuk-experiments-server reporting mirror; `None` when unconfigured
+    /// (spec §11.6). Every use is best-effort and off the run's critical path.
+    experiments: Option<Arc<Experiments>>,
     grants: GrantTable,
     links: Mutex<HashMap<WorkerId, AgentTx>>,
 }
 
 impl Hub {
-    pub fn new(store: Arc<dyn Store>, artifacts: Arc<dyn ArtifactStore>) -> Arc<Self> {
+    pub fn new(
+        store: Arc<dyn Store>,
+        artifacts: Arc<dyn ArtifactStore>,
+        experiments: Option<Arc<Experiments>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             artifacts,
+            experiments,
             grants: GrantTable::default(),
             links: Mutex::new(HashMap::new()),
         })
+    }
+
+    // ---- experiments-server mirror (best-effort, fire-and-forget) ----------
+    // Each spawns a detached task so a slow/down experiments-server can never
+    // block or fail a run; a no-op when the mirror is unconfigured.
+
+    fn mirror_created(&self, run_id: &RunId, spec: &RunSpec) {
+        if let Some(exp) = &self.experiments {
+            let (exp, run_id, spec) = (exp.clone(), run_id.clone(), spec.clone());
+            tokio::spawn(async move { exp.report_created(run_id, spec).await });
+        }
+    }
+
+    fn mirror_state(&self, run_id: &RunId, state: RunState) {
+        if let Some(exp) = &self.experiments {
+            let (exp, run_id) = (exp.clone(), run_id.clone());
+            tokio::spawn(async move { exp.report_state(run_id, state).await });
+        }
+    }
+
+    fn mirror_checkpoint(&self, run_id: &RunId, step: u64, uri: &str, meta: &CheckpointMeta) {
+        if let Some(exp) = &self.experiments {
+            let (exp, run_id, uri, meta) =
+                (exp.clone(), run_id.clone(), uri.to_owned(), meta.clone());
+            tokio::spawn(async move { exp.report_checkpoint(run_id, step, uri, meta).await });
+        }
     }
 
     pub fn grants(&self) -> &GrantTable {
@@ -229,6 +264,7 @@ impl Hub {
                         serde_json::Value::Null,
                     )
                     .await?;
+                self.mirror_state(&run_id, RunState::Running);
             }
             AgentToCp::JobExited { run_id, code } => {
                 let state = if code == 0 {
@@ -246,6 +282,7 @@ impl Hub {
                         serde_json::Value::Null,
                     )
                     .await?;
+                self.mirror_state(&run_id, state);
                 self.store.set_worker_run(worker_id, None).await?;
                 self.pump().await?;
             }
@@ -277,6 +314,7 @@ impl Hub {
                 serde_json::json!({ "step": step, "uri": uri, "model_hash": model_hash }),
             )
             .await?;
+        self.mirror_checkpoint(run_id, step, &uri, meta);
         info!(run = %run_id, step, "checkpoint recorded");
         Ok(())
     }
@@ -285,6 +323,7 @@ impl Hub {
 
     pub async fn submit(&self, name: &str, spec: &RunSpec) -> Result<RunId> {
         let run_id = self.store.create_run(name, spec).await?;
+        self.mirror_created(&run_id, spec);
         self.pump().await?;
         Ok(run_id)
     }

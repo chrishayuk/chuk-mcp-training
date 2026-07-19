@@ -49,6 +49,11 @@ pub trait Store: Send + Sync {
     async fn create_run(&self, name: &str, spec: &RunSpec) -> Result<RunId>;
     /// Next value of the monotonic run sequence (the 5-digit id tail).
     async fn next_run_seq(&self) -> Result<i64>;
+    /// Persist the chuk-experiments-server run id this run is mirrored to
+    /// (spec §11.6), so later lifecycle/artifact reports can address it.
+    async fn set_experiments_run_id(&self, run_id: &RunId, ext_run_id: &str) -> Result<()>;
+    /// The mirrored experiments-server run id, or `None` if not mirrored.
+    async fn experiments_run_id(&self, run_id: &RunId) -> Result<Option<String>>;
     async fn transition(
         &self,
         run_id: &RunId,

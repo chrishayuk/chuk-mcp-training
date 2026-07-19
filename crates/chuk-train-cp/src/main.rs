@@ -15,6 +15,7 @@ mod codeunit;
 mod config;
 mod dash;
 mod drive;
+mod experiments;
 mod grant;
 mod hub;
 mod lease;
@@ -35,6 +36,7 @@ use crate::archive::Archiver;
 use crate::artifacts::{open_artifact_store, ArtifactStore};
 use crate::config::Config;
 use crate::drive::DriveClient;
+use crate::experiments::Experiments;
 use crate::hub::Hub;
 use crate::lease::LeaseManager;
 use crate::provider::build_providers;
@@ -109,7 +111,24 @@ async fn main() -> Result<()> {
     }
     let drive = DriveClient::from_env()?.map(Arc::new);
     info!(archive_tier = drive.is_some(), "drive cold-archive tier");
-    let hub = Hub::new(store, artifacts.clone());
+    // chuk-experiments-server reporting mirror (spec §11.6): optional and gated —
+    // off unless CHUK_EXPERIMENTS_URL + CHUK_EXPERIMENTS_API_KEY are set. When on,
+    // a startup ensure creates-or-confirms the default experiment and validates
+    // the credentials early; the mirror otherwise reports lazily off run events.
+    let experiments = Experiments::from_env(store.clone(), &config.public_url);
+    info!(
+        experiments = experiments.is_some(),
+        "experiments-server reporting mirror"
+    );
+    if let Some(exp) = experiments.clone() {
+        tokio::spawn(async move {
+            match exp.ensure().await {
+                Ok(()) => info!("experiments-server: default experiment ready"),
+                Err(e) => warn!(error = %e, "experiments-server ensure failed (mirror retries lazily)"),
+            }
+        });
+    }
+    let hub = Hub::new(store, artifacts.clone(), experiments);
     // Archive/retention: when Drive is configured, a background loop tiers each
     // completed run (final checkpoint + logs/metrics) to Drive and records the
     // location; it is also the backstop for any run a prior pass missed.

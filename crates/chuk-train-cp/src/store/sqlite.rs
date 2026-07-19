@@ -165,6 +165,7 @@ impl SqliteStore {
             "ALTER TABLE checkpoints ADD COLUMN location TEXT NOT NULL DEFAULT 'r2_hot'",
             "ALTER TABLE checkpoints ADD COLUMN drive_file_ids TEXT",
             "ALTER TABLE checkpoints ADD COLUMN archived_at REAL",
+            "ALTER TABLE runs ADD COLUMN experiments_run_id TEXT",
         ] {
             let _ = sqlx::query(stmt).execute(&pool).await;
         }
@@ -265,6 +266,23 @@ impl Store for SqliteStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.get::<i64, _>("value"))
+    }
+
+    async fn set_experiments_run_id(&self, run_id: &RunId, ext_run_id: &str) -> Result<()> {
+        sqlx::query("UPDATE runs SET experiments_run_id = ?2 WHERE id = ?1")
+            .bind(&run_id.0)
+            .bind(ext_run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn experiments_run_id(&self, run_id: &RunId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT experiments_run_id FROM runs WHERE id = ?1")
+            .bind(&run_id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("experiments_run_id")))
     }
 
     async fn create_run(&self, name: &str, spec: &RunSpec) -> Result<RunId> {

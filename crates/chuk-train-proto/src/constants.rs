@@ -76,6 +76,16 @@ pub const DEFAULT_TEAM_NAME: &str = "Default";
 /// Prefix on generated MCP API keys, so they're recognisable.
 pub const API_KEY_PREFIX: &str = "ck_";
 
+/// chuk-experiments-server reporting mirror (spec §11.6) — the default
+/// programme/experiment harness runs report into. Optional and gated: the whole
+/// mirror is a no-op unless `EXPERIMENTS_URL` + `EXPERIMENTS_API_KEY` are set.
+/// Both slugs are env-overridable; the experiments-server auto-creates the
+/// programme the first time an experiment references it.
+pub const DEFAULT_EXPERIMENTS_PROGRAMME: &str = "gpu-training-harness";
+pub const DEFAULT_EXPERIMENTS_PROGRAMME_TITLE: &str = "GPU training harness";
+pub const DEFAULT_EXPERIMENTS_EXPERIMENT: &str = "harness-runs";
+pub const DEFAULT_EXPERIMENTS_EXPERIMENT_TITLE: &str = "Harness runs";
+
 /// Default number of log lines returned by the tail endpoint.
 pub const DEFAULT_LOG_TAIL_LINES: u32 = 100;
 /// Default page size for run listings.
@@ -179,6 +189,15 @@ pub mod env {
     pub const SYSADMIN_EMAIL: &str = "CHUK_TRAIN_SYSADMIN_EMAIL";
     /// Path to the agent binary the mock provider launches as fake instances.
     pub const AGENT_BIN: &str = "CHUK_TRAIN_AGENT_BIN";
+    /// chuk-experiments-server base URL (e.g. https://chuk-experiments-server.fly.dev).
+    /// The reporting mirror (spec §11.6) is OFF unless this and the key are set.
+    pub const EXPERIMENTS_URL: &str = "CHUK_EXPERIMENTS_URL";
+    /// A WRITE-scoped experiments-server API key (raw bearer token, not `ck_`).
+    pub const EXPERIMENTS_API_KEY: &str = "CHUK_EXPERIMENTS_API_KEY";
+    /// Programme slug harness runs report under (default: gpu-training-harness).
+    pub const EXPERIMENTS_PROGRAMME: &str = "CHUK_EXPERIMENTS_PROGRAMME";
+    /// Experiment slug harness runs attach to (default: harness-runs).
+    pub const EXPERIMENTS_EXPERIMENT: &str = "CHUK_EXPERIMENTS_EXPERIMENT";
 }
 
 /// Environment variables the harness exports to a train entrypoint — the

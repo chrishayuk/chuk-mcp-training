@@ -162,6 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_leases_state ON leases (state);
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS location text NOT NULL DEFAULT 'r2_hot';
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS drive_file_ids text;
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS archived_at double precision;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS experiments_run_id text;
 -- Monotonic run sequence (the 5-digit run-id tail). Matches
 -- chuk-experiments-server's run_ref_seq so the two systems mint the same shape.
 CREATE SEQUENCE IF NOT EXISTS run_ref_seq;
@@ -279,6 +280,23 @@ impl Store for PgStore {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<i64, _>("value"))
+    }
+
+    async fn set_experiments_run_id(&self, run_id: &RunId, ext_run_id: &str) -> Result<()> {
+        sqlx::query("UPDATE runs SET experiments_run_id = $2 WHERE id = $1")
+            .bind(&run_id.0)
+            .bind(ext_run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn experiments_run_id(&self, run_id: &RunId) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT experiments_run_id FROM runs WHERE id = $1")
+            .bind(&run_id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("experiments_run_id")))
     }
 
     async fn create_run(&self, name: &str, spec: &RunSpec) -> Result<RunId> {
