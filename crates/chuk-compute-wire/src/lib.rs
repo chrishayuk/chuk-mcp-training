@@ -30,7 +30,8 @@ mod telemetry;
 
 pub use capability::{Accelerator, Capabilities, GpuInfo, WorkerClass};
 pub use constants::{
-    DEFAULT_TELEMETRY_INTERVAL_SECS, DEFAULT_TERM_GRACE_SECS, PROTOCOL_VERSION, SYS_METRIC_PREFIX,
+    DEFAULT_TELEMETRY_INTERVAL_SECS, DEFAULT_TERM_GRACE_SECS, PROTOCOL_VERSION, SANDBOX_PLACEHOLDER,
+    SYS_METRIC_PREFIX,
 };
 pub use ids::{ArtifactClass, CampaignId, JobId, Template, WorkerId};
 pub use job::{

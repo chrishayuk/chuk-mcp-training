@@ -10,6 +10,7 @@ name = "chuk-train-cp"
 path = "src/main.rs"
 
 [dependencies]
+chuk-compute-wire = { workspace = true }
 chuk-train-proto = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"

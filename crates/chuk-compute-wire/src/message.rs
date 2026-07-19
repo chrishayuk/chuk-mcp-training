@@ -200,13 +200,14 @@ mod tests {
                 env: BTreeMap::new(),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
+                metrics_file: None,
                 max_runtime_secs: Some(600),
                 term_grace_secs: crate::DEFAULT_TERM_GRACE_SECS,
                 service: None,
                 needs: Vec::new(),
                 campaign: None,
                 placement: crate::Placement::default(),
-                output_grant: None,
+                grant: None,
             },
         };
         let value = serde_json::to_value(&msg).unwrap();

@@ -684,6 +684,7 @@ dependencies = [
  "aws-smithy-types",
  "axum",
  "base64",
+ "chuk-compute-wire",
  "chuk-train-proto",
  "dotenvy",
  "futures-util",

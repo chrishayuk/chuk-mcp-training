@@ -32,6 +32,11 @@ pub struct Job {
     /// What to collect from the sandbox, and when.
     #[serde(default)]
     pub outputs: Vec<OutputRule>,
+    /// Path the worker tails as JSON-lines, streaming each record as a
+    /// [`crate::WorkerToCp::Metric`]. May contain [`SANDBOX_PLACEHOLDER`]. Unset
+    /// means the job emits no metric stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_file: Option<String>,
     /// Wall-clock budget for a batch job; its effective deadline is
     /// `min(worker wall, now + max_runtime_secs)`. Unset for service jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,10 +57,12 @@ pub struct Job {
     /// Scheduler placement hints.
     #[serde(default)]
     pub placement: Placement,
-    /// Scoped, short-lived token the worker uses to mint upload URLs for this
-    /// job's outputs. The worker never holds long-lived storage credentials.
+    /// Scoped, short-lived token the worker attaches when fetching inputs or
+    /// uploading outputs that route back through the control plane (the
+    /// filesystem backend; presigned object-store URLs need no token). The
+    /// worker never holds long-lived storage credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_grant: Option<String>,
+    pub grant: Option<String>,
 }
 
 fn default_term_grace_secs() -> u64 {
@@ -67,11 +74,19 @@ fn default_term_grace_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputArtifact {
     pub uri: String,
-    /// Destination path within the sandbox.
+    /// Destination path within the sandbox (may contain [`SANDBOX_PLACEHOLDER`]).
     pub dest: String,
     /// Expected content hash, verified after download when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// When set, `dest` is a directory and the artifact is an archive
+    /// (`.tar`/`.tar.zst`) unpacked into it rather than written as a file.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unpack: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A rule pairing an output class with a glob and when to upload matches.
@@ -169,12 +184,25 @@ mod tests {
         assert!(job.env.is_empty());
         assert!(job.inputs.is_empty());
         assert!(job.outputs.is_empty());
+        assert!(job.metrics_file.is_none());
         assert!(job.max_runtime_secs.is_none());
         assert!(job.service.is_none());
         assert!(job.needs.is_empty());
         assert!(job.campaign.is_none());
-        assert!(job.output_grant.is_none());
+        assert!(job.grant.is_none());
         assert_eq!(job.placement, Placement::default());
+    }
+
+    #[test]
+    fn input_unpack_defaults_false_and_is_skipped_when_false() {
+        let staged: InputArtifact =
+            serde_json::from_str(r#"{"uri":"https://s/x","dest":"code"}"#).unwrap();
+        assert!(!staged.unpack); // serde default
+        // A false flag is omitted on the wire; a true one is present.
+        let file = serde_json::to_value(&staged).unwrap();
+        assert!(file.get("unpack").is_none());
+        let archive = InputArtifact { unpack: true, ..staged };
+        assert_eq!(serde_json::to_value(&archive).unwrap()["unpack"], true);
     }
 
     #[test]
@@ -190,12 +218,14 @@ mod tests {
                 uri: "https://store/ds".into(),
                 dest: "data/".into(),
                 sha256: Some("abc".into()),
+                unpack: true,
             }],
             outputs: vec![OutputRule {
                 class: ArtifactClass::from("report"),
                 glob: "out/*.json".into(),
                 upload: UploadPolicy::OnExit,
             }],
+            metrics_file: Some("${SANDBOX}/metrics.jsonl".into()),
             max_runtime_secs: Some(120),
             term_grace_secs: 10,
             service: None,
@@ -205,7 +235,7 @@ mod tests {
                 prefer_worker: Some(WorkerId::from("w-home")),
                 require_labels: BTreeMap::from([("site".into(), "home".into())]),
             },
-            output_grant: Some("scoped-token".into()),
+            grant: Some("scoped-token".into()),
         };
         let round: Job = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
         assert_eq!(round, job);

@@ -18,6 +18,7 @@ mod drive;
 mod experiments;
 mod grant;
 mod hub;
+mod jobspec;
 mod lease;
 mod provider;
 mod store;
