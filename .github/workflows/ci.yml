@@ -68,7 +68,7 @@ jobs:
         if: matrix.zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.14.1
+          version: 0.14.0
 
       - name: Install cargo-zigbuild
         if: matrix.zig
@@ -87,12 +87,14 @@ jobs:
           name: ${{ matrix.target }}
           path: target/${{ matrix.target }}/release/chuk-compute-worker
 
-  # Production deploy to Fly. Runs only on a push to main, and only after clippy +
-  # tests AND every worker target (incl. the musl cross-builds) are green — so a
-  # broken commit never reaches production. Needs the FLY_API_TOKEN repo secret.
+  # Production deploy to Fly. Runs only on a push to main, gated on clippy + tests.
+  # It deliberately does NOT depend on build-targets: the deploy image self-builds
+  # the x86_64-musl worker via musl-tools (deploy/Dockerfile), so it never needs
+  # the zig-based distribution artifacts — coupling prod releases to flaky zig
+  # mirrors would be wrong. Needs the FLY_API_TOKEN repo secret.
   deploy:
     name: fly deploy
-    needs: [check, build-targets]
+    needs: [check]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     concurrency:
