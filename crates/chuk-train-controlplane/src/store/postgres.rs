@@ -271,6 +271,16 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn worker_is_persistent(&self, id: &WorkerId) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM worker_tokens WHERE worker_id = $1 AND revoked_at IS NULL LIMIT 1",
+        )
+        .bind(&id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
     async fn worker(&self, id: &WorkerId) -> Result<Option<WorkerInfo>> {
         let row = sqlx::query("SELECT * FROM workers WHERE id = $1")
             .bind(&id.0)

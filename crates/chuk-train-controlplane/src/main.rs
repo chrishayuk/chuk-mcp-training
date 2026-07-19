@@ -138,6 +138,13 @@ async fn main() -> Result<()> {
         tokio::spawn(exp.run_outbox_loop(chuk_train_proto::DEFAULT_EXPERIMENTS_OUTBOX_INTERVAL));
     }
     let hub = Hub::new(store, artifacts.clone(), experiments);
+    // Heartbeat reaper: sweeps the fleet for workers whose link is half-open
+    // (a frozen tab that never delivered a socket close) and re-queues their
+    // stranded resumable runs (spec §7). Always on — a core scheduling guarantee.
+    tokio::spawn(
+        hub.clone()
+            .run_reaper_loop(chuk_train_proto::HEARTBEAT_REAP_INTERVAL),
+    );
     // Archive/retention: when Drive is configured, a background loop tiers each
     // completed run (final checkpoint + logs/metrics) to Drive and records the
     // location; it is also the backstop for any run a prior pass missed.

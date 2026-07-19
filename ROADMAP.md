@@ -51,14 +51,15 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 
 ## Immediate next steps
 
-1. **Run stop/cancel + resume** — quick win: the agent already fully handles `CpToAgent::Cancel`,
-   but nothing on the CP can send it (no route, no hub method, no MCP tool), so the only way to
-   stop a run today is to tear down its worker. Add a `stop_run` (send Cancel → `Cancelled`) +
-   `resume_run` (re-queue a terminal run). Most plumbing exists.
-2. **Heartbeat-timeout requeue** — `last_seen` is recorded on every message but never scanned,
-   so a half-open tunnel (frozen Colab tab) strands a run until the lease wall instead of the
-   spec's 90s→unreachable / 10min→preempted. A periodic staleness scan that requeues resumable
-   runs bounds the loss the checkpoint schedule is meant to bound.
+1. ~~**Run stop/cancel + resume**~~ ✅ **done (2026-07-19).** `stop_run` signals the run's worker
+   (`Cancel` → `JobKilled{Cancel}` → `Cancelled`; a queued or link-gone run finalises directly),
+   `resume_run` re-queues a terminal run (train resumes from its latest checkpoint). REST
+   `/runs/{id}/stop`+`/resume`, MCP tools, and dashboard buttons.
+2. ~~**Heartbeat-timeout requeue**~~ ✅ **done (2026-07-19).** `last_seen` is now swept: an
+   always-on reaper loop preempts + re-queues a resumable run on a worker silent past 10 min
+   (spec §7, reusing the `detach` requeue; persistent workers keep their run per M3.2), and the
+   scheduler no longer assigns new work to a worker unreachable past 90s. Both thresholds are
+   pure decisions (`eligible_for_assignment`/`should_reap`) off the fleet's `heartbeat_age_s`.
 3. **M4 budgets + watchdogs** — the dashboard's done; the remaining M4 is per-provider/
    label caps checked on provision/extend, and watchdog gates (isnan/no-improve/grad-blowup)
    that checkpoint-then-stop (reusing the stop path from step 1).

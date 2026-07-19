@@ -251,6 +251,16 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn worker_is_persistent(&self, id: &WorkerId) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 FROM worker_tokens WHERE worker_id = ?1 AND revoked_at IS NULL LIMIT 1",
+        )
+        .bind(&id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
     async fn worker(&self, id: &WorkerId) -> Result<Option<WorkerInfo>> {
         let row = sqlx::query("SELECT * FROM workers WHERE id = ?1")
             .bind(&id.0)
@@ -1200,6 +1210,27 @@ mod tests {
         );
         let scratch = store.run(&scratch).await.expect("run").expect("some");
         assert_eq!(scratch.summary.experiment_ref, None);
+    }
+
+    #[tokio::test]
+    async fn worker_is_persistent_tracks_a_live_bound_token() {
+        let store = mem_store().await;
+        let persist = WorkerId("mac-01".into());
+        // No token yet → not persistent.
+        assert!(!store.worker_is_persistent(&persist).await.expect("query"));
+        store
+            .create_worker_token("tok-1", &persist, "mac", "cw_abcd1234", "hash")
+            .await
+            .expect("create token");
+        assert!(store.worker_is_persistent(&persist).await.expect("query"));
+        // An unrelated worker id stays non-persistent.
+        assert!(!store
+            .worker_is_persistent(&WorkerId("ephemeral-9".into()))
+            .await
+            .expect("query"));
+        // Revoking the token drops the worker back to ephemeral.
+        assert!(store.revoke_worker_token("tok-1").await.expect("revoke"));
+        assert!(!store.worker_is_persistent(&persist).await.expect("query"));
     }
 
     #[tokio::test]

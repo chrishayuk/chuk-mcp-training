@@ -44,6 +44,10 @@ pub trait Store: Send + Sync {
     async fn set_worker_run(&self, id: &WorkerId, run: Option<&RunId>) -> Result<()>;
     async fn worker(&self, id: &WorkerId) -> Result<Option<WorkerInfo>>;
     async fn fleet(&self) -> Result<Vec<WorkerInfo>>;
+    /// Whether this worker id is bound to a live persistent-worker token
+    /// (chuk-compute M3.1) — i.e. its class is `Persistent`. Used by the
+    /// heartbeat reaper to leave a persistent worker's run assigned.
+    async fn worker_is_persistent(&self, id: &WorkerId) -> Result<bool>;
 
     // runs
     /// Create a queued run. `experiment_ref` is the optional external parent —

@@ -40,8 +40,15 @@ pub const SUPPORTED_TARGETS: [&str; 4] = [
 /// How often a connected agent sends a heartbeat.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Heartbeat silence after which the control plane treats a worker as
-/// unreachable (spec §7: "Heartbeat loss > 90s ⇒ unreachable").
+/// unreachable (spec §7: "Heartbeat loss > 90s ⇒ unreachable"). An unreachable
+/// worker is given no new work.
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Total heartbeat silence after which a resumable run on a (now unreachable)
+/// worker is preempted and re-queued (spec §7: "past 10 min ⇒ preempted +
+/// re-queue"). The checkpoint schedule bounds the loss.
+pub const HEARTBEAT_PREEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+/// How often the control plane sweeps the fleet for heartbeat-lost workers.
+pub const HEARTBEAT_REAP_INTERVAL: Duration = Duration::from_secs(30);
 /// How long the control plane waits for the `register` message on a fresh
 /// websocket before dropping it.
 pub const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);

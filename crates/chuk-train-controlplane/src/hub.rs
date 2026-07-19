@@ -19,8 +19,9 @@ use anyhow::{Context, Result};
 use chuk_compute_wire as wire;
 use chuk_train_proto::{
     keys, CheckpointMeta, EventKind, Hardware, LeaseState, RunId, RunSpec, RunState, TrainSpec,
-    WorkerId, CHECKPOINT_DIR_PREFIX, CHECKPOINT_META_FILE, CHECKPOINT_MODEL_FILE,
-    EXIT_CODE_AGENT_ERROR, EXIT_CODE_CANCELLED,
+    WorkerId, WorkerInfo, WorkerState, CHECKPOINT_DIR_PREFIX, CHECKPOINT_META_FILE,
+    CHECKPOINT_MODEL_FILE, EXIT_CODE_AGENT_ERROR, EXIT_CODE_CANCELLED, HEARTBEAT_PREEMPT_TIMEOUT,
+    HEARTBEAT_TIMEOUT,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -178,6 +179,42 @@ impl Hub {
         self.pump().await
     }
 
+    /// Sweep the fleet for heartbeat-lost workers (spec §7). A worker still
+    /// marked connected but silent past the preempt timeout is presumed gone and
+    /// detached — which re-queues a leased worker's resumable run (a persistent
+    /// worker keeps its run for when it reconnects, M3.2). This is the backstop
+    /// for a half-open link (a frozen Colab tab) that never delivered a socket
+    /// close, so `detach` was never called from the websocket task.
+    pub async fn reap_stale_workers(&self) -> Result<()> {
+        let preempt_after = HEARTBEAT_PREEMPT_TIMEOUT.as_secs_f64();
+        for worker in self.store.fleet().await? {
+            if !should_reap(&worker, preempt_after) {
+                continue;
+            }
+            let class = if self.store.worker_is_persistent(&worker.id).await? {
+                wire::WorkerClass::Persistent
+            } else {
+                wire::WorkerClass::Leased
+            };
+            warn!(worker = %worker.id, age_s = worker.heartbeat_age_s, ?class, "heartbeat lost; reaping worker");
+            self.detach(&worker.id, class).await?;
+        }
+        Ok(())
+    }
+
+    /// Run [`Self::reap_stale_workers`] forever on a fixed interval. Spawned once
+    /// at startup; a failed sweep is logged and retried on the next tick.
+    pub async fn run_reaper_loop(self: Arc<Self>, interval: std::time::Duration) {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if let Err(error) = self.reap_stale_workers().await {
+                warn!(%error, "heartbeat reaper sweep failed");
+            }
+        }
+    }
+
     // ---- scheduling --------------------------------------------------------
 
     /// Assign queued runs to idle connected workers, FIFO. The links lock is held
@@ -189,15 +226,7 @@ impl Hub {
             let Some(worker) = self.store.worker(worker_id).await? else {
                 continue;
             };
-            if worker.current_run.is_some() {
-                continue;
-            }
-            // A draining worker takes no new work (spec §4: past T-drain).
-            if worker
-                .lease
-                .as_ref()
-                .is_some_and(|l| l.state == LeaseState::Draining)
-            {
+            if !eligible_for_assignment(&worker, HEARTBEAT_TIMEOUT.as_secs_f64()) {
                 continue;
             }
             let Some(run) = self.store.next_queued().await? else {
@@ -606,6 +635,26 @@ fn kill_reason_state(reason: &wire::KillReason) -> (RunState, i64) {
     }
 }
 
+/// Whether an idle connected worker may be handed a queued run. It must be free
+/// (no current run), not draining toward its lease wall (spec §4), and not
+/// unreachable — a worker silent past the heartbeat timeout gets no new work
+/// (spec §7) so we never assign to a frozen tab.
+fn eligible_for_assignment(worker: &WorkerInfo, unreachable_after_s: f64) -> bool {
+    worker.current_run.is_none()
+        && !worker
+            .lease
+            .as_ref()
+            .is_some_and(|l| l.state == LeaseState::Draining)
+        && worker.heartbeat_age_s <= unreachable_after_s
+}
+
+/// Whether the heartbeat reaper should give up on a worker: still marked
+/// connected, but silent past the preempt timeout (spec §7). An already
+/// disconnected worker has been handled by `detach`, so it is skipped.
+fn should_reap(worker: &WorkerInfo, preempt_after_s: f64) -> bool {
+    worker.state == WorkerState::Connected && worker.heartbeat_age_s >= preempt_after_s
+}
+
 /// A [`wire::JobId`] is a run's id verbatim on the fabric.
 fn run_id(job_id: &wire::JobId) -> RunId {
     RunId(job_id.0.clone())
@@ -752,5 +801,97 @@ mod tests {
         .unwrap();
         let done = hub.store.run(&run).await.unwrap().unwrap();
         assert_eq!(done.summary.state, RunState::Cancelled);
+    }
+
+    // ---- heartbeat reaper (spec §7) ---------------------------------------
+
+    fn worker_info(state: WorkerState, current_run: Option<&str>, age_s: f64) -> WorkerInfo {
+        WorkerInfo {
+            id: WorkerId("w".into()),
+            labels: vec![],
+            hardware: Hardware::default(),
+            state,
+            current_run: current_run.map(|r| RunId(r.into())),
+            joined_at: 0.0,
+            last_seen: 0.0,
+            heartbeat_age_s: age_s,
+            lease: None,
+        }
+    }
+
+    #[test]
+    fn assignment_eligibility_honours_run_drain_and_staleness() {
+        let fresh = |age| worker_info(WorkerState::Connected, None, age);
+        // Free, fresh, unleased → eligible.
+        assert!(eligible_for_assignment(&fresh(1.0), 90.0));
+        // Already running a job → not eligible.
+        assert!(!eligible_for_assignment(
+            &worker_info(WorkerState::Connected, Some("EXEC-1"), 1.0),
+            90.0
+        ));
+        // Silent past the unreachable timeout → no new work (spec §7).
+        assert!(!eligible_for_assignment(&fresh(120.0), 90.0));
+        // Exactly at the boundary is still eligible (strictly greater excludes).
+        assert!(eligible_for_assignment(&fresh(90.0), 90.0));
+    }
+
+    #[test]
+    fn reap_targets_only_connected_workers_past_the_preempt_wall() {
+        // Connected + silent past preempt → reap.
+        assert!(should_reap(&worker_info(WorkerState::Connected, Some("EXEC-1"), 601.0), 600.0));
+        // Connected but recently seen → keep.
+        assert!(!should_reap(&worker_info(WorkerState::Connected, Some("EXEC-1"), 120.0), 600.0));
+        // Already disconnected (detach handled it) → skip.
+        assert!(!should_reap(&worker_info(WorkerState::Disconnected, None, 9999.0), 600.0));
+    }
+
+    #[tokio::test]
+    async fn reaper_leaves_a_freshly_seen_worker_alone() {
+        let hub = test_hub().await;
+        let run = hub.submit("r", &shell_run(), None).await.unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let worker = WorkerId("w-fresh".into());
+        hub.attach(&worker, tx, &[], &Hardware::default()).await.unwrap();
+        assert_eq!(
+            hub.store.run(&run).await.unwrap().unwrap().summary.state,
+            RunState::Assigned
+        );
+        // The worker was just seen (age ~0), so the sweep must not touch it.
+        hub.reap_stale_workers().await.unwrap();
+        assert_eq!(
+            hub.store.run(&run).await.unwrap().unwrap().summary.state,
+            RunState::Assigned
+        );
+        assert!(matches!(
+            hub.store.worker(&worker).await.unwrap().unwrap().state,
+            WorkerState::Connected
+        ));
+    }
+
+    #[tokio::test]
+    async fn detach_requeues_leased_but_keeps_persistent() {
+        // Leased: a lost worker's run is requeued (bounded loss).
+        let hub = test_hub().await;
+        let run = hub.submit("leased", &shell_run(), None).await.unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let worker = WorkerId("w-leased".into());
+        hub.attach(&worker, tx, &[], &Hardware::default()).await.unwrap();
+        hub.detach(&worker, wire::WorkerClass::Leased).await.unwrap();
+        assert_eq!(
+            hub.store.run(&run).await.unwrap().unwrap().summary.state,
+            RunState::Queued
+        );
+
+        // Persistent: the run stays assigned for the worker to reconnect (M3.2).
+        let hub = test_hub().await;
+        let run = hub.submit("persist", &shell_run(), None).await.unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let worker = WorkerId("w-persist".into());
+        hub.attach(&worker, tx, &[], &Hardware::default()).await.unwrap();
+        hub.detach(&worker, wire::WorkerClass::Persistent).await.unwrap();
+        assert_eq!(
+            hub.store.run(&run).await.unwrap().unwrap().summary.state,
+            RunState::Assigned
+        );
     }
 }
