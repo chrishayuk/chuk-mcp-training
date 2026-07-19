@@ -21,13 +21,14 @@ use chuk_train_proto::{
     CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
     MetricPoint, MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec, RunState,
     RunSummary, UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTelemetry,
-    WorkerTokenInfo,
+    WorkerTokenInfo, WORKER_SAMPLE_RETENTION,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
 
 use super::ids::{
     downsample_in_place, enum_from_string, enum_to_string, merge_field, new_run_id, now,
+    worker_telemetry_from_samples,
 };
 use super::Store;
 
@@ -54,9 +55,9 @@ CREATE TABLE IF NOT EXISTS workers (
   joined_at    double precision NOT NULL,
   last_seen    double precision NOT NULL
 );
-CREATE TABLE IF NOT EXISTS worker_telemetry (
-  worker_id    text PRIMARY KEY,
-  sampled_at   double precision NOT NULL,
+CREATE TABLE IF NOT EXISTS worker_samples (
+  worker_id    text NOT NULL,
+  ts           double precision NOT NULL,
   payload      text NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runs (
@@ -189,6 +190,7 @@ CREATE INDEX IF NOT EXISTS idx_metrics_run  ON metrics (run_id, key, step);
 CREATE INDEX IF NOT EXISTS idx_ckpt_run     ON checkpoints (run_id, step);
 CREATE INDEX IF NOT EXISTS idx_leases_state ON leases (state);
 CREATE INDEX IF NOT EXISTS idx_outbox_due   ON experiments_outbox (next_attempt_at) WHERE completed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_worker_samples ON worker_samples (worker_id, ts);
 -- Additive migrations for a checkpoints table created before these columns
 -- (Postgres supports ADD COLUMN IF NOT EXISTS, so this is idempotent).
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS location text NOT NULL DEFAULT 'r2_hot';
@@ -296,33 +298,33 @@ impl Store for PgStore {
         worker_id: &WorkerId,
         values: &BTreeMap<String, f64>,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO worker_telemetry (worker_id, sampled_at, payload) VALUES ($1, $2, $3)
-             ON CONFLICT(worker_id) DO UPDATE SET sampled_at = excluded.sampled_at,
-                                                  payload = excluded.payload",
-        )
-        .bind(&worker_id.0)
-        .bind(now())
-        .bind(serde_json::to_string(values)?)
-        .execute(&self.pool)
-        .await?;
+        let at = now();
+        sqlx::query("INSERT INTO worker_samples (worker_id, ts, payload) VALUES ($1, $2, $3)")
+            .bind(&worker_id.0)
+            .bind(at)
+            .bind(serde_json::to_string(values)?)
+            .execute(&self.pool)
+            .await?;
+        // Bound the history to the sparkline window, pruned on write.
+        sqlx::query("DELETE FROM worker_samples WHERE worker_id = $1 AND ts < $2")
+            .bind(&worker_id.0)
+            .bind(at - WORKER_SAMPLE_RETENTION.as_secs_f64())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     async fn worker_telemetry(&self, worker_id: &WorkerId) -> Result<Option<WorkerTelemetry>> {
-        let row =
-            sqlx::query("SELECT sampled_at, payload FROM worker_telemetry WHERE worker_id = $1")
+        let rows =
+            sqlx::query("SELECT ts, payload FROM worker_samples WHERE worker_id = $1 ORDER BY ts")
                 .bind(&worker_id.0)
-                .fetch_optional(&self.pool)
+                .fetch_all(&self.pool)
                 .await?;
-        row.map(|r| {
-            Ok(WorkerTelemetry {
-                worker_id: worker_id.clone(),
-                sampled_at: r.get("sampled_at"),
-                values: serde_json::from_str(&r.get::<String, _>("payload"))?,
-            })
-        })
-        .transpose()
+        let samples = rows
+            .into_iter()
+            .map(|r| Ok((r.get::<f64, _>("ts"), r.get::<String, _>("payload"))))
+            .collect::<Result<Vec<_>>>()?;
+        worker_telemetry_from_samples(worker_id, samples)
     }
 
     async fn worker(&self, id: &WorkerId) -> Result<Option<WorkerInfo>> {
@@ -345,8 +347,23 @@ impl Store for PgStore {
             .iter()
             .map(worker_from_row)
             .collect::<Result<_>>()?;
+        // Latest sys/* sample per worker (one query), for the fleet's live column.
+        let latest = sqlx::query(
+            "SELECT worker_id, payload FROM worker_samples s
+             WHERE ts = (SELECT MAX(ts) FROM worker_samples WHERE worker_id = s.worker_id)",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut telemetry: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+        for row in &latest {
+            telemetry.insert(
+                row.get("worker_id"),
+                serde_json::from_str(&row.get::<String, _>("payload"))?,
+            );
+        }
         for worker in &mut workers {
             worker.lease = self.lease(&worker.id).await?;
+            worker.telemetry = telemetry.remove(&worker.id.0);
         }
         Ok(workers)
     }
@@ -1243,8 +1260,9 @@ fn worker_from_row(row: &PgRow) -> Result<WorkerInfo> {
         joined_at: row.get("joined_at"),
         last_seen,
         heartbeat_age_s: ((now() - last_seen) * 10.0).round() / 10.0,
-        // Populated by worker()/fleet() from the leases table after conversion.
+        // Populated by worker()/fleet() from the leases + telemetry tables.
         lease: None,
+        telemetry: None,
     })
 }
 

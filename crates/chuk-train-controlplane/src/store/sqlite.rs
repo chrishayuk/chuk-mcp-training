@@ -9,13 +9,14 @@ use chuk_train_proto::{
     CodeUnitManifest, DEFAULT_TEAM_ID, EventKind, Hardware, Lease, LeaseExtension, LeaseState,
     LedgerEntry, MetricPoint, MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec,
     RunState, RunSummary, UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTelemetry,
-    WorkerTokenInfo,
+    WorkerTokenInfo, WORKER_SAMPLE_RETENTION,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 
 use super::ids::{
     downsample_in_place, enum_from_string, enum_to_string, merge_field, new_run_id, now,
+    worker_telemetry_from_samples,
 };
 use super::Store;
 
@@ -33,11 +34,12 @@ CREATE TABLE IF NOT EXISTS workers (
   joined_at    REAL NOT NULL,
   last_seen    REAL NOT NULL
 );
-CREATE TABLE IF NOT EXISTS worker_telemetry (
-  worker_id    TEXT PRIMARY KEY,
-  sampled_at   REAL NOT NULL,
+CREATE TABLE IF NOT EXISTS worker_samples (
+  worker_id    TEXT NOT NULL,
+  ts           REAL NOT NULL,
   payload      TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_worker_samples ON worker_samples (worker_id, ts);
 CREATE TABLE IF NOT EXISTS runs (
   id             TEXT PRIMARY KEY,
   name           TEXT NOT NULL,
@@ -276,33 +278,33 @@ impl Store for SqliteStore {
         worker_id: &WorkerId,
         values: &BTreeMap<String, f64>,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO worker_telemetry (worker_id, sampled_at, payload) VALUES (?1, ?2, ?3)
-             ON CONFLICT(worker_id) DO UPDATE SET sampled_at = excluded.sampled_at,
-                                                  payload = excluded.payload",
-        )
-        .bind(&worker_id.0)
-        .bind(now())
-        .bind(serde_json::to_string(values)?)
-        .execute(&self.pool)
-        .await?;
+        let at = now();
+        sqlx::query("INSERT INTO worker_samples (worker_id, ts, payload) VALUES (?1, ?2, ?3)")
+            .bind(&worker_id.0)
+            .bind(at)
+            .bind(serde_json::to_string(values)?)
+            .execute(&self.pool)
+            .await?;
+        // Bound the history to the sparkline window, pruned on write.
+        sqlx::query("DELETE FROM worker_samples WHERE worker_id = ?1 AND ts < ?2")
+            .bind(&worker_id.0)
+            .bind(at - WORKER_SAMPLE_RETENTION.as_secs_f64())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     async fn worker_telemetry(&self, worker_id: &WorkerId) -> Result<Option<WorkerTelemetry>> {
-        let row =
-            sqlx::query("SELECT sampled_at, payload FROM worker_telemetry WHERE worker_id = ?1")
+        let rows =
+            sqlx::query("SELECT ts, payload FROM worker_samples WHERE worker_id = ?1 ORDER BY ts")
                 .bind(&worker_id.0)
-                .fetch_optional(&self.pool)
+                .fetch_all(&self.pool)
                 .await?;
-        row.map(|r| {
-            Ok(WorkerTelemetry {
-                worker_id: worker_id.clone(),
-                sampled_at: r.get("sampled_at"),
-                values: serde_json::from_str(&r.get::<String, _>("payload"))?,
-            })
-        })
-        .transpose()
+        let samples = rows
+            .into_iter()
+            .map(|r| Ok((r.get::<f64, _>("ts"), r.get::<String, _>("payload"))))
+            .collect::<Result<Vec<_>>>()?;
+        worker_telemetry_from_samples(worker_id, samples)
     }
 
     async fn worker(&self, id: &WorkerId) -> Result<Option<WorkerInfo>> {
@@ -325,8 +327,23 @@ impl Store for SqliteStore {
             .into_iter()
             .map(worker_from_row)
             .collect::<Result<_>>()?;
+        // Latest sys/* sample per worker (one query), for the fleet's live column.
+        let latest = sqlx::query(
+            "SELECT worker_id, payload FROM worker_samples s
+             WHERE ts = (SELECT MAX(ts) FROM worker_samples WHERE worker_id = s.worker_id)",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut telemetry: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+        for row in latest {
+            telemetry.insert(
+                row.get("worker_id"),
+                serde_json::from_str(&row.get::<String, _>("payload"))?,
+            );
+        }
         for worker in &mut workers {
             worker.lease = self.lease(&worker.id).await?;
+            worker.telemetry = telemetry.remove(&worker.id.0);
         }
         Ok(workers)
     }
@@ -1220,8 +1237,9 @@ fn worker_from_row(row: sqlx::sqlite::SqliteRow) -> Result<WorkerInfo> {
         joined_at: row.get("joined_at"),
         last_seen,
         heartbeat_age_s: ((now() - last_seen) * 10.0).round() / 10.0,
-        // Populated by worker()/fleet() from the leases table after conversion.
+        // Populated by worker()/fleet() from the leases + telemetry tables.
         lease: None,
+        telemetry: None,
     })
 }
 
@@ -1309,29 +1327,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_telemetry_upserts_the_latest_sample() {
+    async fn worker_telemetry_keeps_history_and_latest() {
         let store = mem_store().await;
         let w = WorkerId("gpu-1".into());
+        store.worker_joined(&w, &[], &Hardware::default()).await.expect("join");
         // Nothing reported yet.
         assert!(store.worker_telemetry(&w).await.expect("query").is_none());
 
-        let first = BTreeMap::from([("sys/gpu_util".to_owned(), 0.5)]);
-        store.record_worker_samples(&w, &first).await.expect("record");
-        let t = store.worker_telemetry(&w).await.expect("query").expect("some");
-        assert_eq!(t.worker_id, w);
-        assert_eq!(t.values["sys/gpu_util"], 0.5);
+        store
+            .record_worker_samples(&w, &BTreeMap::from([("sys/gpu_util".to_owned(), 0.5)]))
+            .await
+            .expect("record");
+        store
+            .record_worker_samples(
+                &w,
+                &BTreeMap::from([
+                    ("sys/gpu_util".to_owned(), 0.9),
+                    ("sys/cpu_util".to_owned(), 0.2),
+                ]),
+            )
+            .await
+            .expect("record");
 
-        // A later sample overwrites — one row per worker, always the newest.
-        let second = BTreeMap::from([
-            ("sys/gpu_util".to_owned(), 0.9),
-            ("sys/cpu_util".to_owned(), 0.2),
-        ]);
-        store.record_worker_samples(&w, &second).await.expect("record");
         let t = store.worker_telemetry(&w).await.expect("query").expect("some");
+        // Gauges read the newest sample.
         assert_eq!(t.values["sys/gpu_util"], 0.9);
         assert_eq!(t.values["sys/cpu_util"], 0.2);
-        // The overwrite dropped no keys the newest sample carried.
-        assert_eq!(t.values.len(), 2);
+        // Sparkline history retains both samples.
+        assert_eq!(t.series["sys/gpu_util"].len(), 2);
+
+        // The fleet view carries each worker's latest values inline (no N+1 fetch).
+        let fleet = store.fleet().await.expect("fleet");
+        let me = fleet.iter().find(|x| x.id == w).expect("worker in fleet");
+        assert_eq!(me.telemetry.as_ref().expect("telemetry")["sys/gpu_util"], 0.9);
     }
 
     #[tokio::test]

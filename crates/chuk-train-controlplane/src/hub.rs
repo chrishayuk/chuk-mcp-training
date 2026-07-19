@@ -835,6 +835,7 @@ mod tests {
             last_seen: 0.0,
             heartbeat_age_s: age_s,
             lease: None,
+            telemetry: None,
         }
     }
 

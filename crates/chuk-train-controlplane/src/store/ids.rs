@@ -6,8 +6,10 @@
 //! Centralising them means the id/date logic (and the rest) lives in exactly
 //! one place regardless of which backend is compiled in — no per-adapter drift.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
-use chuk_train_proto::{MetricPoint, UnixSeconds};
+use chuk_train_proto::{MetricPoint, TelemetryPoint, UnixSeconds, WorkerId, WorkerTelemetry};
 
 /// Our run ids are `EXEC-YYYYMMDD-HHMMSS-{5-digit sequence}` (UTC) —
 /// self-describing, chronologically sortable, and **deliberately distinct from
@@ -116,6 +118,38 @@ pub(super) fn merge_field(value: &mut serde_json::Value, key: &str, field: serde
         .insert(key.to_owned(), field);
 }
 
+/// Fold a worker's stored samples — `(ts, payload_json)` rows **ascending by
+/// ts** — into a [`WorkerTelemetry`]: `values`/`sampled_at` from the newest
+/// sample (live gauges), and per-key `series` across the whole window
+/// (sparklines). `None` when the worker has no samples. Shared by both adapters.
+pub(super) fn worker_telemetry_from_samples(
+    worker_id: &WorkerId,
+    samples: Vec<(UnixSeconds, String)>,
+) -> Result<Option<WorkerTelemetry>> {
+    if samples.is_empty() {
+        return Ok(None);
+    }
+    let mut series: BTreeMap<String, Vec<TelemetryPoint>> = BTreeMap::new();
+    let mut latest: Option<(UnixSeconds, BTreeMap<String, f64>)> = None;
+    for (ts, payload) in samples {
+        let values: BTreeMap<String, f64> = serde_json::from_str(&payload)?;
+        for (key, &value) in &values {
+            series
+                .entry(key.clone())
+                .or_default()
+                .push(TelemetryPoint { ts, value });
+        }
+        latest = Some((ts, values));
+    }
+    let (sampled_at, values) = latest.expect("non-empty checked above");
+    Ok(Some(WorkerTelemetry {
+        worker_id: worker_id.clone(),
+        sampled_at,
+        values,
+        series,
+    }))
+}
+
 #[cfg(test)]
 mod id_tests {
     use super::*;
@@ -142,5 +176,25 @@ mod id_tests {
         let later = new_run_id(1_609_545_600.0, 1); // +1 day
         let stamp = |s: &str| s[..EXEC_ID_PREFIX.len() + 8].to_owned();
         assert!(stamp(&later) > stamp(&id));
+    }
+
+    #[test]
+    fn telemetry_folds_latest_values_and_full_series() {
+        let w = WorkerId("gpu-1".into());
+        assert!(worker_telemetry_from_samples(&w, vec![]).unwrap().is_none());
+
+        let samples = vec![
+            (100.0, r#"{"sys/gpu_util":0.4,"sys/cpu_util":0.1}"#.to_owned()),
+            (103.0, r#"{"sys/gpu_util":0.9,"sys/cpu_util":0.2}"#.to_owned()),
+        ];
+        let t = worker_telemetry_from_samples(&w, samples).unwrap().unwrap();
+        // Latest gauge values + timestamp come from the newest sample.
+        assert_eq!(t.sampled_at, 103.0);
+        assert_eq!(t.values["sys/gpu_util"], 0.9);
+        // Series carries the whole window, ascending, for sparklines.
+        let gpu = &t.series["sys/gpu_util"];
+        assert_eq!(gpu.len(), 2);
+        assert_eq!((gpu[0].ts, gpu[0].value), (100.0, 0.4));
+        assert_eq!((gpu[1].ts, gpu[1].value), (103.0, 0.9));
     }
 }

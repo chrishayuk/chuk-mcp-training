@@ -121,7 +121,12 @@ td .name{font-weight:600} .empty{color:var(--muted);padding:.9rem;font-size:.86r
 .telem .t .val{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:1.05rem;margin-top:.15rem;color:var(--ink)}
 .telem .t .val small{color:var(--muted);font-size:.72rem}
 .sys{display:flex;flex-direction:column;gap:.55rem}
-.sysrow{display:grid;grid-template-columns:3rem 1fr;align-items:center;gap:.6rem}
+.sysrow{display:grid;grid-template-columns:3rem 1fr 88px;align-items:center;gap:.6rem}
+.sysrow .spk{justify-self:end}
+.spark{width:88px;height:16px;display:block}
+.spark polyline{fill:none;stroke:var(--accent);stroke-width:1.5;vector-effect:non-scaling-stroke}
+.fbar{width:64px;height:7px;background:var(--ring);border-radius:4px;overflow:hidden;display:inline-block;vertical-align:middle}
+.fbar .fbfill{height:100%;background:var(--accent);border-radius:4px}
 .sysrow .sk{font-size:.7rem;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
 .sysrow .sv{display:flex;align-items:center;gap:.5rem;font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:.85rem;color:var(--ink)}
 .sysrow .sv small{color:var(--muted);font-size:.72rem}
@@ -251,7 +256,7 @@ async function loadOverview(){
   // workers don't pile up; "all" reveals them.
   const shownFleet=fleetAll?fleet:fleet.filter(w=>w.state==="connected"||(w.lease&&w.lease.state!=="destroyed"));
   const fleetCtl=`<div class="filters"><button aria-pressed="${!fleetAll}" onclick="setFleetAll(false)">active</button><button aria-pressed="${fleetAll}" onclick="setFleetAll(true)">all</button></div>`;
-  const fleetH=shownFleet.length?`<div class="tblwrap"><table><thead><tr><th>worker</th><th>gpu</th><th>state</th><th>hb</th><th>run</th><th>lease</th><th></th></tr></thead><tbody>${shownFleet.map(fleetRow).join("")}</tbody></table></div>`:`<div class="empty">${fleetAll?"no workers":"no active workers"}</div>`;
+  const fleetH=shownFleet.length?`<div class="tblwrap"><table><thead><tr><th>worker</th><th>gpu</th><th>util</th><th>state</th><th>hb</th><th>run</th><th>lease</th><th></th></tr></thead><tbody>${shownFleet.map(fleetRow).join("")}</tbody></table></div>`:`<div class="empty">${fleetAll?"no workers":"no active workers"}</div>`;
   // Runs: state filter + "load more" paging (the fetch already grew runLimit).
   const RSTATES=["all","running","queued","completed","failed"];
   const runCtl=`<div class="filters">${RSTATES.map(s=>`<button aria-pressed="${runFilter===s}" onclick="setRunFilter('${s}')">${s}</button>`).join("")}</div>`;
@@ -276,7 +281,11 @@ function fleetRow(w){
     lease=`${esc(L.provider)} · $${fmt(L.price_hr)}/h · ${pill(lc,L.state)} · <span class="num">${fmt(rem,1)}m</span>`;
     if(L.state!=="destroyed")action=`<button class="btn" onclick="event.stopPropagation();teardown('${esc(w.id)}')">teardown</button>`;}
   const run=w.current_run?`<a href="#/run/${encodeURIComponent(w.current_run)}" class="mono">${esc(String(w.current_run).slice(0,20))}…</a>`:`<span class="empty" style="padding:0">idle</span>`;
-  return `<tr><td class="mono">${esc(w.id)}</td><td>${esc(gpu)}${vram}</td><td>${pill(cls,w.state)}</td><td class="num">${ago(w.heartbeat_age_s)}</td><td>${run}</td><td>${lease}</td><td>${action}</td></tr>`;
+  const tv=w.telemetry||{},gu=tv["sys/gpu_util"];
+  const util=gu!=null
+    ?`<div class="fbar" title="GPU ${Math.round(gu*100)}%"><div class="fbfill" style="width:${Math.round(gu*100)}%"></div></div>`
+    :(tv["sys/cpu_util"]!=null?`<span class="mut">cpu ${Math.round(tv["sys/cpu_util"]*100)}%</span>`:`<span class="empty" style="padding:0">—</span>`);
+  return `<tr><td class="mono">${esc(w.id)}</td><td>${esc(gpu)}${vram}</td><td>${util}</td><td>${pill(cls,w.state)}</td><td class="num">${ago(w.heartbeat_age_s)}</td><td>${run}</td><td>${lease}</td><td>${action}</td></tr>`;
 }
 function runRow(r){
   const cls=RUN_ST[r.state]||"mut";
@@ -378,18 +387,24 @@ async function refreshRun(id,first){
 }
 function gbytes(b){return (b/1073741824).toFixed(1);}
 function sysBar(frac){const p=Math.round(Math.max(0,Math.min(1,frac||0))*100);return `<div class="bar"><div class="fill" style="width:${p}%"></div></div><span class="pv">${p}%</span>`;}
+function spark(pts){
+  if(!pts||pts.length<2)return"";
+  const W=88,H=16,n=pts.length;
+  const d=pts.map((p,i)=>`${(i/(n-1)*W).toFixed(1)},${(H-Math.max(0,Math.min(1,p.value))*(H-2)-1).toFixed(1)}`).join(" ");
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polyline points="${d}"/></svg>`;
+}
 function renderSys(t){
   const el=$("#sys");if(!el)return;
   const age=$("#sysage");
-  const v=t&&t.values;
+  const v=t&&t.values,s=(t&&t.series)||{};
   if(!v){el.innerHTML=`<div class="empty">no telemetry yet</div>`;if(age)age.textContent="";return;}
-  const rows=[],row=(k,inner)=>rows.push(`<div class="sysrow"><div class="sk">${k}</div><div class="sv">${inner}</div></div>`);
-  if(v["sys/gpu_util"]!=null)row("GPU",sysBar(v["sys/gpu_util"]));
-  if(v["sys/gpu_mem_total_bytes"])row("VRAM",sysBar(v["sys/gpu_mem_used_bytes"]/v["sys/gpu_mem_total_bytes"])+` <small>${gbytes(v["sys/gpu_mem_used_bytes"])}/${gbytes(v["sys/gpu_mem_total_bytes"])} GB</small>`);
+  const rows=[],row=(k,inner,sk)=>rows.push(`<div class="sysrow"><div class="sk">${k}</div><div class="sv">${inner}</div><div class="spk">${sk?spark(s[sk]):""}</div></div>`);
+  if(v["sys/gpu_util"]!=null)row("GPU",sysBar(v["sys/gpu_util"]),"sys/gpu_util");
+  if(v["sys/gpu_mem_total_bytes"])row("VRAM",sysBar(v["sys/gpu_mem_used_bytes"]/v["sys/gpu_mem_total_bytes"])+` <small>${gbytes(v["sys/gpu_mem_used_bytes"])}/${gbytes(v["sys/gpu_mem_total_bytes"])} GB</small>`,"sys/gpu_mem_util");
   if(v["sys/gpu_temp_c"]!=null)row("Temp",`<b>${Math.round(v["sys/gpu_temp_c"])}</b>°C`);
   if(v["sys/gpu_power_w"]!=null)row("Power",`<b>${Math.round(v["sys/gpu_power_w"])}</b> W`);
-  if(v["sys/cpu_util"]!=null)row("CPU",sysBar(v["sys/cpu_util"]));
-  if(v["sys/mem_util"]!=null)row("RAM",sysBar(v["sys/mem_util"])+(v["sys/mem_total_bytes"]?` <small>${gbytes(v["sys/mem_used_bytes"])}/${gbytes(v["sys/mem_total_bytes"])} GB</small>`:""));
+  if(v["sys/cpu_util"]!=null)row("CPU",sysBar(v["sys/cpu_util"]),"sys/cpu_util");
+  if(v["sys/mem_util"]!=null)row("RAM",sysBar(v["sys/mem_util"])+(v["sys/mem_total_bytes"]?` <small>${gbytes(v["sys/mem_used_bytes"])}/${gbytes(v["sys/mem_total_bytes"])} GB</small>`:""),"sys/mem_util");
   el.innerHTML=rows.length?rows.join(""):`<div class="empty">no telemetry yet</div>`;
   if(age)age.textContent=t.sampled_at?ago(nows()-t.sampled_at)+" ago":"";
 }

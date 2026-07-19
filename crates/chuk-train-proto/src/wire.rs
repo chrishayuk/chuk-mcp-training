@@ -43,16 +43,31 @@ pub struct WorkerInfo {
     /// The worker's lease, if it was provisioned under one (spec §3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<Lease>,
+    /// The worker's latest `sys/*` host-telemetry values (chuk-compute M4), so
+    /// the fleet view can show live utilisation without a per-worker fetch.
+    /// `None` until it reports a sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<BTreeMap<String, f64>>,
 }
 
-/// A worker's latest host-telemetry sample (chuk-compute M4): the `sys/*` metric
-/// map (GPU/CPU/memory utilisation, VRAM, temperature, power) as of `sampled_at`.
-/// One sample per worker — the live values a dashboard renders as gauges.
+/// One host-telemetry reading at a point in time — a `series` element.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TelemetryPoint {
+    pub ts: UnixSeconds,
+    pub value: f64,
+}
+
+/// A worker's host telemetry (chuk-compute M4): the latest `sys/*` sample
+/// (GPU/CPU/memory utilisation, VRAM, temperature, power) as `values`/`sampled_at`
+/// for live gauges, plus recent per-key `series` (the retained window) for
+/// sparklines.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerTelemetry {
     pub worker_id: WorkerId,
     pub sampled_at: UnixSeconds,
     pub values: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub series: BTreeMap<String, Vec<TelemetryPoint>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

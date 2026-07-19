@@ -49,6 +49,9 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 pub const HEARTBEAT_PREEMPT_TIMEOUT: Duration = Duration::from_secs(600);
 /// How often the control plane sweeps the fleet for heartbeat-lost workers.
 pub const HEARTBEAT_REAP_INTERVAL: Duration = Duration::from_secs(30);
+/// How long the control plane retains a worker's host-telemetry samples
+/// (chuk-compute M4) — the sparkline window; older samples are pruned on write.
+pub const WORKER_SAMPLE_RETENTION: Duration = Duration::from_secs(15 * 60);
 /// How long the control plane waits for the `register` message on a fresh
 /// websocket before dropping it.
 pub const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
