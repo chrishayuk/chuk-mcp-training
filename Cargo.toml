@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/chuk-compute-wire",
     "crates/chuk-train-proto",
-    "crates/chuk-train-cp",
+    "crates/chuk-train-controlplane",
     "crates/chuk-compute-worker",
 ]
 

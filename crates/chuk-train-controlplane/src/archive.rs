@@ -181,7 +181,7 @@ fn now() -> f64 {
 /// Live end-to-end archive of one real completed run. Ignored by default; run
 /// against the deployed backends with `.env` sourced + these overrides:
 ///   CHUK_TRAIN_ARTIFACTS=r2://<bucket> ARCHIVE_TEST_RUN=<run_id> \
-///   cargo test -p chuk-train-cp archive::live::archive_completed_run -- --ignored --nocapture
+///   cargo test -p chuk-train-controlplane archive::live::archive_completed_run -- --ignored --nocapture
 #[cfg(test)]
 mod live {
     use super::*;

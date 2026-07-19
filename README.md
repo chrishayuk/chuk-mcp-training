@@ -61,7 +61,7 @@ control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
 - `crates/chuk-train-proto` — control-plane domain types, constants, and the
   store key layout (run/train/checkpoint specs, RBAC types, REST payloads). The
   source of truth for the training domain + the CP↔MCP REST surface.
-- `crates/chuk-train-cp` — control plane daemon (axum + tokio + sqlx):
+- `crates/chuk-train-controlplane` — control plane daemon (axum + tokio + sqlx):
   `/ws/agent` (worker websocket), `/api/*` (role-authed REST + grant-auth
   upload/fetch), `/` (the operator dashboard), `/healthz`. Adapter seams — the
   metadata store (`postgres:`/`postgresql:` → Neon, or `sqlite:path.db` local),
@@ -100,7 +100,7 @@ control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
 export CHUK_TRAIN_API_TOKEN=$(openssl rand -hex 24)
 export CHUK_TRAIN_JOIN_TOKEN=$(openssl rand -hex 24)
 
-cargo run -p chuk-train-cp                                   # control plane :8700
+cargo run -p chuk-train-controlplane                                   # control plane :8700
 cargo run -p chuk-compute-worker -- \
   --url ws://127.0.0.1:8700/ws/agent --token $CHUK_TRAIN_JOIN_TOKEN
 

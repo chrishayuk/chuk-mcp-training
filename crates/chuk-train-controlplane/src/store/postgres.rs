@@ -1090,7 +1090,7 @@ fn run_from_row(row: &PgRow) -> Result<RunRecord> {
 
 /// Live round-trip against real Neon. Ignored by default (needs a postgres
 /// `CHUK_TRAIN_STORE` in the env); run with `.env` sourced:
-///   cargo test -p chuk-train-cp store::postgres::pg_live::round_trip -- --ignored --nocapture
+///   cargo test -p chuk-train-controlplane store::postgres::pg_live::round_trip -- --ignored --nocapture
 /// Exercises the dialect's risky bits — boolean columns, `bigserial`, the
 /// metric transaction, upserts — and deletes its own rows so the shared DB
 /// stays clean.

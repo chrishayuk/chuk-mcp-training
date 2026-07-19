@@ -1,4 +1,4 @@
-//! chuk-train-cp — the chuk-mcp-training control plane daemon (M0).
+//! chuk-train-controlplane — the chuk-mcp-training control plane daemon (M0).
 //!
 //! Surfaces:
 //!   * `/ws/agent`  — outbound-dial websocket for chuk-compute-worker workers
@@ -230,7 +230,7 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!(addr = %listener.local_addr()?, "chuk-train-cp listening");
+    info!(addr = %listener.local_addr()?, "chuk-train-controlplane listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

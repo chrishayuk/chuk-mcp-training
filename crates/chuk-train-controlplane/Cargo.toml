@@ -1,12 +1,12 @@
 [package]
-name = "chuk-train-cp"
+name = "chuk-train-controlplane"
 description = "chuk-mcp-training control plane daemon: agent websocket, scheduler, run + artifact store, REST API, dashboard"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "chuk-train-cp"
+name = "chuk-train-controlplane"
 path = "src/main.rs"
 
 [dependencies]

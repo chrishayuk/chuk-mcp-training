@@ -477,7 +477,7 @@ mod tests {
 
     /// Live round-trip against real Drive. Ignored by default (needs a grant in
     /// the env); run with `.env` sourced:
-    ///   cargo test -p chuk-train-cp drive::tests::live_round_trip -- --ignored --nocapture
+    ///   cargo test -p chuk-train-controlplane drive::tests::live_round_trip -- --ignored --nocapture
     /// Uses a >1-chunk payload so the resumable 308 → finalise path is exercised.
     #[ignore]
     #[tokio::test]

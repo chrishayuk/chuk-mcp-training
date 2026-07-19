@@ -12,14 +12,14 @@ COPY crates ./crates
 # the build context (not just crates/).
 COPY scripts ./scripts
 # Control plane: native, runs inside the runtime image below.
-RUN cargo build --release -p chuk-train-cp
+RUN cargo build --release -p chuk-train-controlplane
 # Agent: static musl, downloaded + run on bare Colab/Vast Linux.
 RUN cargo build --release -p chuk-compute-worker --target x86_64-unknown-linux-musl
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/chuk-train-cp /usr/local/bin/chuk-train-cp
+COPY --from=build /src/target/release/chuk-train-controlplane /usr/local/bin/chuk-train-controlplane
 # Per-target worker binaries the control plane serves at /agent/<triple>
 # (chuk-compute M2). Only the x86_64-musl target is cross-built in this
 # x86_64-Linux image; aarch64-musl + the darwin targets come from the CI
@@ -32,4 +32,4 @@ ENV CHUK_TRAIN_AGENT_DIR=/app/agents
 # The mock provider (local only) launches this path; unused in the deploy.
 ENV CHUK_TRAIN_AGENT_BIN=/app/agents/x86_64-unknown-linux-musl
 EXPOSE 8700
-CMD ["chuk-train-cp"]
+CMD ["chuk-train-controlplane"]

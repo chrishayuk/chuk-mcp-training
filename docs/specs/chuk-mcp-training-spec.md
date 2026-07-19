@@ -606,7 +606,7 @@ possible **later opt-in** execution mode — an add-on, never a replacement for 
 
 Every report is **fire-and-forget**, spawned off the run's critical path (a slow or down
 experiments-server logs a warning and never blocks or fails a run). Built and verified
-end-to-end (`crates/chuk-train-cp/src/experiments.rs`). *Known limitation:* a transient
+end-to-end (`crates/chuk-train-controlplane/src/experiments.rs`). *Known limitation:* a transient
 failure drops that one update (no retry) — a durable outbox with retry is future work, so
 the mirror is best-effort, not a guaranteed-consistent replica.
 

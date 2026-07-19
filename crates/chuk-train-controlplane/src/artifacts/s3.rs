@@ -95,7 +95,7 @@ fn now() -> f64 {
 
 /// Live check that R2 accepts + persists our lifecycle rules. Ignored by
 /// default; run with `.env` sourced:
-///   cargo test -p chuk-train-cp artifacts::s3::live::lifecycle_round_trip -- --ignored --nocapture
+///   cargo test -p chuk-train-controlplane artifacts::s3::live::lifecycle_round_trip -- --ignored --nocapture
 #[cfg(test)]
 mod live {
     use super::*;

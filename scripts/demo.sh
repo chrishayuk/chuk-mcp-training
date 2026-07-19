@@ -40,14 +40,14 @@ BASE="http://127.0.0.1:8700"
 TOK="$CHUK_TRAIN_API_TOKEN"   # used only for the seed's own /api calls below
 
 echo "› building control plane + agent (debug)…"
-cargo build -q -p chuk-train-cp -p chuk-compute-worker
+cargo build -q -p chuk-train-controlplane -p chuk-compute-worker
 rm -f "$SCRATCH"/demo.db*
 
 echo "› starting control plane…"
 # Run the built binary from an EMPTY dir so it does not pick up the repo's .env
 # (which points at prod Neon / the Fly wss endpoint / Google auth). The demo is
 # fully isolated — only the exported vars above configure it.
-( cd "$SCRATCH" && exec "$REPO/target/debug/chuk-train-cp" ) >"$SCRATCH/cp.log" 2>&1 &
+( cd "$SCRATCH" && exec "$REPO/target/debug/chuk-train-controlplane" ) >"$SCRATCH/cp.log" 2>&1 &
 CP_PID=$!
 cleanup(){ echo; echo "› stopping demo…"; kill "$CP_PID" 2>/dev/null || true; pkill -f 'target/debug/chuk-compute-worker' 2>/dev/null || true; }
 trap cleanup INT TERM EXIT

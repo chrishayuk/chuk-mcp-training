@@ -675,7 +675,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "chuk-train-cp"
+name = "chuk-train-controlplane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
