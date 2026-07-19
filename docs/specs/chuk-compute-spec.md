@@ -266,7 +266,10 @@ worker class): long-lived revocable `cw_` tokens bound to a stable id (M3.1); an
 a persistent worker keeps its job running across a dropped socket / CP restart and replays
 buffered events on reconnect, trimmed by a `HelloAck` high-water the CP dedups by; no lease ⇒
 never torn down. **Proven** (kill the CP mid-run → job runs through the outage → reconnect →
-replay → completes). **M3.3 — remaining:** self-update from a version `HelloReject`. M4 — `sys/*`
+replay → completes). **M3.3 — DONE:** a version-mismatched persistent worker self-updates from a
+`HelloReject` (the CP sends the target's `/agent/<triple>` URL + sha256; the worker downloads →
+verifies → atomically replaces itself → re-execs; a leased worker gets a bare reject and exits).
+Proven. **M3 complete.** M4 — `sys/*`
 sampler (NVML + sysinfo first; macmon-based MPS once the Mac is on). M5 — service jobs, registry,
 `needs` wiring, secrets; LARQL-on-Mac as first service, cell-runtime second. M6 — campaigns with
 budgets and the bench template's pinning gate. M7 — first RL composition: controller job + rollout

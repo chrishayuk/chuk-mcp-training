@@ -59,7 +59,7 @@ scheduler (M3), budget caps + watchdog gates (M4), sweeps + lazarus integration 
 driver (M5). (The R2 lifecycle rules that expire the hot copies need an Admin R/W R2 token,
 or a manual dashboard config.)
 
-**Substrate (chuk-compute M1–M3.2 done):** the worker + wire protocol are now the
+**Substrate (chuk-compute M1–M3 done):** the worker + wire protocol are now the
 compute-generic **chuk-compute** crates (`chuk-compute-wire` + `chuk-compute-worker`; see §7 and
 `chuk-compute-spec.md`). M1 — the worker is a domain-free job executor; the control plane
 translates a run into a generic job and interprets results back into checkpoints (parity proven,
@@ -67,7 +67,8 @@ incl. E1 resume). M2 — per-target worker distribution (`/agent/{triple}` + `.s
 `/agent/version` + `/install.sh`; CI target matrix). M3 (persistent worker class) — long-lived
 `cw_` tokens bound to a stable id + **survive-disconnect** (a persistent worker keeps its job
 running across a dropped socket / CP restart and replays on reconnect; no lease ⇒ never torn
-down). Proven. (M3.3 self-update pending; the control plane crate is `chuk-train-controlplane`.)
+down; and a version-mismatched persistent worker **self-updates** in place). All proven. (The
+control plane crate is `chuk-train-controlplane`.)
 
 ---
 
@@ -384,7 +385,7 @@ Watchdogs are gates with `action="stop_run"`: `isnan(last(loss))`,
 
 ## 7. Agent protocol
 
-> **Now on the `chuk-compute` substrate (M1–M3.2 done) → `chuk-compute-spec.md`.** The worker
+> **Now on the `chuk-compute` substrate (M1–M3 done) → `chuk-compute-spec.md`.** The worker
 > daemon + wire protocol have been extracted into a compute-generic substrate (crates
 > `chuk-compute-wire` + `chuk-compute-worker`): the daemon is a **worker** (not "agent"), the
 > workload model is batch-vs-service, and the worker is domain-free — the control plane
@@ -392,8 +393,9 @@ Watchdogs are gates with `action="stop_run"`: `isnan(last(loss))`,
 > back into checkpoints. Done + proven: **M1** (parity incl. E1 resume/slice), **M2** (per-target
 > distribution `/agent/{triple}` + `/install.sh`), **M3.1/M3.2** (persistent `cw_` worker tokens +
 > stable identity + survive-disconnect — a persistent worker keeps its job running across a
-> dropped socket / CP restart and replays on reconnect). Still to come: M3.3 self-update, then
-> per-run `sys/*` telemetry (M4), service jobs (M5), campaigns (M6), RL (M7). §12 there fixes the
+> dropped socket / CP restart and replays on reconnect), **M3.3** (a version-mismatched
+> persistent worker self-updates in place). Still to come: per-run `sys/*` telemetry (M4),
+> service jobs (M5), campaigns (M6), RL (M7). §12 there fixes the
 > experiment-vs-service boundary. This section describes the run lifecycle semantics, unchanged.
 
 Single outbound WSS; JSON messages; per-worker monotonic sequence numbers; reconnect

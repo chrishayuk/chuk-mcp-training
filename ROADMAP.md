@@ -117,16 +117,16 @@ agent/MCP-deployment platform never colonizes the rig. Sequencing (spec §11):
   three targets (zigbuild + macOS). **Proven: the Mac joins via `curl <CP>/install.sh | sh`.**
   Follow-up: bake the aarch64-musl + darwin CI artifacts into the deployed image (serves x86_64
   today; the Mac builds locally / from CI).
-- **M3 — persistent worker class** (in progress). **M3.1 + M3.2 ✅ done.** M3.1: long-lived
-  revocable worker tokens (`cw_`, hashed at rest) bound to a stable id; a persistent token →
-  `Persistent` class + that id in HelloAck, so a Mac keeps one identity across reconnects/restarts;
-  no lease ⇒ never torn down. M3.2 **survive-disconnect**: the worker's job supervisor + replay
-  outbox outlive a session, so a persistent worker keeps its job running across a dropped socket
-  (or the CP restarting) and replays buffered events on reconnect, trimmed by a `HelloAck`
-  high-water the CP dedups by; the CP doesn't requeue a persistent worker's live job. **Proven:**
-  bounce the CP mid-run → the job keeps running through the outage → reconnect → replay → run
-  completes. **Remaining:** M3.3 self-update from a version `HelloReject` (download + verify +
-  atomic-replace + re-exec). `WorkerClass` is an enum so destroying a persistent worker is unrepresentable.
+- **M3 — persistent worker class** ✅ **done.** M3.1: long-lived revocable worker tokens
+  (`cw_`, hashed at rest) bound to a stable id; a persistent token → `Persistent` class + that id
+  in HelloAck, so a Mac keeps one identity across reconnects/restarts; no lease ⇒ never torn down.
+  M3.2 **survive-disconnect**: the worker's job supervisor + replay outbox outlive a session, so a
+  persistent worker keeps its job running across a dropped socket (or the CP restarting) and
+  replays buffered events on reconnect, trimmed by a `HelloAck` high-water the CP dedups by; the CP
+  doesn't requeue a persistent worker's live job. M3.3 **self-update**: a version-mismatched
+  persistent worker downloads → verifies → atomically replaces itself → re-execs (leased workers
+  just exit). **All three proven** (bounce-the-CP survive-disconnect; forced-version self-update).
+  `WorkerClass` is an enum so destroying a persistent worker is unrepresentable.
 - **M4 — `sys/*` telemetry sampler** — one sampler task over the existing Metric channel: NVML
   (`nvml-wrapper`, runtime-loaded) + `sysinfo` first; macmon/IOReport MPS once the Mac is on
   (tier-2 best-effort, gaps as absent metrics not zeros). Feeds packing-util, OOM/thermal gates, MFU.
@@ -193,6 +193,29 @@ candidate *Requirements-aware assignment* / *generalized bootstrap* items feed i
   guardrails (§8): a shown estimate gate on submit, and Colab compute-units as their own currency.
 
 **Integration depth**
+
+*chuk-experiments-server pairing (from a 2026-07-19 architecture review). The framing: the
+experiments-server owns the **research record** (what/why/concluded/evidence), the harness owns
+**execution** (what ran, where, did it survive, checkpoints/cost). Keep the boundary
+unmistakable — the harness reports **observations, never conclusions**.*
+- **Distinct logical-run vs execution IDs** (S, decide first) — today both mint `RUN-YYYYMMDD-…`
+  in the same shape (we deliberately aligned them, ID #44), linked by `harness_session_id`. The
+  review argues that's a hazard: a *research run* ("evaluate CN-7 over seeds 80–82") and an
+  *execution attempt* ("seed 81, disconnected at 9.5k, resumed, done at 15k") are different things
+  and shouldn't share a name+format across independent namespaces. Proposal: the harness uses its
+  own `EXEC-…` (or keeps `RUN-…` but visually distinct) and accepts the experiments-server run id
+  as an **external parent reference**. ⚠️ This *reverses* ID #44 — a call to make with the user.
+- **Durable reporting outbox** (S–M) — see the item above under *operational hardening*; the review
+  independently flags the fire-and-forget mirror as the thing to fix so completed metrics/artifacts
+  eventually land instead of being lost on a transient error. Do this one.
+- **Required experiment reference on formal jobs** (S) — a `submit_run` for a formal experiment
+  must carry an experiments-server experiment/run reference; keep an explicit *unattached scratch
+  run* mode for quick probes.
+- **One authoritative scheduler** (principle) — the **harness owns the real GPU execution queue**
+  (it knows fit, resumability, lease headroom, budget); the experiments-server holds *intent*
+  (planned → approved → dispatched → running → reported) and does not independently lease/schedule
+  the same GPU work. Its generic `/v1/queue` stays available for simpler external harnesses (the
+  opt-in pull mode below), but the direct pairing has one scheduler.
 - **Native W&B logging** (M) — W&B is only a forwarded out-link today; the CP already ingests
   every metric batch, so creating a W&B run + streaming metrics is a natural add.
 - **experiments-server pull/queue executor mode** (L) — the deepest integration: a gated adapter

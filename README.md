@@ -33,7 +33,7 @@ and no chuk-experiments-server (reporting mirror off). The harness's own Neon/
 SQLite store + queue are always the source of truth; nothing outside is a hard
 dependency.
 
-**chuk-compute substrate (M1–M3.2 done).** Underneath the training-first control
+**chuk-compute substrate (M1–M3 done).** Underneath the training-first control
 plane the rig is being factored into a **compute fabric**: a permanently
 compute-generic worker + wire protocol (spec `docs/specs/chuk-compute-spec.md`).
 - **M1** — the worker (`chuk-compute-worker`) is a domain-free executor that runs
@@ -47,7 +47,9 @@ compute-generic worker + wire protocol (spec `docs/specs/chuk-compute-spec.md`).
   (`cw_`) bound to a stable id, and **survive-disconnect**: a persistent worker
   (e.g. a Mac you own) keeps its job running across a dropped connection — even the
   control plane restarting — and replays buffered events on reconnect; no lease ⇒
-  never torn down. Proven. (M3.3 self-update is the last piece.)
+  never torn down. A version-mismatched persistent worker **self-updates** in
+  place (download → verify → atomic replace → re-exec; leased workers just exit).
+  All three parts proven end-to-end.
 
 The substrate will grow to run evals, benchmarks, cells, agents, and RL loops
 (spec §10–§11) while the control plane stays training-first.
