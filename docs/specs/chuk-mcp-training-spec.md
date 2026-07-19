@@ -59,10 +59,15 @@ scheduler (M3), budget caps + watchdog gates (M4), sweeps + lazarus integration 
 driver (M5). (The R2 lifecycle rules that expire the hot copies need an Admin R/W R2 token,
 or a manual dashboard config.)
 
-**Substrate:** the worker + wire protocol are now the compute-generic **chuk-compute** crates
-(`chuk-compute-wire` + `chuk-compute-worker`; **M1 done**, parity proven — see §7 and
-`chuk-compute-spec.md`). The control plane translates a run into a generic job and interprets the
-results back into checkpoints; the worker is domain-free.
+**Substrate (chuk-compute M1–M3.2 done):** the worker + wire protocol are now the
+compute-generic **chuk-compute** crates (`chuk-compute-wire` + `chuk-compute-worker`; see §7 and
+`chuk-compute-spec.md`). M1 — the worker is a domain-free job executor; the control plane
+translates a run into a generic job and interprets results back into checkpoints (parity proven,
+incl. E1 resume). M2 — per-target worker distribution (`/agent/{triple}` + `.sha256` +
+`/agent/version` + `/install.sh`; CI target matrix). M3 (persistent worker class) — long-lived
+`cw_` tokens bound to a stable id + **survive-disconnect** (a persistent worker keeps its job
+running across a dropped socket / CP restart and replays on reconnect; no lease ⇒ never torn
+down). Proven. (M3.3 self-update pending; the control plane crate is `chuk-train-controlplane`.)
 
 ---
 
@@ -379,16 +384,17 @@ Watchdogs are gates with `action="stop_run"`: `isnan(last(loss))`,
 
 ## 7. Agent protocol
 
-> **Now on the `chuk-compute` substrate (M1 done) → `chuk-compute-spec.md`.** The worker daemon
-> + wire protocol have been extracted into a compute-generic substrate (crates
+> **Now on the `chuk-compute` substrate (M1–M3.2 done) → `chuk-compute-spec.md`.** The worker
+> daemon + wire protocol have been extracted into a compute-generic substrate (crates
 > `chuk-compute-wire` + `chuk-compute-worker`): the daemon is a **worker** (not "agent"), the
 > workload model is batch-vs-service, and the worker is domain-free — the control plane
 > translates a run into a generic `Job` (inputs → command → outputs) and interprets the results
-> back into checkpoints. **M1 is proven** (parity incl. the E1 resume/slice path). Still to come
-> (M2–M7): the target-triple matrix + `install.sh`, a persistent BYO/Mac worker class, per-run
-> `sys/*` telemetry, service jobs, campaigns, and RL. §12 there fixes the experiment-vs-service
-> boundary against the agent/MCP deployment platform. This section describes the run lifecycle
-> semantics, which are unchanged.
+> back into checkpoints. Done + proven: **M1** (parity incl. E1 resume/slice), **M2** (per-target
+> distribution `/agent/{triple}` + `/install.sh`), **M3.1/M3.2** (persistent `cw_` worker tokens +
+> stable identity + survive-disconnect — a persistent worker keeps its job running across a
+> dropped socket / CP restart and replays on reconnect). Still to come: M3.3 self-update, then
+> per-run `sys/*` telemetry (M4), service jobs (M5), campaigns (M6), RL (M7). §12 there fixes the
+> experiment-vs-service boundary. This section describes the run lifecycle semantics, unchanged.
 
 Single outbound WSS; JSON messages; per-worker monotonic sequence numbers; reconnect
 replays from last acked seq. **The agent must tolerate a dark control plane**: if the

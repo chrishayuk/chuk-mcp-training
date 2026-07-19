@@ -33,15 +33,24 @@ and no chuk-experiments-server (reporting mirror off). The harness's own Neon/
 SQLite store + queue are always the source of truth; nothing outside is a hard
 dependency.
 
-**chuk-compute substrate (in progress).** Underneath the training-first control
+**chuk-compute substrate (M1–M3.2 done).** Underneath the training-first control
 plane the rig is being factored into a **compute fabric**: a permanently
-compute-generic worker + wire protocol. **M1 is done** — the worker
-(`chuk-compute-worker`) is a domain-free executor that runs generic *jobs*
-(stage inputs → command → outputs) and speaks `chuk-compute-wire`; the control
-plane translates a run into a generic job and interprets the results back into
-checkpoints. Same behaviour as before (proven — including the E1 resume/slice
-path), now on a substrate that will grow to run evals, benchmarks, cells, agents,
-and RL loops. Spec: `docs/specs/chuk-compute-spec.md`.
+compute-generic worker + wire protocol (spec `docs/specs/chuk-compute-spec.md`).
+- **M1** — the worker (`chuk-compute-worker`) is a domain-free executor that runs
+  generic *jobs* (stage inputs → command → outputs) over `chuk-compute-wire`; the
+  control plane translates a run into a job and interprets results back into
+  checkpoints. Same behaviour as before (proven — including the E1 resume/slice path).
+- **M2** — the CP distributes the worker per target: `/agent/{triple}` + `.sha256`
+  + `/agent/version` + a one-shot `/install.sh` (uname → download → verify → join),
+  so Colab, Vast, and a Mac all bootstrap the same way (CI builds the target matrix).
+- **M3 (persistent worker class)** — long-lived, revocable, per-worker tokens
+  (`cw_`) bound to a stable id, and **survive-disconnect**: a persistent worker
+  (e.g. a Mac you own) keeps its job running across a dropped connection — even the
+  control plane restarting — and replays buffered events on reconnect; no lease ⇒
+  never torn down. Proven. (M3.3 self-update is the last piece.)
+
+The substrate will grow to run evals, benchmarks, cells, agents, and RL loops
+(spec §10–§11) while the control plane stays training-first.
 
 **Stack:** Rust control plane + Rust worker (`chuk-compute-worker`); the MCP tool
 surface is Python on `chuk-mcp-server`, a thin client over the control plane's
