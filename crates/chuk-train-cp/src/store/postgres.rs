@@ -1,4 +1,16 @@
-//! SQLite adapter (sqlx, async native).
+//! PostgreSQL adapter (sqlx, async native).
+//!
+//! A dialect port of [`super::sqlite`]: same tables, columns, and semantics,
+//! rewritten for Postgres. It backs a multi-machine control plane where the
+//! state must live off-box (Fly machine → Neon over TLS). Notable differences
+//! from the SQLite schema, all forced by the dialect:
+//!   * placeholders are `$1, $2, …` (sqlx does not translate `?1`);
+//!   * `REAL`/`INTEGER`/`TEXT` → `double precision`/`bigint`/`text`;
+//!   * the 0/1 integer flags (`connected`, `pinned`) become native `boolean`;
+//!   * `INTEGER PRIMARY KEY AUTOINCREMENT` (rowid surrogate) → `bigserial`.
+//!
+//! Timestamps stay `double precision` unix seconds (`f64`) — the rest of the
+//! code treats them as such; they are deliberately not `timestamptz`.
 
 use std::collections::BTreeMap;
 
@@ -10,7 +22,7 @@ use chuk_train_proto::{
     MetricPoint, MetricSeries, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary,
     UnixSeconds, User, WorkerId, WorkerInfo, WorkerState,
 };
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
 
 use super::ids::{
@@ -18,120 +30,126 @@ use super::ids::{
 };
 use super::Store;
 
-/// Counter row name backing the monotonic run sequence (the run-id tail).
-const RUN_SEQ_COUNTER: &str = "run_seq";
+/// Pool ceiling. Fly runs one small machine against Neon's pooled endpoint, so
+/// a handful of connections is plenty and keeps us well under Neon's limits.
+const MAX_CONNECTIONS: u32 = 5;
 
+/// Explicit column list for checkpoint reads. Never `SELECT *`: on Neon's
+/// pooled endpoint an additive migration would otherwise invalidate a shared
+/// backend's cached plan ("cached plan must not change result type"). Naming
+/// the columns keeps a read's result type stable across `ADD COLUMN`.
+const CKPT_COLUMNS: &str =
+    "run_id, step, uri, model_hash, meta, pinned, pin_name, created_at, location, archived_at";
+
+/// Schema DDL, mirroring the SQLite adapter table-for-table with Postgres
+/// types. Run on every `open()`; `IF NOT EXISTS` makes it idempotent.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workers (
-  id           TEXT PRIMARY KEY,
-  labels       TEXT NOT NULL DEFAULT '[]',
-  hardware     TEXT NOT NULL DEFAULT '{}',
-  connected    INTEGER NOT NULL DEFAULT 1,
-  current_run  TEXT,
-  joined_at    REAL NOT NULL,
-  last_seen    REAL NOT NULL
+  id           text PRIMARY KEY,
+  labels       text NOT NULL DEFAULT '[]',
+  hardware     text NOT NULL DEFAULT '{}',
+  connected    boolean NOT NULL DEFAULT true,
+  current_run  text,
+  joined_at    double precision NOT NULL,
+  last_seen    double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runs (
-  id           TEXT PRIMARY KEY,
-  name         TEXT NOT NULL,
-  kind         TEXT NOT NULL,
-  spec         TEXT NOT NULL,
-  state        TEXT NOT NULL,
-  worker_id    TEXT,
-  exit_code    INTEGER,
-  created_at   REAL NOT NULL,
-  updated_at   REAL NOT NULL
+  id           text PRIMARY KEY,
+  name         text NOT NULL,
+  kind         text NOT NULL,
+  spec         text NOT NULL,
+  state        text NOT NULL,
+  worker_id    text,
+  exit_code    bigint,
+  created_at   double precision NOT NULL,
+  updated_at   double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS run_logs (
-  run_id       TEXT NOT NULL,
-  n            INTEGER NOT NULL,
-  ts           REAL NOT NULL,
-  line         TEXT NOT NULL,
+  run_id       text NOT NULL,
+  n            bigint NOT NULL,
+  ts           double precision NOT NULL,
+  line         text NOT NULL,
   PRIMARY KEY (run_id, n)
 );
 CREATE TABLE IF NOT EXISTS run_events (
-  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id       TEXT NOT NULL,
-  ts           REAL NOT NULL,
-  event        TEXT NOT NULL,
-  detail       TEXT NOT NULL DEFAULT '{}'
+  seq          bigserial PRIMARY KEY,
+  run_id       text NOT NULL,
+  ts           double precision NOT NULL,
+  event        text NOT NULL,
+  detail       text NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS code_units (
-  name         TEXT NOT NULL,
-  sha          TEXT NOT NULL,
-  manifest     TEXT NOT NULL,
-  uri          TEXT NOT NULL,
-  created_at   REAL NOT NULL,
+  name         text NOT NULL,
+  sha          text NOT NULL,
+  manifest     text NOT NULL,
+  uri          text NOT NULL,
+  created_at   double precision NOT NULL,
   PRIMARY KEY (name, sha)
 );
 CREATE TABLE IF NOT EXISTS metrics (
-  run_id       TEXT NOT NULL,
-  step         INTEGER NOT NULL,
-  key          TEXT NOT NULL,
-  value        REAL NOT NULL,
-  ts           REAL NOT NULL,
+  run_id       text NOT NULL,
+  step         bigint NOT NULL,
+  key          text NOT NULL,
+  value        double precision NOT NULL,
+  ts           double precision NOT NULL,
   PRIMARY KEY (run_id, key, step)
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
-  run_id         TEXT NOT NULL,
-  step           INTEGER NOT NULL,
-  uri            TEXT NOT NULL,
-  model_hash     TEXT NOT NULL,
-  meta           TEXT NOT NULL,
-  pinned         INTEGER NOT NULL DEFAULT 0,
-  pin_name       TEXT,
-  created_at     REAL NOT NULL,
-  location       TEXT NOT NULL DEFAULT 'r2_hot',
-  drive_file_ids TEXT,
-  archived_at    REAL,
+  run_id         text NOT NULL,
+  step           bigint NOT NULL,
+  uri            text NOT NULL,
+  model_hash     text NOT NULL,
+  meta           text NOT NULL,
+  pinned         boolean NOT NULL DEFAULT false,
+  pin_name       text,
+  created_at     double precision NOT NULL,
+  location       text NOT NULL DEFAULT 'r2_hot',
+  drive_file_ids text,
+  archived_at    double precision,
   PRIMARY KEY (run_id, step)
 );
 CREATE TABLE IF NOT EXISTS leases (
-  worker_id        TEXT PRIMARY KEY,
-  provider         TEXT NOT NULL,
-  instance_id      TEXT NOT NULL,
-  price_hr         REAL NOT NULL,
-  granted_min      REAL NOT NULL,
-  drain_window_min REAL NOT NULL,
-  started_at       REAL NOT NULL,
-  state            TEXT NOT NULL,
-  extensions       TEXT NOT NULL DEFAULT '[]'
+  worker_id        text PRIMARY KEY,
+  provider         text NOT NULL,
+  instance_id      text NOT NULL,
+  price_hr         double precision NOT NULL,
+  granted_min      double precision NOT NULL,
+  drain_window_min double precision NOT NULL,
+  started_at       double precision NOT NULL,
+  state            text NOT NULL,
+  extensions       text NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS ledger (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts           REAL NOT NULL,
-  worker_id    TEXT NOT NULL,
-  provider     TEXT NOT NULL,
-  event        TEXT NOT NULL,
-  minutes      REAL NOT NULL,
-  cost         REAL NOT NULL
+  id           bigserial PRIMARY KEY,
+  ts           double precision NOT NULL,
+  worker_id    text NOT NULL,
+  provider     text NOT NULL,
+  event        text NOT NULL,
+  minutes      double precision NOT NULL,
+  cost         double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS teams (
-  id           TEXT PRIMARY KEY,
-  name         TEXT NOT NULL,
-  created_at   REAL NOT NULL
+  id           text PRIMARY KEY,
+  name         text NOT NULL,
+  created_at   double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS users (
-  email        TEXT PRIMARY KEY,
-  team_id      TEXT NOT NULL,
-  role         TEXT NOT NULL,
-  created_at   REAL NOT NULL
+  email        text PRIMARY KEY,
+  team_id      text NOT NULL,
+  role         text NOT NULL,
+  created_at   double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS api_keys (
-  id           TEXT PRIMARY KEY,
-  team_id      TEXT NOT NULL,
-  created_by   TEXT NOT NULL,
-  name         TEXT NOT NULL,
-  prefix       TEXT NOT NULL,
-  key_hash     TEXT NOT NULL,
-  role         TEXT NOT NULL,
-  created_at   REAL NOT NULL,
-  last_used_at REAL,
-  revoked_at   REAL
-);
-CREATE TABLE IF NOT EXISTS counters (
-  name         TEXT PRIMARY KEY,
-  value        INTEGER NOT NULL
+  id           text PRIMARY KEY,
+  team_id      text NOT NULL,
+  created_by   text NOT NULL,
+  name         text NOT NULL,
+  prefix       text NOT NULL,
+  key_hash     text NOT NULL,
+  role         text NOT NULL,
+  created_at   double precision NOT NULL,
+  last_used_at double precision,
+  revoked_at   double precision
 );
 CREATE INDEX IF NOT EXISTS idx_apikeys_hash ON api_keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_runs_state   ON runs (state, created_at);
@@ -139,41 +157,43 @@ CREATE INDEX IF NOT EXISTS idx_events_run   ON run_events (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_metrics_run  ON metrics (run_id, key, step);
 CREATE INDEX IF NOT EXISTS idx_ckpt_run     ON checkpoints (run_id, step);
 CREATE INDEX IF NOT EXISTS idx_leases_state ON leases (state);
+-- Additive migrations for a checkpoints table created before these columns
+-- (Postgres supports ADD COLUMN IF NOT EXISTS, so this is idempotent).
+ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS location text NOT NULL DEFAULT 'r2_hot';
+ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS drive_file_ids text;
+ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS archived_at double precision;
+-- Monotonic run sequence (the 5-digit run-id tail). Matches
+-- chuk-experiments-server's run_ref_seq so the two systems mint the same shape.
+CREATE SEQUENCE IF NOT EXISTS run_ref_seq;
 "#;
 
-pub struct SqliteStore {
-    pool: SqlitePool,
+pub struct PgStore {
+    pool: PgPool,
 }
 
-impl SqliteStore {
-    pub async fn open(path: &str) -> Result<Self> {
-        let options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal);
-        // One writer connection sidesteps SQLite writer contention; WAL keeps
-        // readers unblocked. Plenty for M0's event rates.
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+impl PgStore {
+    /// Open a pool against `url` (the full connection string, e.g. Neon's
+    /// pooled endpoint including `?sslmode=require`) and apply the schema.
+    pub async fn open(url: &str) -> Result<Self> {
+        // Neon's pooled endpoint (pgbouncer-style) reuses server sessions across
+        // clients, so server-side cached plans go stale across schema migrations
+        // ("cached plan must not change result type"). Disabling sqlx's prepared-
+        // statement cache sidesteps that entirely; the re-prepare cost is
+        // negligible at our query rates.
+        let options = url
+            .parse::<PgConnectOptions>()?
+            .statement_cache_capacity(0);
+        let pool = PgPoolOptions::new()
+            .max_connections(MAX_CONNECTIONS)
             .connect_with(options)
             .await?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
-        // Additive migrations for DBs created before a column existed. SQLite
-        // has no ADD COLUMN IF NOT EXISTS, so run each and ignore the
-        // duplicate-column error a fresh (already-columned) db raises.
-        for stmt in [
-            "ALTER TABLE checkpoints ADD COLUMN location TEXT NOT NULL DEFAULT 'r2_hot'",
-            "ALTER TABLE checkpoints ADD COLUMN drive_file_ids TEXT",
-            "ALTER TABLE checkpoints ADD COLUMN archived_at REAL",
-        ] {
-            let _ = sqlx::query(stmt).execute(&pool).await;
-        }
         Ok(Self { pool })
     }
 }
 
 #[async_trait]
-impl Store for SqliteStore {
+impl Store for PgStore {
     // ---- workers ----------------------------------------------------------
 
     async fn worker_joined(
@@ -184,10 +204,10 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO workers (id, labels, hardware, connected, joined_at, last_seen)
-             VALUES (?1, ?2, ?3, 1, ?4, ?4)
+             VALUES ($1, $2, $3, true, $4, $4)
              ON CONFLICT(id) DO UPDATE SET
                labels = excluded.labels, hardware = excluded.hardware,
-               connected = 1, last_seen = excluded.last_seen",
+               connected = true, last_seen = excluded.last_seen",
         )
         .bind(&id.0)
         .bind(serde_json::to_string(labels)?)
@@ -199,7 +219,7 @@ impl Store for SqliteStore {
     }
 
     async fn worker_seen(&self, id: &WorkerId) -> Result<()> {
-        sqlx::query("UPDATE workers SET last_seen = ?1 WHERE id = ?2")
+        sqlx::query("UPDATE workers SET last_seen = $1 WHERE id = $2")
             .bind(now())
             .bind(&id.0)
             .execute(&self.pool)
@@ -208,7 +228,7 @@ impl Store for SqliteStore {
     }
 
     async fn worker_left(&self, id: &WorkerId) -> Result<()> {
-        sqlx::query("UPDATE workers SET connected = 0 WHERE id = ?1")
+        sqlx::query("UPDATE workers SET connected = false WHERE id = $1")
             .bind(&id.0)
             .execute(&self.pool)
             .await?;
@@ -216,7 +236,7 @@ impl Store for SqliteStore {
     }
 
     async fn set_worker_run(&self, id: &WorkerId, run: Option<&RunId>) -> Result<()> {
-        sqlx::query("UPDATE workers SET current_run = ?1 WHERE id = ?2")
+        sqlx::query("UPDATE workers SET current_run = $1 WHERE id = $2")
             .bind(run.map(|r| r.0.as_str()))
             .bind(&id.0)
             .execute(&self.pool)
@@ -225,11 +245,11 @@ impl Store for SqliteStore {
     }
 
     async fn worker(&self, id: &WorkerId) -> Result<Option<WorkerInfo>> {
-        let row = sqlx::query("SELECT * FROM workers WHERE id = ?1")
+        let row = sqlx::query("SELECT * FROM workers WHERE id = $1")
             .bind(&id.0)
             .fetch_optional(&self.pool)
             .await?;
-        let Some(mut worker) = row.map(worker_from_row).transpose()? else {
+        let Some(mut worker) = row.map(|r| worker_from_row(&r)).transpose()? else {
             return Ok(None);
         };
         worker.lease = self.lease(id).await?;
@@ -241,7 +261,7 @@ impl Store for SqliteStore {
             .fetch_all(&self.pool)
             .await?;
         let mut workers: Vec<WorkerInfo> = rows
-            .into_iter()
+            .iter()
             .map(worker_from_row)
             .collect::<Result<_>>()?;
         for worker in &mut workers {
@@ -253,17 +273,11 @@ impl Store for SqliteStore {
     // ---- runs -------------------------------------------------------------
 
     async fn next_run_seq(&self) -> Result<i64> {
-        // Atomic bump-and-return: seed at 1 on first call, +1 thereafter.
-        // SQLite 3.35+ supports RETURNING, and the single writer connection
-        // makes the upsert race-free.
-        let row = sqlx::query(
-            "INSERT INTO counters (name, value) VALUES (?1, 1)
-             ON CONFLICT(name) DO UPDATE SET value = value + 1
-             RETURNING value",
-        )
-        .bind(RUN_SEQ_COUNTER)
-        .fetch_one(&self.pool)
-        .await?;
+        // nextval() is atomic across sessions (even through Neon's pooler), so
+        // the run sequence stays gap-tolerant but never collides.
+        let row = sqlx::query("SELECT nextval('run_ref_seq') AS value")
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.get::<i64, _>("value"))
     }
 
@@ -271,7 +285,7 @@ impl Store for SqliteStore {
         let run_id = RunId(new_run_id(now(), self.next_run_seq().await?));
         sqlx::query(
             "INSERT INTO runs (id, name, kind, spec, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+             VALUES ($1, $2, $3, $4, $5, $6, $6)",
         )
         .bind(&run_id.0)
         .bind(name)
@@ -301,10 +315,10 @@ impl Store for SqliteStore {
         detail: serde_json::Value,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE runs SET state = ?1, updated_at = ?2,
-               worker_id = COALESCE(?3, worker_id),
-               exit_code = COALESCE(?4, exit_code)
-             WHERE id = ?5",
+            "UPDATE runs SET state = $1, updated_at = $2,
+               worker_id = COALESCE($3, worker_id),
+               exit_code = COALESCE($4, exit_code)
+             WHERE id = $5",
         )
         .bind(state.as_str())
         .bind(now())
@@ -326,27 +340,28 @@ impl Store for SqliteStore {
     }
 
     async fn next_queued(&self) -> Result<Option<RunRecord>> {
-        let row = sqlx::query("SELECT * FROM runs WHERE state = ?1 ORDER BY created_at LIMIT 1")
+        let row = sqlx::query("SELECT * FROM runs WHERE state = $1 ORDER BY created_at LIMIT 1")
             .bind(RunState::Queued.as_str())
             .fetch_optional(&self.pool)
             .await?;
-        row.map(run_from_row).transpose()
+        row.map(|r| run_from_row(&r)).transpose()
     }
 
     async fn run(&self, run_id: &RunId) -> Result<Option<RunRecord>> {
-        let row = sqlx::query("SELECT * FROM runs WHERE id = ?1")
+        let row = sqlx::query("SELECT * FROM runs WHERE id = $1")
             .bind(&run_id.0)
             .fetch_optional(&self.pool)
             .await?;
-        row.map(run_from_row).transpose()
+        row.map(|r| run_from_row(&r)).transpose()
     }
 
     async fn runs(&self, limit: u32) -> Result<Vec<RunSummary>> {
-        let rows = sqlx::query("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?1")
-            .bind(limit)
+        // Postgres has no unsigned integers, so LIMIT is bound as i64.
+        let rows = sqlx::query("SELECT * FROM runs ORDER BY created_at DESC LIMIT $1")
+            .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter()
+        rows.iter()
             .map(|r| Ok(run_from_row(r)?.summary))
             .collect()
     }
@@ -356,7 +371,7 @@ impl Store for SqliteStore {
     async fn append_log(&self, run_id: &RunId, line: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO run_logs (run_id, n, ts, line)
-             SELECT ?1, COALESCE(MAX(n), 0) + 1, ?2, ?3 FROM run_logs WHERE run_id = ?1",
+             SELECT $1, COALESCE(MAX(n), 0) + 1, $2, $3 FROM run_logs WHERE run_id = $1",
         )
         .bind(&run_id.0)
         .bind(now())
@@ -368,9 +383,9 @@ impl Store for SqliteStore {
 
     async fn tail_logs(&self, run_id: &RunId, lines: u32) -> Result<Vec<String>> {
         let rows =
-            sqlx::query("SELECT line FROM run_logs WHERE run_id = ?1 ORDER BY n DESC LIMIT ?2")
+            sqlx::query("SELECT line FROM run_logs WHERE run_id = $1 ORDER BY n DESC LIMIT $2")
                 .bind(&run_id.0)
-                .bind(lines)
+                .bind(lines as i64)
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows
@@ -391,7 +406,7 @@ impl Store for SqliteStore {
         } else {
             detail
         };
-        sqlx::query("INSERT INTO run_events (run_id, ts, event, detail) VALUES (?1, ?2, ?3, ?4)")
+        sqlx::query("INSERT INTO run_events (run_id, ts, event, detail) VALUES ($1, $2, $3, $4)")
             .bind(&run_id.0)
             .bind(now())
             .bind(enum_to_string(&event))
@@ -403,7 +418,7 @@ impl Store for SqliteStore {
 
     async fn events(&self, run_id: &RunId) -> Result<Vec<RunEvent>> {
         let rows =
-            sqlx::query("SELECT ts, event, detail FROM run_events WHERE run_id = ?1 ORDER BY seq")
+            sqlx::query("SELECT ts, event, detail FROM run_events WHERE run_id = $1 ORDER BY seq")
                 .bind(&run_id.0)
                 .fetch_all(&self.pool)
                 .await?;
@@ -428,7 +443,7 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO code_units (name, sha, manifest, uri, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT(name, sha) DO UPDATE SET manifest = excluded.manifest, uri = excluded.uri",
         )
         .bind(&code.name)
@@ -442,7 +457,7 @@ impl Store for SqliteStore {
     }
 
     async fn code_unit(&self, name: &str, sha: &str) -> Result<Option<CodeUnitInfo>> {
-        let row = sqlx::query("SELECT * FROM code_units WHERE name = ?1 AND sha = ?2")
+        let row = sqlx::query("SELECT * FROM code_units WHERE name = $1 AND sha = $2")
             .bind(name)
             .bind(sha)
             .fetch_optional(&self.pool)
@@ -474,7 +489,7 @@ impl Store for SqliteStore {
         let mut tx = self.pool.begin().await?;
         for (key, value) in values {
             sqlx::query(
-                "INSERT INTO metrics (run_id, step, key, value, ts) VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO metrics (run_id, step, key, value, ts) VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT(run_id, key, step) DO UPDATE SET value = excluded.value",
             )
             .bind(&run_id.0)
@@ -497,10 +512,10 @@ impl Store for SqliteStore {
         downsample: u32,
     ) -> Result<MetricSeries> {
         // Filtering by key list is done in Rust: the set is tiny and this
-        // avoids building a dynamic `IN (?, ?, ...)` clause.
+        // avoids building a dynamic `IN ($1, $2, ...)` clause.
         let rows = sqlx::query(
             "SELECT step, key, value FROM metrics
-             WHERE run_id = ?1 AND step >= ?2 ORDER BY key, step",
+             WHERE run_id = $1 AND step >= $2 ORDER BY key, step",
         )
         .bind(&run_id.0)
         .bind(since_step as i64)
@@ -543,7 +558,7 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO checkpoints (run_id, step, uri, model_hash, meta, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT(run_id, step) DO UPDATE SET
                uri = excluded.uri, model_hash = excluded.model_hash, meta = excluded.meta",
         )
@@ -559,25 +574,28 @@ impl Store for SqliteStore {
     }
 
     async fn checkpoints(&self, run_id: &RunId) -> Result<Vec<CheckpointInfo>> {
-        let rows = sqlx::query("SELECT * FROM checkpoints WHERE run_id = ?1 ORDER BY step")
-            .bind(&run_id.0)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter().map(checkpoint_from_row).collect()
+        let rows = sqlx::query(&format!(
+            "SELECT {CKPT_COLUMNS} FROM checkpoints WHERE run_id = $1 ORDER BY step"
+        ))
+        .bind(&run_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(checkpoint_from_row).collect()
     }
 
     async fn latest_checkpoint(&self, run_id: &RunId) -> Result<Option<CheckpointInfo>> {
-        let row =
-            sqlx::query("SELECT * FROM checkpoints WHERE run_id = ?1 ORDER BY step DESC LIMIT 1")
-                .bind(&run_id.0)
-                .fetch_optional(&self.pool)
-                .await?;
-        row.map(checkpoint_from_row).transpose()
+        let row = sqlx::query(&format!(
+            "SELECT {CKPT_COLUMNS} FROM checkpoints WHERE run_id = $1 ORDER BY step DESC LIMIT 1"
+        ))
+        .bind(&run_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| checkpoint_from_row(&r)).transpose()
     }
 
     async fn pin_checkpoint(&self, run_id: &RunId, step: u64, name: &str) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE checkpoints SET pinned = 1, pin_name = ?3 WHERE run_id = ?1 AND step = ?2",
+            "UPDATE checkpoints SET pinned = true, pin_name = $3 WHERE run_id = $1 AND step = $2",
         )
         .bind(&run_id.0)
         .bind(step as i64)
@@ -593,7 +611,7 @@ impl Store for SqliteStore {
         step: u64,
         location: CheckpointLocation,
     ) -> Result<()> {
-        sqlx::query("UPDATE checkpoints SET location = ?3 WHERE run_id = ?1 AND step = ?2")
+        sqlx::query("UPDATE checkpoints SET location = $3 WHERE run_id = $1 AND step = $2")
             .bind(&run_id.0)
             .bind(step as i64)
             .bind(location.as_str())
@@ -610,8 +628,8 @@ impl Store for SqliteStore {
         archived_at: UnixSeconds,
     ) -> Result<()> {
         sqlx::query(
-            "UPDATE checkpoints SET location = ?3, drive_file_ids = ?4, archived_at = ?5
-             WHERE run_id = ?1 AND step = ?2",
+            "UPDATE checkpoints SET location = $3, drive_file_ids = $4, archived_at = $5
+             WHERE run_id = $1 AND step = $2",
         )
         .bind(&run_id.0)
         .bind(step as i64)
@@ -628,11 +646,12 @@ impl Store for SqliteStore {
         run_id: &RunId,
         step: u64,
     ) -> Result<Option<BTreeMap<String, String>>> {
-        let row = sqlx::query("SELECT drive_file_ids FROM checkpoints WHERE run_id = ?1 AND step = ?2")
-            .bind(&run_id.0)
-            .bind(step as i64)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row =
+            sqlx::query("SELECT drive_file_ids FROM checkpoints WHERE run_id = $1 AND step = $2")
+                .bind(&run_id.0)
+                .bind(step as i64)
+                .fetch_optional(&self.pool)
+                .await?;
         match row.and_then(|r| r.get::<Option<String>, _>("drive_file_ids")) {
             Some(json) => Ok(Some(serde_json::from_str(&json)?)),
             None => Ok(None),
@@ -646,7 +665,7 @@ impl Store for SqliteStore {
             "INSERT INTO leases
                (worker_id, provider, instance_id, price_hr, granted_min, drain_window_min,
                 started_at, state, extensions)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT(worker_id) DO UPDATE SET
                provider=excluded.provider, instance_id=excluded.instance_id,
                price_hr=excluded.price_hr, granted_min=excluded.granted_min,
@@ -668,23 +687,23 @@ impl Store for SqliteStore {
     }
 
     async fn lease(&self, worker_id: &WorkerId) -> Result<Option<Lease>> {
-        let row = sqlx::query("SELECT * FROM leases WHERE worker_id = ?1")
+        let row = sqlx::query("SELECT * FROM leases WHERE worker_id = $1")
             .bind(&worker_id.0)
             .fetch_optional(&self.pool)
             .await?;
-        row.map(lease_from_row).transpose()
+        row.map(|r| lease_from_row(&r)).transpose()
     }
 
     async fn live_leases(&self) -> Result<Vec<Lease>> {
-        let rows = sqlx::query("SELECT * FROM leases WHERE state != ?1")
+        let rows = sqlx::query("SELECT * FROM leases WHERE state != $1")
             .bind(LeaseState::Destroyed.as_str())
             .fetch_all(&self.pool)
             .await?;
-        rows.into_iter().map(lease_from_row).collect()
+        rows.iter().map(lease_from_row).collect()
     }
 
     async fn set_lease_state(&self, worker_id: &WorkerId, state: LeaseState) -> Result<()> {
-        sqlx::query("UPDATE leases SET state = ?2 WHERE worker_id = ?1")
+        sqlx::query("UPDATE leases SET state = $2 WHERE worker_id = $1")
             .bind(&worker_id.0)
             .bind(state.as_str())
             .execute(&self.pool)
@@ -701,7 +720,7 @@ impl Store for SqliteStore {
             return Ok(None);
         };
         lease.extensions.push(ext);
-        sqlx::query("UPDATE leases SET extensions = ?2 WHERE worker_id = ?1")
+        sqlx::query("UPDATE leases SET extensions = $2 WHERE worker_id = $1")
             .bind(&worker_id.0)
             .bind(serde_json::to_string(&lease.extensions)?)
             .execute(&self.pool)
@@ -714,7 +733,7 @@ impl Store for SqliteStore {
     async fn ledger_append(&self, entry: &LedgerEntry) -> Result<()> {
         sqlx::query(
             "INSERT INTO ledger (ts, worker_id, provider, event, minutes, cost)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(entry.ts)
         .bind(&entry.worker_id.0)
@@ -748,7 +767,7 @@ impl Store for SqliteStore {
 
     async fn ensure_team(&self, id: &str, name: &str) -> Result<()> {
         sqlx::query(
-            "INSERT INTO teams (id, name, created_at) VALUES (?1, ?2, ?3)
+            "INSERT INTO teams (id, name, created_at) VALUES ($1, $2, $3)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(id)
@@ -761,7 +780,7 @@ impl Store for SqliteStore {
 
     async fn upsert_user(&self, email: &str, team_id: &str, role: Role) -> Result<()> {
         sqlx::query(
-            "INSERT INTO users (email, team_id, role, created_at) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO users (email, team_id, role, created_at) VALUES ($1, $2, $3, $4)
              ON CONFLICT(email) DO UPDATE SET team_id = excluded.team_id, role = excluded.role",
         )
         .bind(email)
@@ -775,25 +794,25 @@ impl Store for SqliteStore {
 
     async fn get_user(&self, email: &str) -> Result<Option<User>> {
         let row =
-            sqlx::query("SELECT email, team_id, role, created_at FROM users WHERE email = ?1")
+            sqlx::query("SELECT email, team_id, role, created_at FROM users WHERE email = $1")
                 .bind(email)
                 .fetch_optional(&self.pool)
                 .await?;
-        row.map(user_from_row).transpose()
+        row.map(|r| user_from_row(&r)).transpose()
     }
 
     async fn list_users(&self, team_id: &str) -> Result<Vec<User>> {
         let rows = sqlx::query(
-            "SELECT email, team_id, role, created_at FROM users WHERE team_id = ?1 ORDER BY email",
+            "SELECT email, team_id, role, created_at FROM users WHERE team_id = $1 ORDER BY email",
         )
         .bind(team_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(user_from_row).collect()
+        rows.iter().map(user_from_row).collect()
     }
 
     async fn remove_user(&self, email: &str) -> Result<()> {
-        sqlx::query("DELETE FROM users WHERE email = ?1")
+        sqlx::query("DELETE FROM users WHERE email = $1")
             .bind(email)
             .execute(&self.pool)
             .await?;
@@ -812,7 +831,7 @@ impl Store for SqliteStore {
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO api_keys (id, team_id, created_by, name, prefix, key_hash, role, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(id)
         .bind(team_id)
@@ -830,17 +849,17 @@ impl Store for SqliteStore {
     async fn list_api_keys(&self, team_id: &str) -> Result<Vec<ApiKeyInfo>> {
         let rows = sqlx::query(
             "SELECT id, team_id, created_by, name, prefix, role, created_at, last_used_at, revoked_at
-             FROM api_keys WHERE team_id = ?1 ORDER BY created_at DESC",
+             FROM api_keys WHERE team_id = $1 ORDER BY created_at DESC",
         )
         .bind(team_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(api_key_from_row).collect()
+        rows.iter().map(api_key_from_row).collect()
     }
 
     async fn revoke_api_key(&self, id: &str) -> Result<bool> {
         let result =
-            sqlx::query("UPDATE api_keys SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL")
+            sqlx::query("UPDATE api_keys SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL")
                 .bind(id)
                 .bind(now())
                 .execute(&self.pool)
@@ -851,16 +870,16 @@ impl Store for SqliteStore {
     async fn resolve_api_key(&self, key_hash: &str) -> Result<Option<ApiKeyInfo>> {
         let row = sqlx::query(
             "SELECT id, team_id, created_by, name, prefix, role, created_at, last_used_at, revoked_at
-             FROM api_keys WHERE key_hash = ?1 AND revoked_at IS NULL",
+             FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
         )
         .bind(key_hash)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(api_key_from_row).transpose()
+        row.map(|r| api_key_from_row(&r)).transpose()
     }
 
     async fn touch_api_key(&self, id: &str, at: UnixSeconds) -> Result<()> {
-        sqlx::query("UPDATE api_keys SET last_used_at = ?2 WHERE id = ?1")
+        sqlx::query("UPDATE api_keys SET last_used_at = $2 WHERE id = $1")
             .bind(id)
             .bind(at)
             .execute(&self.pool)
@@ -869,7 +888,7 @@ impl Store for SqliteStore {
     }
 }
 
-fn api_key_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ApiKeyInfo> {
+fn api_key_from_row(row: &PgRow) -> Result<ApiKeyInfo> {
     Ok(ApiKeyInfo {
         id: row.get("id"),
         team_id: row.get("team_id"),
@@ -883,7 +902,7 @@ fn api_key_from_row(row: sqlx::sqlite::SqliteRow) -> Result<ApiKeyInfo> {
     })
 }
 
-fn user_from_row(row: sqlx::sqlite::SqliteRow) -> Result<User> {
+fn user_from_row(row: &PgRow) -> Result<User> {
     Ok(User {
         email: row.get("email"),
         team_id: row.get("team_id"),
@@ -892,7 +911,9 @@ fn user_from_row(row: sqlx::sqlite::SqliteRow) -> Result<User> {
     })
 }
 
-fn lease_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Lease> {
+// ---- row parsers (PgRow ≠ SqliteRow, so these mirror the sqlite ones) ------
+
+fn lease_from_row(row: &PgRow) -> Result<Lease> {
     Ok(Lease {
         worker_id: WorkerId(row.get("worker_id")),
         provider: row.get("provider"),
@@ -906,13 +927,14 @@ fn lease_from_row(row: sqlx::sqlite::SqliteRow) -> Result<Lease> {
     })
 }
 
-fn checkpoint_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CheckpointInfo> {
+fn checkpoint_from_row(row: &PgRow) -> Result<CheckpointInfo> {
     Ok(CheckpointInfo {
         run_id: RunId(row.get("run_id")),
         step: row.get::<i64, _>("step") as u64,
         uri: row.get("uri"),
         model_hash: row.get("model_hash"),
-        pinned: row.get::<i64, _>("pinned") == 1,
+        // Native boolean in Postgres (SQLite stored this as INTEGER 0/1).
+        pinned: row.get::<bool, _>("pinned"),
         pin_name: row.get("pin_name"),
         meta: serde_json::from_str(&row.get::<String, _>("meta"))?,
         created_at: row.get("created_at"),
@@ -921,13 +943,14 @@ fn checkpoint_from_row(row: sqlx::sqlite::SqliteRow) -> Result<CheckpointInfo> {
     })
 }
 
-fn worker_from_row(row: sqlx::sqlite::SqliteRow) -> Result<WorkerInfo> {
+fn worker_from_row(row: &PgRow) -> Result<WorkerInfo> {
     let last_seen: f64 = row.get("last_seen");
     Ok(WorkerInfo {
         id: WorkerId(row.get("id")),
         labels: serde_json::from_str(&row.get::<String, _>("labels"))?,
         hardware: serde_json::from_str(&row.get::<String, _>("hardware"))?,
-        state: if row.get::<i64, _>("connected") == 1 {
+        // Native boolean in Postgres (SQLite stored this as INTEGER 0/1).
+        state: if row.get::<bool, _>("connected") {
             WorkerState::Connected
         } else {
             WorkerState::Disconnected
@@ -941,7 +964,7 @@ fn worker_from_row(row: sqlx::sqlite::SqliteRow) -> Result<WorkerInfo> {
     })
 }
 
-fn run_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RunRecord> {
+fn run_from_row(row: &PgRow) -> Result<RunRecord> {
     let spec: RunSpec = serde_json::from_str(&row.get::<String, _>("spec"))?;
     Ok(RunRecord {
         summary: RunSummary {
@@ -956,4 +979,148 @@ fn run_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RunRecord> {
         },
         spec,
     })
+}
+
+/// Live round-trip against real Neon. Ignored by default (needs a postgres
+/// `CHUK_TRAIN_STORE` in the env); run with `.env` sourced:
+///   cargo test -p chuk-train-cp store::postgres::pg_live::round_trip -- --ignored --nocapture
+/// Exercises the dialect's risky bits — boolean columns, `bigserial`, the
+/// metric transaction, upserts — and deletes its own rows so the shared DB
+/// stays clean.
+#[cfg(test)]
+mod pg_live {
+    use super::*;
+    use chuk_train_proto::{Hardware, LedgerEntry, ShellSpec};
+
+    fn pg_url() -> Option<String> {
+        match std::env::var("CHUK_TRAIN_STORE") {
+            Ok(u) if u.starts_with("postgres") => Some(u),
+            _ => None,
+        }
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn round_trip() {
+        let Some(url) = pg_url() else {
+            eprintln!("skip: CHUK_TRAIN_STORE is not a postgres url");
+            return;
+        };
+        let store = PgStore::open(&url).await.expect("open + schema");
+
+        // Purge leftovers from any prior interrupted run (a panic before the
+        // fix skipped cleanup), so this shared db / dashboard stays clean.
+        let purge = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("purge pool");
+        for stmt in [
+            "DELETE FROM run_logs   WHERE run_id IN (SELECT id FROM runs WHERE name='pg-live')",
+            "DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE name='pg-live')",
+            "DELETE FROM metrics    WHERE run_id IN (SELECT id FROM runs WHERE name='pg-live')",
+            "DELETE FROM checkpoints WHERE run_id IN (SELECT id FROM runs WHERE name='pg-live')",
+            "DELETE FROM runs   WHERE name='pg-live'",
+            "DELETE FROM workers WHERE id LIKE 'pgtest-%'",
+            "DELETE FROM leases  WHERE worker_id LIKE 'pgtest-%'",
+            "DELETE FROM ledger  WHERE worker_id LIKE 'pgtest-%'",
+        ] {
+            let _ = sqlx::query(stmt).execute(&purge).await;
+        }
+
+        // workers: boolean `connected`, upsert, Hardware json round-trip
+        let wid = WorkerId(format!("pgtest-{}", new_run_id(now(), store.next_run_seq().await.unwrap())));
+        let hw = Hardware {
+            host: "t".into(),
+            os: "linux".into(),
+            gpu: Some("T4".into()),
+            vram_mb: Some(16_384),
+            driver: None,
+        };
+        store.worker_joined(&wid, &["gpu".into()], &hw).await.expect("worker_joined");
+        let w = store.worker(&wid).await.expect("worker").expect("some");
+        assert_eq!(w.hardware.gpu.as_deref(), Some("T4"));
+        assert!(matches!(w.state, WorkerState::Connected));
+        store.worker_left(&wid).await.expect("worker_left");
+        let w2 = store.worker(&wid).await.expect("worker").expect("some");
+        assert!(matches!(w2.state, WorkerState::Disconnected));
+
+        // runs + events + transition + sortable id
+        let spec = RunSpec::Shell(ShellSpec { command: "echo hi".into(), timeout_s: 60 });
+        let run_id = store.create_run("pg-live", &spec).await.expect("create_run");
+        assert!(run_id.0.starts_with("RUN-"), "{}", run_id.0);
+        let rec = store.run(&run_id).await.expect("run").expect("some");
+        assert_eq!(rec.summary.name, "pg-live");
+        assert!(matches!(rec.summary.state, RunState::Queued));
+        store
+            .transition(&run_id, RunState::Running, Some(&wid), None, serde_json::json!({}))
+            .await
+            .expect("transition");
+        let rec2 = store.run(&run_id).await.expect("run").expect("some");
+        assert!(matches!(rec2.summary.state, RunState::Running));
+        assert!(store.runs(5).await.expect("runs").iter().any(|r| r.id == run_id));
+        assert!(!store.events(&run_id).await.expect("events").is_empty());
+
+        // logs: monotonic n via COALESCE(MAX(n)+1), tail order
+        for i in 0..3 {
+            store.append_log(&run_id, &format!("line {i}")).await.expect("log");
+        }
+        let tail = store.tail_logs(&run_id, 2).await.expect("tail");
+        assert_eq!(tail, vec!["line 1".to_string(), "line 2".to_string()]);
+
+        // metrics: transaction + upsert
+        let mut m = BTreeMap::new();
+        m.insert("loss".to_string(), 1.5);
+        store.append_metrics(&run_id, 10, &m).await.expect("metrics");
+        let series = store.metric_series(&run_id, None, 0, 0).await.expect("series");
+        assert_eq!(series.series.get("loss").expect("loss series")[0].value, 1.5);
+
+        // checkpoints + pin: the other boolean column
+        let meta = CheckpointMeta { step: 10, ..Default::default() };
+        store.record_checkpoint(&run_id, 10, "r2://x", "hash", &meta).await.expect("record_ckpt");
+        assert!(store.pin_checkpoint(&run_id, 10, "best").await.expect("pin"));
+        let cks = store.checkpoints(&run_id).await.expect("cks");
+        assert_eq!(cks.len(), 1);
+        assert!(cks[0].pinned);
+        assert_eq!(cks[0].pin_name.as_deref(), Some("best"));
+
+        // ledger: bigserial id + ORDER BY id
+        store
+            .ledger_append(&LedgerEntry {
+                ts: now(),
+                worker_id: wid.clone(),
+                provider: "mock".into(),
+                event: "grant".into(),
+                minutes: 15.0,
+                cost: 0.03,
+            })
+            .await
+            .expect("ledger");
+        assert!(store
+            .ledger_entries()
+            .await
+            .expect("ledger_entries")
+            .iter()
+            .any(|e| e.worker_id == wid));
+
+        // cleanup — remove this test's rows so the shared Neon DB stays tidy
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.expect("cleanup pool");
+        for stmt in [
+            "DELETE FROM run_logs WHERE run_id = $1",
+            "DELETE FROM run_events WHERE run_id = $1",
+            "DELETE FROM metrics WHERE run_id = $1",
+            "DELETE FROM checkpoints WHERE run_id = $1",
+            "DELETE FROM runs WHERE id = $1",
+        ] {
+            sqlx::query(stmt).bind(&run_id.0).execute(&pool).await.expect("cleanup run rows");
+        }
+        for stmt in [
+            "DELETE FROM workers WHERE id = $1",
+            "DELETE FROM leases WHERE worker_id = $1",
+            "DELETE FROM ledger WHERE worker_id = $1",
+        ] {
+            sqlx::query(stmt).bind(&wid.0).execute(&pool).await.expect("cleanup worker rows");
+        }
+        eprintln!("pg live round-trip ok: {}", run_id.0);
+    }
 }

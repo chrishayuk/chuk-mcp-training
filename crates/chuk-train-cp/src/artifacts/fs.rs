@@ -58,6 +58,36 @@ impl ArtifactStore for FsArtifactStore {
         Ok(tokio::task::spawn_blocking(move || path.exists()).await?)
     }
 
+    async fn delete(&self, key: &str) -> Result<()> {
+        let path = self.resolve(key)?;
+        tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            // Idempotent: already gone is success.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::Error::from(e))
+                .with_context(|| format!("removing {}", path.display())),
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+        let src_path = self.resolve(src)?;
+        let dst_path = self.resolve(dst)?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            if let Some(parent) = dst_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::copy(&src_path, &dst_path).with_context(|| {
+                format!("copy {} -> {}", src_path.display(), dst_path.display())
+            })?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
     fn uri(&self, key: &str) -> String {
         format!("file://{}/{key}", self.root.display())
     }

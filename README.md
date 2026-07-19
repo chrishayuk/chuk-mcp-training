@@ -1,19 +1,27 @@
 # chuk-mcp-training
 
 MCP-controlled remote training harness for Colab and rented single GPUs.
-Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.5) · status + plan: `ROADMAP.md`.
+Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.7) · status + plan: `ROADMAP.md`.
 
 Milestones **M0–M2** are built; the control plane is deployed on Fly
-(`chuk-mcp-training.fly.dev`) with checkpoints in Cloudflare R2. Proven on real
-hardware: **E0** (agent joins a Colab T4, `nvidia-smi` + matmul probe, live
-logs) and **E1** (v11 — 115M params — trains on the T4, metrics stream, ~460 MB
-checkpoints upload directly to R2 with lineage-complete `meta.json`, and the
-resume test passes — bounce the Colab cell mid-run and it resumes from the R2
-checkpoint, `slices [[0,80],[80,390]]`). **M2** (leases, drain,
+(`chuk-mcp-training.fly.dev`), **stateless on Neon** (serverless Postgres), with
+checkpoints in Cloudflare R2 and cold storage on Google Drive. Proven on real
+hardware: **E0** (agent joins a Colab T4, `nvidia-smi` + matmul probe, live logs)
+and **E1** (a 115M-param model trains on the T4, metrics stream, lineage-complete
+checkpoints upload directly to R2, and the resume test passes — bounce the Colab
+cell mid-run and it resumes from the R2 checkpoint). **M2** (leases, drain,
 provider-verified destroy, reconcile / orphan-kill, ledger) is verified locally
-via a mock provider that launches real agent processes; the live Vast E2 hasn't
-been run. Next: M4 (dashboard + budget caps), then M3 (packing). See
-`ROADMAP.md`.
+via a mock provider; live Vast E2 pending.
+
+Beyond the milestones, the harness now has a **full Google-authed operator
+dashboard** (a clean per-run view — live loss + metric toggles, streamed logs,
+checkpoints with metadata + download, events, out-links — plus fleet/runs filters
+and pagination); a complete **Drive cold-archive tier** (completed runs auto-tier
+their final checkpoint + logs to Drive, R2 lifecycle expires the hot copies,
+retrieval resolves R2 *or* Drive, with `archive_run`/`archive_runs`/`archive_status`
+MCP tools); and **RBAC** — users + roles (sysadmin › admin › write › read) in a
+team, with **scoped MCP API keys** generated from the dashboard. Next M-work: M4
+budget caps + watchdogs, then M3 packing. See `ROADMAP.md`.
 
 **Stack:** Rust control plane + Rust worker agent; the MCP tool surface is
 Python on `chuk-mcp-server`, a thin client over the control plane's REST API.
@@ -27,26 +35,34 @@ on the Python side — shared names/numbers live in `chuk-train-proto`
   and the store key layout. The single source of truth for everything that
   crosses a process boundary.
 - `crates/chuk-train-cp` — control plane daemon (axum + tokio + sqlx):
-  `/ws/agent` (worker websocket), `/api/*` (bearer-auth REST + grant-auth
-  upload/fetch), `/` (dashboard stub), `/healthz`. Three adapter seams — the
-  metadata store (`sqlite:path.db`, `redis:` reserved), the artifact blob
-  store (`file:/path`, `s3:`/`r2:` reserved), and the provider registry
-  (`mock` now, `vast` skeleton). Builds code units, mints run-scoped upload
-  grants, ingests metrics + checkpoints, resumes, and runs the lease clock +
-  reconcile loop that enforce the wall and kill orphans.
+  `/ws/agent` (worker websocket), `/api/*` (role-authed REST + grant-auth
+  upload/fetch), `/` (the operator dashboard), `/healthz`. Adapter seams — the
+  metadata store (`postgres:`/`postgresql:` → Neon, or `sqlite:path.db` local),
+  the artifact blob store (`r2:`/`s3:`, or `file:/path`), and the provider
+  registry (`mock`, `vast` skeleton). Modules include `store` (SQLite + Postgres
+  adapters), `archive` (Drive tiering + backstop sweep), `drive` (Drive v3
+  client), `apikey` (RBAC keys + bearer→role resolution), and `dash` (the
+  dashboard). Builds code units, mints run-scoped upload grants, ingests metrics
+  + checkpoints, resumes, auto-archives completed runs, and runs the lease clock
+  + reconcile loop that enforce the wall and kill orphans.
 - `crates/chuk-train-agent` — worker agent binary: dials out, registers
   hardware, heartbeats, runs shell + train jobs, streams logs/metrics, fetches
   code units (cached by sha), uploads lineage-complete checkpoints, resumes,
   reconnects with backoff. Builds to a static musl binary workers download.
-- `mcp/` — `chuk-train-mcp` Python package: `fleet`, `submit_shell`,
-  `list_runs`, `run_status`, `tail_logs`, `run_events`, plus M1 tools
-  `build_code_unit`, `submit_run`, `run_metrics`, `list_checkpoints`,
-  `pin_checkpoint`, `artifact_url`.
-- `examples/stub-trainer/` — a contract-honouring stub trainer code unit; the
-  E1 fixture (reads `$CHUK_CONFIG`, writes metrics + checkpoints, resumes).
+- `mcp/` — `chuk-train-mcp` Python package: `fleet`, `submit_shell`, `list_runs`,
+  `run_status`, `tail_logs`, `run_events`, `build_code_unit`, `submit_run`,
+  `run_metrics`, `list_checkpoints`, `pin_checkpoint`, `artifact_url`,
+  `provider_offers`, `provision`, `spend_status`, `colab_cell`, and the archive
+  tools `archive_run`, `archive_runs`, `archive_status`.
+- `examples/stub-trainer/` — a contract-honouring stub trainer code unit (the E1
+  fixture + demo trainer): reads `$CHUK_CONFIG`, emits rich metrics
+  (loss/lr/grad_norm/tokens_per_s/tflops) + logs, writes checkpoints, resumes.
+- `scripts/demo.sh` — one-command local demo: a CP + mock workers running the
+  stub-trainer so the dashboard fills with live data (isolated from prod).
+- `scripts/authorize-drive.py` — one-time `drive.file` offline auth → refresh token.
 - `bootstrap/colab_cell.py` — the one Colab cell that joins a T4 as a worker (E0).
-- `deploy/` — Dockerfile + fly.toml (`auto_stop_machines = "off"`,
-  volume-backed SQLite).
+- `deploy/` — Dockerfile + fly.toml (`auto_stop_machines = "off"`); stateless on
+  Neon (the store URL is a Fly secret; the `/data` volume is legacy).
 
 ## Run locally
 
@@ -62,7 +78,16 @@ cd mcp && uv sync && CHUK_TRAIN_URL=http://127.0.0.1:8700 \
   uv run chuk-train-mcp                                      # MCP (stdio)
 ```
 
-Dashboard: <http://127.0.0.1:8700/> (paste the API token into the token box).
+Or the one-command demo (mock workers running the stub-trainer, so the dashboard
+fills with live runs):
+
+```bash
+./scripts/demo.sh          # then open http://127.0.0.1:8700 ; Ctrl-C to stop
+```
+
+Dashboard: <http://127.0.0.1:8700/> — Google sign-in when configured, else the
+API-token box (local dev). Set `CHUK_TRAIN_STORE=postgresql://…` (Neon's pooled
+endpoint) to run against Postgres instead of local SQLite.
 
 ## First real run: Colab (E0)
 
@@ -142,9 +167,39 @@ Set `CHUK_TRAIN_PROVIDERS`, `CHUK_TRAIN_AGENT_BIN` (mock), `CHUK_TRAIN_VAST_API_
 (vast). `CHUK_TRAIN_RECONCILE_S`, `CHUK_TRAIN_IDLE_REAP_S`, and
 `CHUK_TRAIN_DRAIN_WINDOW_MIN` override timings for fast local runs.
 
+## Dashboard, access & archive
+
+The operator dashboard (`/`, spec §9) is served by the control plane and gated
+behind **Google sign-in** (session cookie; the API-token box is the local-dev
+fallback). It has an overview (fleet/runs/spend/health with filters + pagination)
+and a per-run view: live loss curve + metric toggles, streamed logs, config,
+checkpoints with full metadata + download, events, and out-links (W&B /
+experiments-server). Runs get sortable `RUN-YYYYMMDD-HHMMSS-NNNNN` ids (a
+store-backed 5-digit sequence, the same shape chuk-experiments-server mints).
+
+**Access (RBAC):** users have a role — sysadmin › admin › write › read — in a
+team (single default team; multi-team scaffolded). `read`/`write`/`admin` mirror
+chuk-experiments-server; `sysadmin` is the extra platform-owner tier (the legacy
+master token resolves to it). The **Access** screen is **self-service**: any
+signed-in user mints, lists, and revokes **their own** MCP API keys, always
+scoped **at or below their own role** (shown once, hashed at rest). Admins
+additionally manage team members and see every key in the team. Roles are
+enforced per endpoint: read = view, write = submit/manage runs, admin = archive +
+manage access. Give MCP clients a scoped key (`CHUK_TRAIN_API_TOKEN=ck_…`) instead
+of the master token.
+
+**Archive tier (spec §11.5):** Drive is the durable, browsable home; R2 is a hot
+cache. When a run completes, its final checkpoint + logs + metrics tier to Google
+Drive automatically (a background loop is both the prompt archiver and the
+idempotent backstop); the final is promoted to `ckpt-final/` on R2, and R2
+lifecycle expires the hot copies (`ckpt-hot/` 1d, `ckpt-final/` 30d). A stable
+per-checkpoint URL resolves R2-or-Drive. Trigger/inspect via `archive_run`,
+`archive_runs`, `archive_status`. (R2 lifecycle needs an Admin R/W token, or set
+the two rules in the Cloudflare R2 dashboard.)
+
 ## Current limits (deliberate — see spec §14)
 
 No packing or budgets/caps yet; one run in flight per worker; logs/metrics are
 dropped while the control plane is dark. A dropped train run resumes from its
 last uploaded checkpoint; a dropped shell run restarts. M3 adds the packing
-scheduler; M4 adds budget caps + the one-page dashboard + watchdog gates.
+scheduler; M4 adds budget caps + watchdog gates (the dashboard is done).

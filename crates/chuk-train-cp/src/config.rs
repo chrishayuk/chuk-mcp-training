@@ -53,12 +53,22 @@ pub struct Config {
     pub google_client_secret: Option<String>,
     /// Emails permitted to view the dashboard.
     pub allowed_emails: Vec<String>,
+    /// Bootstrap sysadmin email, seeded on startup (falls back to the first
+    /// allowed email). Only seeded when that user doesn't already exist.
+    pub sysadmin_email: Option<String>,
 }
 
 impl Config {
-    /// Dashboard Google sign-in is enforced only when a client is configured.
+    /// Dashboard Google sign-in is enforced only when a client is configured
+    /// *and* an allowlist says who may in. Requiring the allowlist keeps the
+    /// Drive archive tier — which reuses the same client id/secret to refresh
+    /// its token — from accidentally gating the dashboard when those creds are
+    /// present for storage alone, and stops a client without an allowlist from
+    /// locking everyone out.
     pub fn auth_enabled(&self) -> bool {
-        self.google_client_id.is_some() && self.google_client_secret.is_some()
+        self.google_client_id.is_some()
+            && self.google_client_secret.is_some()
+            && !self.allowed_emails.is_empty()
     }
 }
 
@@ -133,7 +143,18 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty()),
             allowed_emails,
+            sysadmin_email: std::env::var(env::SYSADMIN_EMAIL)
+                .ok()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty()),
         })
+    }
+
+    /// The email to seed as the bootstrap sysadmin on startup, if any.
+    pub fn bootstrap_sysadmin(&self) -> Option<String> {
+        self.sysadmin_email
+            .clone()
+            .or_else(|| self.allowed_emails.first().cloned())
     }
 }
 

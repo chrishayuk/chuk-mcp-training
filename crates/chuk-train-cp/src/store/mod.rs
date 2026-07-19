@@ -1,24 +1,32 @@
 //! Storage adapter seam: one async trait, pluggable backends.
 //!
-//! M0 ships SQLite (single Fly machine with a volume). The `redis:` scheme is
-//! reserved for an M2+ backend that would let the control plane's persistent
-//! state live off-box. Note that a Redis store alone does not make the
-//! control plane stateless: live agent websockets are in-process state, so
-//! running >1 machine also needs sticky routing or pubsub fan-out.
+//! M0 ships SQLite (single Fly machine with a volume). The `postgres:` /
+//! `postgresql:` scheme selects the Postgres (Neon) backend, which lets the
+//! control plane's persistent state live off-box for a multi-machine deploy.
+//! The `redis:` scheme is reserved for an M2+ backend. Note that moving the
+//! store off-box does not by itself make the control plane stateless: live
+//! agent websockets are in-process state, so running >1 machine also needs
+//! sticky routing or pubsub fan-out.
 
+mod ids;
+mod postgres;
 mod sqlite;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
-    CheckpointInfo, CheckpointMeta, CodeRef, CodeUnitInfo, CodeUnitManifest, EventKind, Hardware,
-    Lease, LeaseExtension, LeaseState, LedgerEntry, MetricSeries, RunEvent, RunId, RunRecord,
-    RunSpec, RunState, RunSummary, WorkerId, WorkerInfo,
+    ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
+    CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
+    MetricSeries, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary, UnixSeconds,
+    User, WorkerId, WorkerInfo,
 };
 
+pub use postgres::PgStore;
 pub use sqlite::SqliteStore;
 
 const SCHEME_SQLITE: &str = "sqlite:";
+const SCHEME_POSTGRES: &str = "postgres:";
+const SCHEME_POSTGRESQL: &str = "postgresql:";
 const SCHEME_REDIS: &str = "redis:";
 
 /// Persistent control-plane state. Every backend must provide exactly this.
@@ -39,6 +47,8 @@ pub trait Store: Send + Sync {
 
     // runs
     async fn create_run(&self, name: &str, spec: &RunSpec) -> Result<RunId>;
+    /// Next value of the monotonic run sequence (the 5-digit id tail).
+    async fn next_run_seq(&self) -> Result<i64>;
     async fn transition(
         &self,
         run_id: &RunId,
@@ -99,6 +109,30 @@ pub trait Store: Send + Sync {
     async fn latest_checkpoint(&self, run_id: &RunId) -> Result<Option<CheckpointInfo>>;
     /// Pin a checkpoint by step; returns false if no such checkpoint exists.
     async fn pin_checkpoint(&self, run_id: &RunId, step: u64, name: &str) -> Result<bool>;
+    /// Update a checkpoint's recorded location (e.g. hot → final on promotion).
+    async fn set_checkpoint_location(
+        &self,
+        run_id: &RunId,
+        step: u64,
+        location: CheckpointLocation,
+    ) -> Result<()>;
+    /// Mark a checkpoint archived to Drive: location = drive, the per-file Drive
+    /// ids (filename → id), and the archive timestamp.
+    async fn mark_checkpoint_archived(
+        &self,
+        run_id: &RunId,
+        step: u64,
+        drive_file_ids: &std::collections::BTreeMap<String, String>,
+        archived_at: UnixSeconds,
+    ) -> Result<()>;
+    /// The Drive file ids (filename → id) recorded when a checkpoint was
+    /// archived, or `None` if it has no Drive copy. Used by the retrieval
+    /// resolver to serve an archived checkpoint from Drive.
+    async fn checkpoint_drive_ids(
+        &self,
+        run_id: &RunId,
+        step: u64,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>>;
 
     // leases (spec §3)
     async fn create_lease(&self, lease: &Lease) -> Result<()>;
@@ -117,16 +151,50 @@ pub trait Store: Send + Sync {
     // ledger (spec §8)
     async fn ledger_append(&self, entry: &LedgerEntry) -> Result<()>;
     async fn ledger_entries(&self) -> Result<Vec<LedgerEntry>>;
+
+    // users & teams (RBAC)
+    /// Create the team if absent (idempotent); never downgrades an existing name.
+    async fn ensure_team(&self, id: &str, name: &str) -> Result<()>;
+    /// Create or update a user's team + role.
+    async fn upsert_user(&self, email: &str, team_id: &str, role: Role) -> Result<()>;
+    async fn get_user(&self, email: &str) -> Result<Option<User>>;
+    async fn list_users(&self, team_id: &str) -> Result<Vec<User>>;
+    async fn remove_user(&self, email: &str) -> Result<()>;
+
+    // api keys (RBAC) — only the sha256 hash is stored, never the plaintext.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_api_key(
+        &self,
+        id: &str,
+        team_id: &str,
+        created_by: &str,
+        name: &str,
+        prefix: &str,
+        key_hash: &str,
+        role: Role,
+    ) -> Result<()>;
+    async fn list_api_keys(&self, team_id: &str) -> Result<Vec<ApiKeyInfo>>;
+    /// Revoke a key by id; returns false if there was no such live key.
+    async fn revoke_api_key(&self, id: &str) -> Result<bool>;
+    /// Resolve a bearer key by its sha256 hash to its (non-revoked) info.
+    async fn resolve_api_key(&self, key_hash: &str) -> Result<Option<ApiKeyInfo>>;
+    async fn touch_api_key(&self, id: &str, at: UnixSeconds) -> Result<()>;
 }
 
-/// Open a store from a URL-ish spec: `sqlite:path.db` (a bare path also means
-/// SQLite), `redis:...` reserved.
+/// Open a store from a URL-ish spec: `postgres:`/`postgresql:` → Postgres
+/// (Neon), `sqlite:path.db` (a bare path also means SQLite) → SQLite,
+/// `redis:...` reserved.
 pub async fn open_store(spec: &str) -> Result<Box<dyn Store>> {
+    if spec.starts_with(SCHEME_POSTGRES) || spec.starts_with(SCHEME_POSTGRESQL) {
+        // Pass the URL through unchanged: the driver needs the scheme, and Neon
+        // needs the credentials and `?sslmode=require` in the query string.
+        return Ok(Box::new(PgStore::open(spec).await?));
+    }
     if let Some(path) = spec.strip_prefix(SCHEME_SQLITE) {
         return Ok(Box::new(SqliteStore::open(path).await?));
     }
     if spec.starts_with(SCHEME_REDIS) {
-        anyhow::bail!("redis store backend is reserved for M2+; use sqlite for now");
+        anyhow::bail!("redis store backend is reserved for M2+; use sqlite or postgres for now");
     }
     Ok(Box::new(SqliteStore::open(spec).await?))
 }

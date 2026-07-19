@@ -20,6 +20,7 @@ API_PROVIDER_OFFERS: Final = "/api/provider_offers"
 API_PROVISION: Final = "/api/provision"
 API_COLAB_CELL: Final = "/api/colab_cell"
 API_SPEND: Final = "/api/spend"
+API_ARCHIVE: Final = "/api/archive"
 
 
 def api_worker_lease(worker_id: str) -> str:
@@ -56,6 +57,10 @@ def api_run_checkpoints(run_id: str) -> str:
 
 def api_run_checkpoint_pin(run_id: str) -> str:
     return f"{API_RUNS}/{run_id}/checkpoints/pin"
+
+
+def api_run_archive(run_id: str) -> str:
+    return f"{API_RUNS}/{run_id}/archive"
 
 
 # Defaults mirrored from chuk-train-proto.

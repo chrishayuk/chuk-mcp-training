@@ -25,6 +25,7 @@ from .constants import (
     DEFAULT_SHELL_TIMEOUT_S,
     DEFAULT_TRAIN_TIMEOUT_S,
     api_run,
+    api_run_archive,
     api_run_checkpoint_pin,
     api_run_checkpoints,
     api_run_events,
@@ -41,6 +42,7 @@ from .constants import (
     API_PROVISION,
     API_RUNS,
     API_RUNS_SHELL,
+    API_ARCHIVE,
     API_SPEND,
 )
 from .models import (
@@ -196,6 +198,25 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         """Pin a run's checkpoint by step, exempting it from retention."""
         request = PinCheckpointRequest(step=step, name=name)
         return await _envelope(cp.post_raw(api_run_checkpoint_pin(run_id), request))
+
+    @mcp.tool
+    async def archive_run(run_id: str, force: bool = False) -> dict[str, Any]:
+        """Archive a run's final checkpoint + logs/metrics to Google Drive now
+        (spec §11.5). Idempotent; `force` re-archives an already-archived run.
+        Admin-scoped (team admins + sysadmins)."""
+        return await _envelope(cp.post_params(api_run_archive(run_id), {"force": force}))
+
+    @mcp.tool
+    async def archive_runs() -> dict[str, Any]:
+        """Sweep: archive every completed run not yet tiered to Drive (the
+        backstop, on demand). Admin-scoped."""
+        return await _envelope(cp.post_params(API_ARCHIVE))
+
+    @mcp.tool
+    async def archive_status() -> dict[str, Any]:
+        """Per-run archive state: each recent run's final checkpoint location
+        (R2 hot/final or Drive) and when it was archived."""
+        return await _envelope(cp.get_raw(API_ARCHIVE))
 
     @mcp.tool
     async def artifact_url(key: str, ttl_s: int = DEFAULT_ARTIFACT_URL_TTL_S) -> dict[str, Any]:

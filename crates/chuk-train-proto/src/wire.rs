@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
-    ArtifactKind, CodeRef, EventKind, Hardware, RunId, RunSpec, RunState, UnixSeconds, WorkerId,
-    WorkerState,
+    ArtifactKind, CheckpointLocation, CodeRef, EventKind, Hardware, Role, RunId, RunSpec, RunState,
+    UnixSeconds, WorkerId, WorkerState,
 };
 use crate::lease::Lease;
 use crate::manifest::{CheckpointMeta, CodeUnitManifest};
@@ -233,12 +233,50 @@ pub struct CheckpointInfo {
     pub pin_name: Option<String>,
     pub meta: CheckpointMeta,
     pub created_at: UnixSeconds,
+    /// Where the canonical bytes live now: R2 hot/final or Drive (spec §11.5).
+    #[serde(default)]
+    pub location: CheckpointLocation,
+    /// When this checkpoint was archived to Drive (None until archived).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<UnixSeconds>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PinCheckpointRequest {
     pub step: u64,
     pub name: String,
+}
+
+/// An API key's metadata for display — **never** the hash or plaintext (the
+/// plaintext is shown once at creation via [`CreatedApiKey`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiKeyInfo {
+    pub id: String,
+    pub team_id: String,
+    pub created_by: String,
+    pub name: String,
+    /// Short display prefix (e.g. `ck_a1b2c3d4`); enough to recognise, not use.
+    pub prefix: String,
+    pub role: Role,
+    pub created_at: UnixSeconds,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<UnixSeconds>,
+}
+
+/// Request to mint a new API key (admin-scoped; role must be ≤ the creator's).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub name: String,
+    pub role: Role,
+}
+
+/// The one-time response with the plaintext key — shown once, never stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreatedApiKey {
+    pub key: String,
+    pub info: ApiKeyInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

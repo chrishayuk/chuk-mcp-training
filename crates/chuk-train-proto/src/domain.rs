@@ -69,6 +69,72 @@ impl RunState {
     }
 }
 
+/// Where a checkpoint's canonical bytes currently live (spec §11.5). A hot copy
+/// is on R2 under `ckpt-hot/` (short lifecycle); a promoted final is on R2 under
+/// `ckpt-final/` (longer lifecycle); `drive` means it has been archived to
+/// Google Drive (the durable copy) and the R2 copy may have expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointLocation {
+    #[default]
+    R2Hot,
+    R2Final,
+    Drive,
+}
+
+impl CheckpointLocation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::R2Hot => "r2_hot",
+            Self::R2Final => "r2_final",
+            Self::Drive => "drive",
+        }
+    }
+}
+
+/// Access role, declared least→most privileged so `role >= Role::Admin` is a
+/// clean min-role check. read = view; write = submit/manage runs; admin = team
+/// admin (archive/retention + manage the team's users + API keys); sysadmin =
+/// everything, across teams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    #[default]
+    Read,
+    Write,
+    Admin,
+    Sysadmin,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Admin => "admin",
+            Self::Sysadmin => "sysadmin",
+        }
+    }
+}
+
+/// A member of a team with a role (RBAC).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct User {
+    pub email: String,
+    pub team_id: String,
+    pub role: Role,
+    pub created_at: UnixSeconds,
+}
+
+/// A team. A single "default" team for now; the seam for multi-tenant later —
+/// `users` and `api_keys` already carry `team_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Team {
+    pub id: String,
+    pub name: String,
+    pub created_at: UnixSeconds,
+}
+
 /// Connection state of a worker as the control plane sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -181,6 +247,20 @@ pub struct TrainSpec {
     /// Wall-clock limit for one slice.
     #[serde(default = "default_train_timeout_s")]
     pub timeout_s: u64,
+    /// Out-links to this experiment elsewhere (Weights & Biases, the
+    /// experiments-server dashboard, …), surfaced on the dashboard's run view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<RunLink>,
+}
+
+/// A labelled out-link shown on a run's dashboard page.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunLink {
+    /// Short kind used for the icon/accent: `wandb`, `exp`, `r2`, … (free-form).
+    #[serde(default)]
+    pub kind: String,
+    pub label: String,
+    pub url: String,
 }
 
 /// Reference to a code unit: a name plus its content hash (spec §11.1).

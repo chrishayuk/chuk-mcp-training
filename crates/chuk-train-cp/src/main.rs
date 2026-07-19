@@ -7,11 +7,14 @@
 //!   * `/healthz`   — unauthenticated liveness
 
 mod api;
+mod apikey;
+mod archive;
 mod artifacts;
 mod auth;
 mod codeunit;
 mod config;
 mod dash;
+mod drive;
 mod grant;
 mod hub;
 mod lease;
@@ -23,13 +26,15 @@ mod ws;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use chuk_train_proto::{AGENT_DOWNLOAD_PATH, AGENT_WS_PATH, API_PREFIX, HEALTH_PATH};
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::archive::Archiver;
 use crate::artifacts::{open_artifact_store, ArtifactStore};
 use crate::config::Config;
+use crate::drive::DriveClient;
 use crate::hub::Hub;
 use crate::lease::LeaseManager;
 use crate::provider::build_providers;
@@ -40,6 +45,10 @@ pub struct AppState {
     pub hub: Arc<Hub>,
     pub artifacts: Arc<dyn ArtifactStore>,
     pub leases: Arc<LeaseManager>,
+    /// Drive cold-archive client; `None` when the archive tier is off.
+    pub drive: Option<Arc<DriveClient>>,
+    /// Archive/retention worker; `None` when the archive tier is off.
+    pub archiver: Option<Arc<Archiver>>,
 }
 
 #[tokio::main]
@@ -57,8 +66,58 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let store: Arc<dyn store::Store> = Arc::from(open_store(&config.store_spec).await?);
+    // Seed the default team + bootstrap sysadmin (idempotent — only seeds a user
+    // that doesn't already exist, so later role changes persist across restarts).
+    store
+        .ensure_team(
+            chuk_train_proto::DEFAULT_TEAM_ID,
+            chuk_train_proto::DEFAULT_TEAM_NAME,
+        )
+        .await?;
+    if let Some(admin) = config.bootstrap_sysadmin() {
+        if store.get_user(&admin).await?.is_none() {
+            store
+                .upsert_user(
+                    &admin,
+                    chuk_train_proto::DEFAULT_TEAM_ID,
+                    chuk_train_proto::Role::Sysadmin,
+                )
+                .await?;
+            info!(email = %admin, "seeded bootstrap sysadmin");
+        }
+    }
     let artifacts: Arc<dyn ArtifactStore> = Arc::from(open_artifact_store(&config.artifacts_spec)?);
+    // R2 lifecycle: expire the hot / promoted-final checkpoint tiers on a timer
+    // (spec §11.5) so the control plane never deletes them itself. Idempotent
+    // (the whole config is re-set each boot); a no-op for the fs backend.
+    {
+        use chuk_train_proto::{
+            CKPT_FINAL_PREFIX, CKPT_FINAL_TTL_DAYS, CKPT_HOT_PREFIX, CKPT_HOT_TTL_DAYS,
+        };
+        let rules = vec![
+            (format!("{CKPT_HOT_PREFIX}/"), CKPT_HOT_TTL_DAYS),
+            (format!("{CKPT_FINAL_PREFIX}/"), CKPT_FINAL_TTL_DAYS),
+        ];
+        match artifacts.apply_lifecycle(&rules).await {
+            Ok(()) => info!(
+                hot_days = CKPT_HOT_TTL_DAYS,
+                final_days = CKPT_FINAL_TTL_DAYS,
+                "artifact lifecycle rules set"
+            ),
+            Err(e) => warn!(error = %e, "applying artifact lifecycle rules (non-fatal)"),
+        }
+    }
+    let drive = DriveClient::from_env()?.map(Arc::new);
+    info!(archive_tier = drive.is_some(), "drive cold-archive tier");
     let hub = Hub::new(store, artifacts.clone());
+    // Archive/retention: when Drive is configured, a background loop tiers each
+    // completed run (final checkpoint + logs/metrics) to Drive and records the
+    // location; it is also the backstop for any run a prior pass missed.
+    let archiver = drive.clone().map(|d| {
+        let a = Archiver::new(hub.store.clone(), artifacts.clone(), d);
+        tokio::spawn(a.clone().run_loop(chuk_train_proto::DEFAULT_ARCHIVE_INTERVAL));
+        a
+    });
     let providers = Arc::new(build_providers(
         &config.providers,
         config.agent_bin.clone(),
@@ -77,6 +136,8 @@ async fn main() -> Result<()> {
         hub,
         artifacts,
         leases,
+        drive,
+        archiver,
     });
 
     // Bearer-authenticated surface: the MCP server and dashboard.
@@ -100,6 +161,17 @@ async fn main() -> Result<()> {
         .route("/workers/{worker_id}/extend", post(api::extend_lease))
         .route("/workers/{worker_id}/teardown", post(api::teardown))
         .route("/spend", get(api::spend_status))
+        .route("/runs/{run_id}/archive", post(api::archive_run))
+        .route("/archive", post(api::archive_all).get(api::archive_status))
+        .route(
+            "/checkpoint/{run_id}/{step}/{file}",
+            get(api::serve_checkpoint),
+        )
+        .route("/me", get(api::whoami))
+        .route("/users", get(api::list_users).post(api::upsert_user))
+        .route("/users/{email}", delete(api::remove_user))
+        .route("/apikeys", get(api::list_api_keys).post(api::create_api_key))
+        .route("/apikeys/{id}", delete(api::revoke_api_key))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api::require_bearer,

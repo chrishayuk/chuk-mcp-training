@@ -86,3 +86,11 @@ class ControlPlaneClient:
 
     async def post_raw(self, path: str, body: BaseModel) -> dict[str, Any]:
         return await self._request("POST", path, json=body.model_dump(mode="json"))
+
+    async def post_params(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """POST with query params and no body (e.g. an action endpoint)."""
+        return await self._request("POST", path, params=params)
+
+    async def get_raw(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """GET returning the raw decoded JSON (no model validation)."""
+        return await self._request("GET", path, params=params)

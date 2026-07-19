@@ -6,7 +6,9 @@ app = "chuk-mcp-training"
 primary_region = "lhr"
 
 [env]
-CHUK_TRAIN_STORE = "sqlite:/data/chuk_train.db"
+# Metadata store is Neon (serverless Postgres), provided via `fly secrets` as
+# CHUK_TRAIN_STORE=postgresql://…-pooler…?sslmode=require — so the control plane
+# is stateless. (The /data volume mount below is legacy; no longer written.)
 # Artifacts (checkpoints) live in R2, not on this box (spec §11.5). Set via
 # `fly secrets` so the credentials stay off the repo:
 #   fly secrets set CHUK_TRAIN_ARTIFACTS=r2://<bucket> \

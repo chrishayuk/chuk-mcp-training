@@ -18,7 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/chuk-train-cp /usr/local/bin/chuk-train-cp
 COPY --from=build /src/target/x86_64-unknown-linux-musl/release/chuk-train-agent /app/chuk-train-agent
-ENV CHUK_TRAIN_STORE=sqlite:/data/chuk_train.db
+# Store comes from CHUK_TRAIN_STORE at runtime (Neon via `fly secrets`); no
+# image-level default so nothing silently shadows the secret.
 # The control plane serves this at /agent/linux-x86_64 for the bootstrap cell.
 ENV CHUK_TRAIN_AGENT_BIN=/app/chuk-train-agent
 EXPOSE 8700

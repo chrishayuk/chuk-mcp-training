@@ -60,6 +60,22 @@ pub const DESTROY_VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often to poll provider status while verifying a destroy.
 pub const DESTROY_VERIFY_POLL: Duration = Duration::from_secs(2);
 
+/// How often the archive/retention sweep runs — it promptly tiers newly
+/// completed runs to Drive and backstops any a prior pass missed (spec §11.5).
+pub const DEFAULT_ARCHIVE_INTERVAL: Duration = Duration::from_secs(60);
+/// Days after which R2 lifecycle expires hot (ckpt-hot) checkpoints, and the
+/// promoted final (ckpt-final) copies. The hot window is the error-recovery
+/// grace; the final window is a warm cache since Drive holds the canonical copy.
+pub const CKPT_HOT_TTL_DAYS: i32 = 1;
+pub const CKPT_FINAL_TTL_DAYS: i32 = 30;
+
+/// The single default team (RBAC). Multi-team is a later addition; `users` and
+/// `api_keys` already carry `team_id` so it won't be a refactor.
+pub const DEFAULT_TEAM_ID: &str = "default";
+pub const DEFAULT_TEAM_NAME: &str = "Default";
+/// Prefix on generated MCP API keys, so they're recognisable.
+pub const API_KEY_PREFIX: &str = "ck_";
+
 /// Default number of log lines returned by the tail endpoint.
 pub const DEFAULT_LOG_TAIL_LINES: u32 = 100;
 /// Default page size for run listings.
@@ -80,6 +96,19 @@ pub const CHECKPOINT_META_FILE: &str = "meta.json";
 pub const CHECKPOINT_MODEL_FILE: &str = "model.safetensors";
 /// Optimizer state filename (optional; excluded from lazarus pulls, spec §10).
 pub const CHECKPOINT_OPTIM_FILE: &str = "optim.pt";
+
+// -- artifact storage prefixes (spec §11.5) --------------------------------
+// R2 lifecycle rules filter by leading key prefix only, so ephemeral vs
+// promoted checkpoints get *top-level* prefixes (not `runs/<id>/…`, where the
+// id precedes `ckpt` and no prefix could isolate them).
+
+/// Hot (ephemeral) step checkpoints the agent uploads live under this prefix.
+/// An R2 lifecycle rule expires it on a short timer (the grace window).
+pub const CKPT_HOT_PREFIX: &str = "ckpt-hot";
+/// The promoted final checkpoint (copied here on run completion) lives under
+/// this prefix; a longer R2 lifecycle rule expires it once Drive holds the
+/// canonical copy.
+pub const CKPT_FINAL_PREFIX: &str = "ckpt-final";
 
 /// Code-unit filenames (spec §11.1).
 pub const CODE_UNIT_TARBALL: &str = "unit.tar.zst";
@@ -137,8 +166,17 @@ pub mod env {
     pub const GOOGLE_CLIENT_ID: &str = "CHUK_TRAIN_GOOGLE_CLIENT_ID";
     /// Google OAuth web-client secret.
     pub const GOOGLE_CLIENT_SECRET: &str = "CHUK_TRAIN_GOOGLE_CLIENT_SECRET";
+    /// Long-lived offline refresh token (drive.file scope) for the Drive cold
+    /// archive tier. Refreshed against the client id/secret above. When unset,
+    /// the archive tier is off and everything stays on R2.
+    pub const GOOGLE_REFRESH_TOKEN: &str = "CHUK_TRAIN_GOOGLE_REFRESH_TOKEN";
     /// Comma-separated allowlist of emails permitted to view the dashboard.
+    /// (Legacy: with the RBAC users table this seeds nothing new; kept for the
+    /// dashboard auth gate + as the sysadmin fallback when SYSADMIN_EMAIL unset.)
     pub const ALLOWED_EMAILS: &str = "CHUK_TRAIN_ALLOWED_EMAILS";
+    /// Email seeded as the bootstrap sysadmin on startup (falls back to the
+    /// first ALLOWED_EMAILS entry). Only seeded if the user doesn't yet exist.
+    pub const SYSADMIN_EMAIL: &str = "CHUK_TRAIN_SYSADMIN_EMAIL";
     /// Path to the agent binary the mock provider launches as fake instances.
     pub const AGENT_BIN: &str = "CHUK_TRAIN_AGENT_BIN";
 }

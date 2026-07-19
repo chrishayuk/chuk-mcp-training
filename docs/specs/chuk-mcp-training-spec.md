@@ -1,10 +1,24 @@
-# chuk-mcp-training — Specification v0.5
+# chuk-mcp-training — Specification v0.7
 
 **MCP-controlled remote training harness for Colab and rented single GPUs**
 Control plane + worker agent in **Rust** (axum · tokio · sqlx) · MCP tool surface in
 **Python** on `chuk-mcp-server` (thin client over the control plane's REST API) ·
 Workers: Google Colab, Vast.ai, Lambda Cloud
 
+v0.7 changes: the control plane is **stateless on Neon** (serverless Postgres) via the
+`Store` seam (SQLite kept for local dev + tests). The **archive tier (§11.5) is complete** —
+completed runs auto-tier their final checkpoint + logs + metrics to Drive, R2 lifecycle
+expires the hot copies, and a stable per-checkpoint URL resolves R2-or-Drive
+(`archive_run`/`archive_runs`/`archive_status`). **RBAC (§12)**: users + roles
+(sysadmin › admin › write › read) in a team, with scoped MCP **API keys** managed from the
+dashboard and enforced per endpoint. The dashboard (§9) gains a per-run view, fleet/runs
+filters, pagination, and an admin **Access** screen. Checkpoints move to top-level
+`ckpt-hot/` / `ckpt-final/` prefixes so R2 lifecycle can target them.
+v0.6 changes: the one-page **dashboard (§9) is built** — served by the Rust control plane
+and gated behind app-level **Google sign-in** (email allowlist, HMAC-signed session
+cookie) while MCP/agents stay on bearer tokens (§12). Storage gains a **cold-archive tier
+(§11.5)**: R2 stays hot, and completed runs' checkpoints/logs tier to **Google Drive**
+(`drive.file`, resumable upload) as durable, browsable cold storage.
 v0.5 changes (implementation reality): the control plane and agent are **Rust**, not a
 Python/FastAPI process — only the MCP tool surface is Python. The dashboard (§9) is
 served by the Rust control plane (static HTML + fetch/SSE), not FastAPI+htmx. The
@@ -19,7 +33,7 @@ scheduler; cost governance and dashboard; lazarus reduced to the artifact contra
 
 ---
 
-## 0. Implementation status (v0.5, 2026-07-18)
+## 0. Implementation status (v0.7, 2026-07-19)
 
 | Milestone | State | Gate | Proven |
 |-----------|-------|------|--------|
@@ -27,13 +41,19 @@ scheduler; cost governance and dashboard; lazarus reduced to the artifact contra
 | **M1** train: code units, metrics, lineage checkpoints, resume | ✅ done | E1 | ✅ **on real Colab T4** — v11 (115M) trains on CUDA, metrics stream, ~460 MB checkpoints to R2 with full lineage, **resume test passed** (bounced the cell mid-run → resumed from the R2 checkpoint → completed; `slices [[0,80],[80,390]]`) |
 | **M2** leases + provable cleanup | ✅ done | E2 | **locally via a mock provider** (launches real agent processes: drain, T-0 verified destroy with the agent hung, reconcile/orphan-kill, ledger); **live Vast E2 not yet run** (costs $) |
 | **M3** packing scheduler | ⬜ not started | E3 | — |
-| **M4** budgets + dashboard | 🟡 partial | E4 | ledger + `spend_status` done (in M2); **caps, watchdog gates, and the one-page dashboard not done** (only a M0 stub dashboard exists) |
+| **M4** budgets + dashboard | 🟡 partial | E4 | ledger + `spend_status` (in M2) and the **one-page dashboard done** (Fleet · Runs · Money · Health, served by the CP), gated behind **Google sign-in** (email allowlist, HMAC session cookie); **budget caps + watchdog gates not done** |
 | **M5** sweeps + panel gates + lazarus `load_checkpoint` + dynamics curve | ⬜ not started | E5 | — |
 
-Deployed: control plane on Fly (`chuk-mcp-training.fly.dev`), SQLite on a volume,
-artifacts on R2. Providers: `mock` (tested), `vast` (skeleton, untested against the live
-API). Not yet built: the packing scheduler (M3), budget caps + watchdog gates + the
-real dashboard (M4), sweeps + lazarus integration + Lambda driver (M5).
+Deployed: control plane on Fly (`chuk-mcp-training.fly.dev`), **stateless on Neon**
+(serverless Postgres), artifacts on R2, dashboard gated behind Google sign-in. The
+**Drive cold-archive tier** (§11.5) is **complete and live-proven** — a real completed
+Colab run's final checkpoint + logs + metrics tiered to Drive, promoted to `ckpt-final` on
+R2, and streamed back through the retrieval resolver. **RBAC** (§12) is live: users +
+roles (sysadmin › admin › write › read) in a team, with scoped MCP API keys managed from
+the dashboard's Access screen. Providers: `mock` (tested), `vast` (skeleton, untested
+against the live API). Not yet built: the packing scheduler (M3), budget caps + watchdog
+gates (M4), sweeps + lazarus integration + Lambda driver (M5). (The R2 lifecycle rules
+that expire the hot copies need an Admin R/W R2 token, or a manual dashboard config.)
 
 ---
 
@@ -306,9 +326,19 @@ def utilization(period: str = "month") -> UtilReport   # busy/granted, overhead 
 
 ```python
 @tool
-def list_checkpoints(run_id: str) -> list[CheckpointInfo]
+def list_checkpoints(run_id: str) -> list[CheckpointInfo]   # location: r2 | drive
 @tool
 def pin_checkpoint(run_id: str, step: int, name: str) -> Ack
+@tool
+def archive_run(run_id: str, force: bool = False) -> ArchiveReport
+     # apply retention now for one run: drop mid-run checkpoints past the 24h grace
+     # (keep final + pins), archive final + logs to Drive if the run is >30d old
+     # (force ignores both the grace window and the age threshold)
+@tool
+def archive_runs(force: bool = False) -> ArchiveReport   # same policy across all runs
+@tool
+def archive_status(run_id: str | None = None) -> ArchiveStatus
+     # per run: hot (R2) vs cold (Drive), grace/age remaining, bytes freed
 @tool
 def build_code_unit(repo: str, commit: str, name: str | None = None) -> CodeUnitRef
      # tarball + uv.lock + manifest, hashed, uploaded; agents cache by hash
@@ -373,8 +403,11 @@ past 10 min ⇒ `preempted` + re-queue (the checkpoint schedule bounds the loss)
 
 ## 9. Dashboard
 
-Served by the control plane process itself (FastAPI + htmx/SSE; no Grafana stack to
-babysit; metrics JSONL remains exportable if that ever changes). One page, four bands:
+Served by the Rust control plane itself (static HTML + `fetch`; no Grafana stack to
+babysit; metrics JSONL remains exportable if that ever changes) and **gated behind
+app-level Google sign-in** — an email allowlist carried in an HMAC-signed session cookie,
+so only the owner sees it while MCP/agents stay on bearer tokens (§12); the token box is
+the local-dev fallback. **Built.** One page, four bands:
 
 1. **Fleet** — per worker: GPU, $/hr ticking cost, lease remaining (countdown), current
    job, utilization bar, **kill button** (one click, unconditional, drain-first with a
@@ -486,26 +519,40 @@ downstream of the bad hash.
 ### 11.5 Storage layout (S3-compatible; R2 preferred for zero egress)
 
 ```
-s3://chuk-train/
+s3://chuk-train/                                # R2 = hot cache; Drive = cold canonical
   artifacts/
     code/<name>/<sha>/{unit.tar.zst, unit.toml, uv.lock}
-    env/<name>/<sha>.json                # docker image digest / colab install recipe
+    env/<name>/<sha>.json                       # docker digest / colab install recipe
     datasets/<name>/<sha>/...
     decks/<name>/<sha>/...
-  runs/<run_id>/
-    spec.json
-    events.jsonl
-    metrics.jsonl.zst
-    logs/slice_<k>.log.zst
-    ckpt/step_<n>/{model.safetensors, optim.pt, meta.json}
-  pins/<name>  -> artifact or checkpoint ref
-  ledger/<yyyy-mm>.jsonl                 # cost records
+  ckpt-hot/<run_id>/step_<n>/{model.safetensors, meta.json, optim.pt}   # agent uploads; ~1d lifecycle
+  ckpt-final/<run_id>/step_<n>/{model.safetensors, meta.json}           # promoted on completion; ~30d
+  runs/<run_id>/{spec.json, events.jsonl, ...}                          # run tree (logs/metrics live in the store)
+  ledger/<yyyy-mm>.jsonl                         # cost records
+
+drive:chuk-train/runs/<run_id>/                 # canonical cold copy (Drive v3, drive.file)
+  ckpt/step_<n>/{model.safetensors, meta.json}  logs.txt  metrics.json
 ```
+
+Top-level `ckpt-hot/` / `ckpt-final/` prefixes (not `runs/<id>/ckpt/`) let R2 lifecycle
+rules target them by prefix. The `checkpoints` metadata row records each checkpoint's
+`location` (`r2_hot` | `r2_final` | `drive`) + Drive file ids, so a stable per-checkpoint
+URL (`/api/checkpoint/<run>/<step>/<file>`) resolves R2 (302 to a presigned URL) or Drive
+(streamed) transparently.
 
 Workers upload with credentials scoped to `runs/<run_id>/` and read scoped to declared
 `artifacts_in` plus their assigned code unit. Reads (Mac pulling checkpoints) dominate
 long-term — R2's zero egress is the argument. ~500MB/checkpoint with optimizer state at
 115M scale.
+
+**Cold-archive tier.** R2 is hot storage; completed runs' checkpoints and logs tier to
+**Google Drive** (5 TB, `drive.file` scope, resumable chunked upload) as durable,
+browsable cold storage — freeing R2 while honoring `keep_last`/`keep_every`/pins. An
+archived object records a `drive://<fileId>` location, and `artifact_url`/`blob` resolve
+R2 *or* Drive transparently. Auth is a long-lived offline refresh token, minted once via
+`scripts/authorize-drive.py` and refreshed against the dashboard's Google client; the
+`DriveClient` (token refresh, folder-ensure, resumable upload/download/delete) is built
+and live-proven, with the tiering/retrieval job pending.
 
 ---
 
@@ -516,8 +563,23 @@ long-term — R2's zero egress is the argument. ~500MB/checkpoint with optimizer
 - Provider keys, HF tokens, store-admin credentials: VPS only, never on workers.
 - `shell` sessions: off by default, explicit server-config allow.
 - Rented GPUs are untrusted hardware: only public code/data ships to them.
-- Dashboard + MCP HTTP endpoint behind auth (token header; optionally Cloudflare Access
-  in front of the VPS).
+- Agent/worker surfaces behind bearer tokens (join token → worker credential; run-scoped
+  upload grants for checkpoint writes).
+- Dashboard behind **app-level Google OAuth**: an HMAC-signed session cookie; the token
+  box is the local-dev fallback. Optionally Cloudflare Access as an outer layer.
+- **RBAC.** Users have a role — **sysadmin › admin › write › read** — in a team; the
+  Google session's email maps to a user + role. The `/api/*` MCP surface is authenticated
+  by an **API key** (or the legacy master token → sysadmin) that resolves to a role. Keys
+  are `ck_…`, stored only as a **sha256 hash + short prefix**, shown once at creation, and
+  revocable. Roles are enforced per endpoint: read = view; write = submit/manage runs,
+  provision, teardown; admin = archive/retention + manage the team's users + all keys.
+  Key management is **self-service**: any signed-in user mints/lists/revokes their **own**
+  keys scoped ≤ their own role from the dashboard's **Access** screen (admins additionally
+  see and revoke every key in the team). `read`/`write`/`admin` mirror
+  chuk-experiments-server; `sysadmin` is the extra platform-owner tier. A `teams`
+  table scaffolds multi-tenant (single default team today).
+- Drive archive uses the narrow `drive.file` scope (only files this app creates); the
+  refresh token lives on the control plane only.
 
 ---
 

@@ -93,6 +93,53 @@ fn now() -> f64 {
         .as_secs_f64()
 }
 
+/// Live check that R2 accepts + persists our lifecycle rules. Ignored by
+/// default; run with `.env` sourced:
+///   cargo test -p chuk-train-cp artifacts::s3::live::lifecycle_round_trip -- --ignored --nocapture
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    #[ignore]
+    #[tokio::test]
+    async fn lifecycle_round_trip() {
+        let bucket =
+            std::env::var("CHUK_TRAIN_S3_BUCKET").unwrap_or_else(|_| "chuk-train".to_owned());
+        let Ok(store) = S3ArtifactStore::from_env(&bucket) else {
+            eprintln!("skip: no S3/R2 env");
+            return;
+        };
+        if let Err(e) = store
+            .apply_lifecycle(&[("ckpt-hot/".to_owned(), 1), ("ckpt-final/".to_owned(), 30)])
+            .await
+        {
+            let msg = e.to_string();
+            if msg.contains("AccessDenied") || msg.contains("Access Denied") {
+                eprintln!("skip: R2 token lacks lifecycle permission — set the rules in the Cloudflare dashboard or use an Admin R/W token");
+                return;
+            }
+            panic!("apply lifecycle: {e}");
+        }
+        let got = store
+            .client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await
+            .expect("get lifecycle");
+        let rules = got.rules();
+        for r in rules {
+            eprintln!(
+                "rule id={:?} status={:?} days={:?}",
+                r.id(),
+                r.status(),
+                r.expiration().and_then(|e| e.days())
+            );
+        }
+        assert!(rules.len() >= 2, "expected our two rules");
+    }
+}
+
 #[async_trait]
 impl ArtifactStore for S3ArtifactStore {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<String> {
@@ -128,6 +175,64 @@ impl ArtifactStore for S3ArtifactStore {
             .send()
             .await
             .is_ok())
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        // DeleteObject is idempotent on S3/R2 (missing key still returns 2xx).
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("s3 delete {key}"))?;
+        Ok(())
+    }
+
+    async fn copy(&self, src: &str, dst: &str) -> Result<()> {
+        // x-amz-copy-source is `<bucket>/<key>`; our keys are ascii/safe (see
+        // keys::is_safe_key), so no percent-encoding is needed.
+        let source = format!("{}/{src}", self.bucket);
+        self.client
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(source)
+            .key(dst)
+            .send()
+            .await
+            .with_context(|| format!("s3 copy {src} -> {dst}"))?;
+        Ok(())
+    }
+
+    async fn apply_lifecycle(&self, rules: &[(String, i32)]) -> Result<()> {
+        use aws_sdk_s3::types::{
+            BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
+            LifecycleRuleFilter,
+        };
+        let mut built = Vec::with_capacity(rules.len());
+        for (prefix, days) in rules {
+            built.push(
+                LifecycleRule::builder()
+                    .id(format!("expire-{}", prefix.trim_end_matches('/')))
+                    .status(ExpirationStatus::Enabled)
+                    .filter(LifecycleRuleFilter::builder().prefix(prefix.clone()).build())
+                    .expiration(LifecycleExpiration::builder().days(*days).build())
+                    .build()
+                    .context("building lifecycle rule")?,
+            );
+        }
+        let config = BucketLifecycleConfiguration::builder()
+            .set_rules(Some(built))
+            .build()
+            .context("building lifecycle configuration")?;
+        self.client
+            .put_bucket_lifecycle_configuration()
+            .bucket(&self.bucket)
+            .lifecycle_configuration(config)
+            .send()
+            .await
+            .with_context(|| format!("put lifecycle on bucket {}", self.bucket))?;
+        Ok(())
     }
 
     fn uri(&self, key: &str) -> String {
