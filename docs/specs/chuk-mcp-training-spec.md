@@ -49,11 +49,13 @@ Deployed: control plane on Fly (`chuk-mcp-training.fly.dev`), **stateless on Neo
 **Drive cold-archive tier** (§11.5) is **complete and live-proven** — a real completed
 Colab run's final checkpoint + logs + metrics tiered to Drive, promoted to `ckpt-final` on
 R2, and streamed back through the retrieval resolver. **RBAC** (§12) is live: users +
-roles (sysadmin › admin › write › read) in a team, with scoped MCP API keys managed from
-the dashboard's Access screen. Providers: `mock` (tested), `vast` (skeleton, untested
-against the live API). Not yet built: the packing scheduler (M3), budget caps + watchdog
-gates (M4), sweeps + lazarus integration + Lambda driver (M5). (The R2 lifecycle rules
-that expire the hot copies need an Admin R/W R2 token, or a manual dashboard config.)
+roles (sysadmin › admin › write › read) in a team, with **self-service** scoped MCP API
+keys (any signed-in user mints their own ≤ their role; admins manage the team) from the
+dashboard's Access screen. Providers: `mock` (tested), `vast` (skeleton, untested against
+the live API). Not yet built: the packing scheduler (M3), budget caps + watchdog gates
+(M4), the optional chuk-experiments-server reporting mirror (§11.6), sweeps + lazarus
+integration + Lambda driver (M5). (The R2 lifecycle rules that expire the hot copies need
+an Admin R/W R2 token, or a manual dashboard config.)
 
 ---
 
@@ -94,6 +96,11 @@ Mac) reads them via one `load_checkpoint(run_id, step)` tool. No shared code, no
 8. **Gates as code.** Panel criteria are registered and evaluated by the control plane
    from streamed metrics; watchdog gates auto-stop runaway runs.
 9. **chuk conventions.** `chuk-mcp-server`, `@tool`, Pydantic schemas, error envelopes.
+10. **Runs standalone; every external tier is optional.** The harness's own store + queue
+    (Neon or SQLite) are always the source of truth. R2 (falls back to `file:`), Google
+    Drive (archive tier), Google auth (falls back to the token box), and
+    chuk-experiments-server (the reporting mirror, §11.6) are each **gated and optional** —
+    unset ⇒ that tier is a no-op, and nothing outside the harness is ever a hard dependency.
 
 ---
 
@@ -553,6 +560,31 @@ R2 *or* Drive transparently. Auth is a long-lived offline refresh token, minted 
 `scripts/authorize-drive.py` and refreshed against the dashboard's Google client; the
 `DriveClient` (token refresh, folder-ensure, resumable upload/download/delete) is built
 and live-proven, with the tiering/retrieval job pending.
+
+### 11.6 chuk-experiments-server reporting (optional mirror — planned)
+
+[chuk-experiments-server](https://github.com/chrishayuk/chuk-experiments-server) is the
+research **system of record** (programme → experiment → run → result/artifact). The harness
+reports into it as an **optional, gated mirror** — never a dependency (design principle 10).
+When `CHUK_EXPERIMENTS_URL` + a WRITE API key are configured, the control plane:
+
+- **on run submit** — POSTs to `/v1/experiments/{slug}/runs` (a configurable default
+  experiment; programme auto-creates). The server **mints its own** `RUN-…` id, so we send
+  **our** run id as the `slug` and, via a follow-up `PATCH /v1/runs/{id}`, as
+  `harness_session_id`; we store their returned id on our run row for later calls.
+- **on lifecycle transitions** — `PATCH /v1/runs/{id}` with the mapped `status`
+  (queued/running/completed/failed/killed/cancelled), `started_at`/`ended_at`, `cost_usd`,
+  `wandb_url`.
+- **on checkpoint upload** — `POST /v1/runs/{id}/artifacts` (`kind=checkpoint`,
+  `role=produced`, the stable `https` per-checkpoint URL, `bytes`, `sha256`, and our lineage
+  superset as `meta`); optional `result` rows for final metrics and `/v1/pins` for
+  `latest`/`best`.
+
+Unset ⇒ a complete no-op; the harness's own store + queue remain authoritative. Their run
+ids and ours share the same `RUN-YYYYMMDD-HHMMSS-NNNNN` shape but are **parallel, independent
+id-spaces** (each from its own store sequence), linked by `harness_session_id`. Their
+`/v1/queue` claim/lease contract (workers *pull* work the experiments-server enqueued) is a
+possible **later opt-in** execution mode — an add-on, never a replacement for our own queue.
 
 ---
 

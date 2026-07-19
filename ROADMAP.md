@@ -48,9 +48,16 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 
 1. **M4 budgets + watchdogs** — the dashboard's done; the remaining M4 is per-provider/
    label caps checked on provision/extend, and watchdog gates that checkpoint-then-stop.
-2. **Live Vast E2** — rent 15 min, hang the agent, prove provider-verified destroy.
-3. **M3 packing** when there's rented-GPU pressure.
-4. **R2 lifecycle permission** (see backlog) so the R2 hot copies actually auto-expire.
+2. **chuk-experiments-server reporting** — an **optional, gated** mirror (like the Drive
+   archive tier): when `CHUK_EXPERIMENTS_URL` + a WRITE key are set, the CP creates the run
+   there (our id as `slug`/`harness_session_id`), PATCHes lifecycle, and registers
+   checkpoints as artifacts; unset ⇒ complete no-op. **The harness always runs standalone —
+   the experiments-server is never a dependency, and our own store/queue stays the source of
+   truth.** (Their `/v1/queue` claim/lease model is a possible *later* opt-in pull mode, not
+   a replacement for our queue.)
+3. **Live Vast E2** — rent 15 min, hang the agent, prove provider-verified destroy.
+4. **M3 packing** when there's rented-GPU pressure.
+5. **R2 lifecycle permission** (see backlog) so the R2 hot copies actually auto-expire.
 
 *(E0 and E1 are done — both proven on a real Colab T4, including E1's resume test.)*
 
