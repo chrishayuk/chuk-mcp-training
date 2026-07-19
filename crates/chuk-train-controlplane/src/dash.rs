@@ -343,7 +343,7 @@ function renderRunShell(run){
       </div>
     </div>`:`
     <div class="grid2"><div class="stack"><div class="card"><div class="hd"><h3>Logs</h3><span class="sp"></span><span class="st mut" id="logstat">${run.state}</span></div><div class="logs" id="logs"><div class="empty">loading…</div></div></div></div>
-      <div class="stack">${configCard}<div class="card"><div class="hd"><h3>Events</h3></div><div class="tl" id="events"></div></div></div></div>`;
+      <div class="stack"><div class="card"><div class="hd"><h3>System</h3><span class="sp"></span><span class="tag" id="sysage"></span></div><div class="sys" id="sys"><div class="empty">—</div></div></div>${configCard}<div class="card"><div class="hd"><h3>Events</h3></div><div class="tl" id="events"></div></div></div></div>`;
   $("#app").innerHTML=head+body;
   window.scrollTo(0,0);
 }
