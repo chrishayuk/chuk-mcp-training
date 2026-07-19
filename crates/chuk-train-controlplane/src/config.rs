@@ -40,6 +40,9 @@ pub struct Config {
     /// Directory of per-target worker binaries served for download (M2). None
     /// → the default image path; a request for an absent target 404s.
     pub agent_dir: Option<String>,
+    /// Minimum worker protocol version accepted at handshake (M3.3). A worker
+    /// below it is rejected; a persistent one is told to self-update.
+    pub min_protocol: u32,
     /// Vast API key (VastProvider only).
     pub vast_api_key: Option<String>,
     /// Minutes reserved at the end of a lease for drain.
@@ -107,6 +110,10 @@ impl Config {
             .unwrap_or_else(|_| format!("ws://127.0.0.1:{port}{AGENT_WS_PATH}"));
         let agent_bin = std::env::var(env::AGENT_BIN).ok();
         let agent_dir = std::env::var(env::AGENT_DIR).ok();
+        let min_protocol = std::env::var(env::MIN_PROTOCOL)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(chuk_compute_wire::PROTOCOL_VERSION);
         let vast_api_key = std::env::var(env::VAST_API_KEY).ok();
         let reconcile_interval =
             duration_from_env(env::RECONCILE_INTERVAL_S, DEFAULT_RECONCILE_INTERVAL)?;
@@ -137,6 +144,7 @@ impl Config {
             agent_ws_url,
             agent_bin,
             agent_dir,
+            min_protocol,
             vast_api_key,
             drain_window_min,
             reconcile_interval,

@@ -34,6 +34,8 @@ async fn session(state: Arc<AppState>, socket: WebSocket) {
     let (worker_id, class, labels, hardware) = match handshake {
         Ok(Some(wire::WorkerToCp::Hello {
             token,
+            protocol_version,
+            target_triple,
             capabilities,
             resume,
             ..
@@ -43,6 +45,14 @@ async fn session(state: Arc<AppState>, socket: WebSocket) {
                 let _ = send(&mut sink, &reject(REJECT_BAD_TOKEN)).await;
                 return;
             };
+            // Version gate (M3.3): a worker below the accepted minimum is
+            // rejected — a persistent one with a self-update payload, a leased
+            // one bare (it re-downloads on its next provision).
+            if protocol_version < state.config.min_protocol {
+                warn!(protocol_version, min = state.config.min_protocol, class = ?class, "worker protocol too old");
+                let _ = send(&mut sink, &version_reject(&state, class, &target_triple).await).await;
+                return;
+            }
             let labels = labels_of(&capabilities);
             let hardware = hardware_of(&capabilities);
             (worker_id, class, labels, hardware)
@@ -106,6 +116,38 @@ fn reject(reason: &str) -> wire::CpToWorker {
     wire::CpToWorker::HelloReject {
         reason: reason.to_owned(),
         min_protocol: wire::PROTOCOL_VERSION,
+        url: None,
+        sha256: None,
+    }
+}
+
+/// The reject for a too-old worker (M3.3). A **persistent** worker gets a
+/// self-update payload — the download URL for its target + that binary's
+/// checksum — so it can update in place; a leased worker (or one whose target we
+/// don't serve) gets a bare reject and exits.
+async fn version_reject(
+    state: &AppState,
+    class: wire::WorkerClass,
+    target_triple: &str,
+) -> wire::CpToWorker {
+    let min = state.config.min_protocol;
+    let reason = format!("worker protocol below the minimum ({min})");
+    if class == wire::WorkerClass::Persistent {
+        if let Some(sha256) =
+            crate::api::binary_sha(state.config.agent_dir.as_deref(), target_triple).await
+        {
+            let base = state.config.public_url.trim_end_matches('/');
+            return wire::CpToWorker::HelloReject {
+                reason,
+                min_protocol: min,
+                url: Some(format!("{base}/agent/{target_triple}")),
+                sha256: Some(sha256),
+            };
+        }
+    }
+    wire::CpToWorker::HelloReject {
+        reason,
+        min_protocol: min,
         url: None,
         sha256: None,
     }

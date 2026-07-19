@@ -80,6 +80,18 @@ pub async fn serve_agent(State(state): State<Arc<AppState>>, Path(name): Path<St
         .into_response()
 }
 
+/// The sha256 hex of the served worker binary for `target`, or `None` if we
+/// don't distribute that target or have no binary for it. Used to build the
+/// self-update payload in the handshake (M3.3).
+pub async fn binary_sha(agent_dir: Option<&str>, target: &str) -> Option<String> {
+    if !SUPPORTED_TARGETS.contains(&target) {
+        return None;
+    }
+    let dir = agent_dir.unwrap_or(DEFAULT_AGENT_DIR);
+    let bytes = tokio::fs::read(format!("{dir}/{target}")).await.ok()?;
+    Some(hex::encode(Sha256::digest(&bytes)))
+}
+
 /// Parse a download name into `(target, wants_checksum)`, or `None` if the
 /// target is not one we distribute. Returns the `'static` allowlist entry so the
 /// caller builds the filesystem path from trusted input.

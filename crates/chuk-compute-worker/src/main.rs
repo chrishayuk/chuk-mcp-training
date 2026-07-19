@@ -29,6 +29,7 @@ mod outbox;
 mod outputs;
 mod procio;
 mod sandbox;
+mod selfupdate;
 mod seq;
 
 use std::time::Duration;
@@ -42,11 +43,12 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::backoff::with_jitter;
 use crate::constants::{
-    DEFAULT_DRAIN_WINDOW_MIN, HEARTBEAT_INTERVAL, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
+    DEFAULT_DRAIN_WINDOW_MIN, EXIT_CODE_REJECTED, HEARTBEAT_INTERVAL, RECONNECT_BACKOFF_MAX,
+    RECONNECT_BACKOFF_MIN,
 };
 use crate::executor::RunningJob;
 use crate::outbox::{event_seq, trim_to_high_water, SEQ_ORIGIN};
@@ -83,9 +85,36 @@ struct Args {
     drain_window_min: Option<f64>,
 }
 
-/// This build's compile target as `<arch>-<os>` (e.g. `aarch64-macos`).
+/// The distribution target triple for this host — the one the control plane
+/// serves a worker under (`/agent/<triple>`), so it must match the CP's
+/// `SUPPORTED_TARGETS` and `install.sh`'s uname mapping. Falls back to a bare
+/// `<arch>-<os>` (which the CP won't have a binary for) on an unknown platform.
 fn target_triple() -> String {
-    format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        (os, arch) => return format!("{arch}-{os}"),
+    }
+    .to_owned()
+}
+
+/// Re-exec `exe` with our original arguments, replacing this process (used after
+/// a self-update, spec §3). Only returns — as an error — if the exec syscall
+/// fails; on success the running image is replaced and this never returns.
+#[cfg(unix)]
+fn reexec(exe: &std::path::Path) -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    anyhow::anyhow!("re-exec of {} failed: {err}", exe.display())
+}
+
+#[cfg(not(unix))]
+fn reexec(exe: &std::path::Path) -> anyhow::Error {
+    anyhow::anyhow!("self-update re-exec is unix-only (target {})", exe.display())
 }
 
 /// Cheap entropy for reconnect jitter: the sub-second slice of the wall clock.
@@ -259,8 +288,30 @@ async fn run_session(
         Some(CpToWorker::HelloReject {
             reason,
             min_protocol,
-            ..
-        }) => anyhow::bail!("hello rejected: {reason} (min_protocol={min_protocol})"),
+            url,
+            sha256,
+        }) => {
+            // The control plane sends a binary url + checksum only to a worker it
+            // wants to self-update (a persistent one, spec §3). With both present
+            // we download → verify → atomically replace → re-exec. Otherwise
+            // (a leased worker, or no binary to offer) we exit rather than
+            // reconnect-loop against a version we can't satisfy.
+            match (url, sha256) {
+                (Some(url), Some(sha256)) => {
+                    warn!(%reason, min_protocol, %url, "control plane requires a newer worker; self-updating");
+                    let exe = selfupdate::download_and_replace(&url, &sha256)
+                        .await
+                        .context("self-update")?;
+                    // Re-exec the replaced binary with our original args; on
+                    // success this never returns (the process is replaced).
+                    return Err(reexec(&exe));
+                }
+                _ => {
+                    error!(%reason, min_protocol, "hello rejected with no update available; exiting");
+                    std::process::exit(EXIT_CODE_REJECTED);
+                }
+            }
+        }
         other => anyhow::bail!("unexpected handshake response: {other:?}"),
     };
 
@@ -395,11 +446,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_triple_is_arch_dash_os() {
+    fn target_triple_is_a_distribution_triple() {
+        // On a supported host it is a full distribution triple the control plane
+        // serves (so the self-update URL /agent/<triple> is valid); on anything
+        // else it falls back to `<arch>-<os>`.
         let triple = target_triple();
-        assert_eq!(
-            triple,
-            format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
+        let supported = [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+        ];
+        let fallback = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
+        assert!(
+            supported.contains(&triple.as_str()) || triple == fallback,
+            "unexpected triple: {triple}"
         );
         assert!(triple.contains('-'));
     }

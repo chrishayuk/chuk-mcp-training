@@ -218,6 +218,10 @@ pub mod env {
     /// Directory of per-target worker binaries the control plane serves for
     /// download (files named by target triple, e.g. `x86_64-unknown-linux-musl`).
     pub const AGENT_DIR: &str = "CHUK_TRAIN_AGENT_DIR";
+    /// Minimum worker protocol version the control plane accepts; a worker below
+    /// it is rejected (and a persistent one told to self-update). Defaults to the
+    /// build's `PROTOCOL_VERSION`; raise it to force a fleet-wide worker update.
+    pub const MIN_PROTOCOL: &str = "CHUK_TRAIN_MIN_PROTOCOL";
     /// chuk-experiments-server base URL (e.g. https://chuk-experiments-server.fly.dev).
     /// The reporting mirror (spec §11.6) is OFF unless this and the key are set.
     pub const EXPERIMENTS_URL: &str = "CHUK_EXPERIMENTS_URL";
