@@ -24,7 +24,10 @@ team, with **self-service scoped MCP API keys** (any signed-in user mints their
 own ≤ their role; admins manage the team); and an **optional
 chuk-experiments-server reporting mirror** (gated off by default — when
 configured, run lifecycle + checkpoints-as-artifacts + final-metrics-as-results
-mirror into the experiments registry, best-effort). Next M-work: M4 budget caps +
+mirror into the experiments registry through a durable, retrying outbox — a
+transient failure is retried, never silently dropped — with each run attributed
+to whichever user's own linked chuk-experiments-server key submitted it, falling
+back to the shared server-wide key otherwise). Next M-work: M4 budget caps +
 watchdogs, then M3 packing. See `ROADMAP.md`.
 
 **Runs standalone.** Every external tier is gated and optional — no R2 (falls

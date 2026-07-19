@@ -620,11 +620,17 @@ conflated by a shared shape. Their `/v1/queue` claim/lease contract (workers *pu
 experiments-server enqueued) is a possible **later opt-in** execution mode — an add-on, never a
 replacement for our own queue.
 
-Every report is **fire-and-forget**, spawned off the run's critical path (a slow or down
-experiments-server logs a warning and never blocks or fails a run). Built and verified
-end-to-end (`crates/chuk-train-controlplane/src/experiments.rs`). *Known limitation:* a transient
-failure drops that one update (no retry) — a durable outbox with retry is future work, so
-the mirror is best-effort, not a guaranteed-consistent replica.
+Every report is persisted to a durable outbox (`experiments_outbox`, both SQLite and
+Postgres) before the first delivery attempt, and retried with capped exponential backoff
+on failure — a slow or down experiments-server never blocks or fails a run, and a
+transient failure is retried rather than silently dropped. Built and verified end-to-end
+(`crates/chuk-train-controlplane/src/experiments.rs`). Each run's submitting user may link
+their own chuk-experiments-server API key (`PUT /api/me/experiments-key`, encrypted at
+rest); a mirrored run is attributed under that key when one is linked, falling back to the
+shared server-wide key otherwise. *Known limitation:* delivery is at-least-once, not
+idempotent — a lost HTTP response after a real commit can duplicate a result row or hit a
+`create` slug conflict that isn't yet resolved by looking up the existing run; a stable
+per-event id + a real dedup/fetch-existing path is future work (see ROADMAP.md).
 
 ---
 

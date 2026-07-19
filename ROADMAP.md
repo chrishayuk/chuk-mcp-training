@@ -26,8 +26,9 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 - **Full operator dashboard** (spec §9) — served by the CP, Google-authed. A clean
   per-run view (live loss + metric toggles, streamed logs, checkpoints with metadata +
   download, events, config, out-links) and an overview with fleet/runs filters +
-  pagination. Sortable `RUN-YYYYMMDD-HHMMSS-NNNNN` ids (store-backed 5-digit
-  sequence, matching chuk-experiments-server).
+  pagination. Sortable `EXEC-YYYYMMDD-HHMMSS-NNNNN` ids (store-backed 5-digit
+  sequence — deliberately distinct from chuk-experiments-server's own `RUN-…`
+  shape; see *Integration depth* below).
 - **Drive cold-archive tier** (complete) — completed runs auto-tier their final
   checkpoint + logs + metrics to Google Drive (canonical), the final is promoted to
   `ckpt-final` on R2, and R2 lifecycle expires the hot copies. Stable per-checkpoint URLs
@@ -42,8 +43,10 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 - **chuk-experiments-server reporting mirror** (§11.6) — optional + gated (off unless
   `CHUK_EXPERIMENTS_URL` + a WRITE key are set): the CP creates the run there (our id as
   `slug`/`harness_session_id`), PATCHes lifecycle, registers checkpoints as artifacts, and
-  submits final metrics as results — all **fire-and-forget** off the run's critical path.
-  Unset ⇒ no-op; the harness always runs standalone. Verified end-to-end.
+  submits final metrics as results — every event persists to a durable outbox before the
+  first delivery attempt and retries with capped backoff on failure, never silently dropped
+  (see *Integration depth* below). Unset ⇒ no-op; the harness always runs standalone.
+  Verified end-to-end.
 - **Dogfooding demo** — `scripts/demo.sh` spins up a local CP + mock workers running the
   (enriched) stub-trainer, so the dashboard fills with live data; isolated from prod.
 - **Fly deploy**: `chuk-mcp-training.fly.dev`; the CP serves the agent binary and
@@ -154,9 +157,14 @@ candidate *Requirements-aware assignment* / *generalized bootstrap* items feed i
   config_hash)` so packing's fit rule is real (§16 open question; skip gpu-class first).
 
 **Operational hardening**
-- **Durable outbox for the experiments mirror** (S–M) — reports are fire-and-forget, so a
-  transient 5xx silently drops a checkpoint-artifact registration and diverges the registry;
-  persist pending ops with retry (the Drive archiver's pattern) without making it a dependency.
+- **Outbox delivery is at-least-once, not idempotent** (S–M, 2026-07-19 review finding) —
+  the durable outbox retries a failed attempt, but if the experiments-server actually
+  committed the write and only the HTTP response was lost, the retry can duplicate a
+  result row, or (for `create`) hit a slug conflict that `try_create` currently treats as
+  just another failure rather than looking up the existing run and completing the
+  attachment. Needs a stable per-event id carried in the outbox row and either a
+  fetch-existing-on-conflict path for `create`, or an idempotency key the
+  experiments-server dedups results/checkpoints against.
 - **Multi-machine story** (L) — live agent sockets, the grant table, and idle timers are all
   in-process; >1 Fly machine needs sticky agent routing or Redis pubsub fan-out (the store
   module already flags this).
