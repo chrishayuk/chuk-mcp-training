@@ -117,13 +117,16 @@ agent/MCP-deployment platform never colonizes the rig. Sequencing (spec §11):
   three targets (zigbuild + macOS). **Proven: the Mac joins via `curl <CP>/install.sh | sh`.**
   Follow-up: bake the aarch64-musl + darwin CI artifacts into the deployed image (serves x86_64
   today; the Mac builds locally / from CI).
-- **M3 — persistent worker class** (in progress). **M3.1 ✅ done** — long-lived revocable
-  worker tokens (`cw_`, hashed at rest) bound to a stable id; a persistent token → `Persistent`
-  class + that id in HelloAck, so a Mac keeps one identity across reconnects/restarts; no lease
-  ⇒ never torn down. Proven (mint → join → job → restart-same-id → bogus-rejected). **Remaining:**
-  M3.2 survive-disconnect (job keeps running across a drop; event spool/replay against a
-  high-water mark; CP doesn't requeue a persistent worker's live job), M3.3 self-update from a
-  version `HelloReject`. `WorkerClass` is an enum so destroying a persistent worker is unrepresentable.
+- **M3 — persistent worker class** (in progress). **M3.1 + M3.2 ✅ done.** M3.1: long-lived
+  revocable worker tokens (`cw_`, hashed at rest) bound to a stable id; a persistent token →
+  `Persistent` class + that id in HelloAck, so a Mac keeps one identity across reconnects/restarts;
+  no lease ⇒ never torn down. M3.2 **survive-disconnect**: the worker's job supervisor + replay
+  outbox outlive a session, so a persistent worker keeps its job running across a dropped socket
+  (or the CP restarting) and replays buffered events on reconnect, trimmed by a `HelloAck`
+  high-water the CP dedups by; the CP doesn't requeue a persistent worker's live job. **Proven:**
+  bounce the CP mid-run → the job keeps running through the outage → reconnect → replay → run
+  completes. **Remaining:** M3.3 self-update from a version `HelloReject` (download + verify +
+  atomic-replace + re-exec). `WorkerClass` is an enum so destroying a persistent worker is unrepresentable.
 - **M4 — `sys/*` telemetry sampler** — one sampler task over the existing Metric channel: NVML
   (`nvml-wrapper`, runtime-loaded) + `sysinfo` first; macmon/IOReport MPS once the Mac is on
   (tier-2 best-effort, gaps as absent metrics not zeros). Feeds packing-util, OOM/thermal gates, MFU.
