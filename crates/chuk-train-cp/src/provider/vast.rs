@@ -16,12 +16,12 @@ use super::{Provider, ProvisionContext};
 
 pub const NAME: &str = "vast";
 const API_BASE: &str = "https://console.vast.ai/api/v0";
-/// Boot script the rented instance runs: fetch the static agent and join.
-/// The real binary URL is filled from an env/release in E2 wiring.
+/// Boot script the rented instance runs: the control plane's one-shot installer
+/// detects the box's target, downloads + verifies the matching worker, and joins
+/// (chuk-compute M2). `{cp_url}` is the control plane's HTTP base.
 const ONSTART_TEMPLATE: &str = "\
-curl -fsSL \"$CHUK_AGENT_URL\" -o /usr/local/bin/chuk-compute-worker && \
-chmod +x /usr/local/bin/chuk-compute-worker && \
-chuk-compute-worker --url '{ws_url}' --token '{join_token}' \
+curl -fsSL '{cp_url}/install.sh' | sh -s -- \
+--cp '{cp_url}' --token '{join_token}' \
 --worker-id '{worker_id}' --lease-min {lease_min} --drain-window-min {drain_window_min}";
 
 pub struct VastProvider {
@@ -100,8 +100,15 @@ impl Provider for VastProvider {
             .as_deref()
             .and_then(|id| id.strip_prefix("vast:").unwrap_or(id).parse::<u64>().ok())
             .context("vast provision needs an offer_id from provider_offers")?;
+        // install.sh needs the HTTP base; derive it from the websocket URL.
+        let cp_url = ctx
+            .ws_url
+            .replace("wss://", "https://")
+            .replace("ws://", "http://")
+            .trim_end_matches(chuk_train_proto::AGENT_WS_PATH)
+            .to_owned();
         let onstart = ONSTART_TEMPLATE
-            .replace("{ws_url}", &ctx.ws_url)
+            .replace("{cp_url}", &cp_url)
             .replace("{join_token}", &ctx.join_token)
             .replace("{worker_id}", &ctx.worker_id)
             .replace("{lease_min}", &req.lease_min.to_string())

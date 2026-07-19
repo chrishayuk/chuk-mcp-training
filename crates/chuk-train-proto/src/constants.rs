@@ -5,12 +5,37 @@ use std::time::Duration;
 /// Default TCP port for the control plane (HTTP + agent websocket).
 pub const DEFAULT_PORT: u16 = 8700;
 
-/// Path agents dial for the outbound websocket (spec §7).
+/// Path workers dial for the outbound websocket (spec §7).
 pub const AGENT_WS_PATH: &str = "/ws/agent";
 /// Unauthenticated liveness probe.
 pub const HEALTH_PATH: &str = "/healthz";
-/// Unauthenticated download of the worker agent binary (public code, spec §12).
-pub const AGENT_DOWNLOAD_PATH: &str = "/agent/linux-x86_64";
+
+// -- worker distribution (chuk-compute M2) ----------------------------------
+// The control plane serves a per-target worker binary + its checksum, a version
+// endpoint for the self-updater, and the one-shot installer. All public (the
+// worker is public code, spec §12).
+
+/// Route for the per-target worker binary + its checksum: `/agent/<target>` and
+/// `/agent/<target>.sha256`, where `<target>` is one of [`SUPPORTED_TARGETS`].
+pub const AGENT_DOWNLOAD_ROUTE: &str = "/agent/{name}";
+/// Suffix that turns a binary path into its checksum path.
+pub const AGENT_SHA256_SUFFIX: &str = ".sha256";
+/// Current worker version, for the persistent worker's self-updater (M3).
+pub const AGENT_VERSION_PATH: &str = "/agent/version";
+/// The rustup-style one-shot installer: detects the target, downloads + verifies
+/// the matching binary, and execs the worker joined to the fleet.
+pub const INSTALL_SCRIPT_PATH: &str = "/install.sh";
+
+/// Target triples the control plane distributes a worker for. Also the download
+/// allowlist (a request for anything else 404s — no path traversal). The two
+/// linux-musl targets are cross-built into the deployed image; the darwin
+/// targets come from a macOS build (CI / local).
+pub const SUPPORTED_TARGETS: [&str; 4] = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+];
 
 /// How often a connected agent sends a heartbeat.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -185,8 +210,11 @@ pub mod env {
     /// Email seeded as the bootstrap sysadmin on startup (falls back to the
     /// first ALLOWED_EMAILS entry). Only seeded if the user doesn't yet exist.
     pub const SYSADMIN_EMAIL: &str = "CHUK_TRAIN_SYSADMIN_EMAIL";
-    /// Path to the agent binary the mock provider launches as fake instances.
+    /// Path to the worker binary the mock provider launches as fake instances.
     pub const AGENT_BIN: &str = "CHUK_TRAIN_AGENT_BIN";
+    /// Directory of per-target worker binaries the control plane serves for
+    /// download (files named by target triple, e.g. `x86_64-unknown-linux-musl`).
+    pub const AGENT_DIR: &str = "CHUK_TRAIN_AGENT_DIR";
     /// chuk-experiments-server base URL (e.g. https://chuk-experiments-server.fly.dev).
     /// The reporting mirror (spec §11.6) is OFF unless this and the key are set.
     pub const EXPERIMENTS_URL: &str = "CHUK_EXPERIMENTS_URL";

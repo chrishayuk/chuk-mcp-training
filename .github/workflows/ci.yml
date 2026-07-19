@@ -31,3 +31,51 @@ jobs:
       # not gated here.
       - name: Test
         run: cargo test --workspace
+
+  # chuk-compute M2: build the worker for every distributed target (the
+  # SUPPORTED_TARGETS matrix). Linux-musl via cargo-zigbuild; darwin natively on
+  # a macOS runner. Uploads each binary as an artifact for the release / image.
+  build-targets:
+    name: worker (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            zig: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-zigbuild + zig
+        if: matrix.zig
+        run: |
+          pipx install ziglang || pip install ziglang
+          cargo install cargo-zigbuild --locked
+
+      - name: Build worker
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release -p chuk-compute-worker --target ${{ matrix.target }}
+          else
+            cargo build --release -p chuk-compute-worker --target ${{ matrix.target }}
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/chuk-compute-worker

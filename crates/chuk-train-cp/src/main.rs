@@ -31,7 +31,9 @@ use anyhow::Result;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use chuk_compute_wire::API_PREFIX;
-use chuk_train_proto::{AGENT_DOWNLOAD_PATH, AGENT_WS_PATH, HEALTH_PATH};
+use chuk_train_proto::{
+    AGENT_DOWNLOAD_ROUTE, AGENT_VERSION_PATH, AGENT_WS_PATH, HEALTH_PATH, INSTALL_SCRIPT_PATH,
+};
 use tracing::{info, warn};
 
 use crate::archive::Archiver;
@@ -215,7 +217,9 @@ async fn main() -> Result<()> {
         .route("/auth/callback", get(auth::callback))
         .route("/auth/logout", get(auth::logout))
         .route(HEALTH_PATH, get(api::healthz))
-        .route(AGENT_DOWNLOAD_PATH, get(api::serve_agent))
+        .route(INSTALL_SCRIPT_PATH, get(api::serve_install))
+        .route(AGENT_VERSION_PATH, get(api::agent_version))
+        .route(AGENT_DOWNLOAD_ROUTE, get(api::serve_agent))
         .route(AGENT_WS_PATH, get(ws::agent_ws))
         .nest(API_PREFIX, api_bearer.merge(api_grant))
         .with_state(state);

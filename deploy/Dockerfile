@@ -17,10 +17,16 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/chuk-train-cp /usr/local/bin/chuk-train-cp
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/chuk-compute-worker /app/chuk-compute-worker
+# Per-target worker binaries the control plane serves at /agent/<triple>
+# (chuk-compute M2). Only the x86_64-musl target is cross-built in this
+# x86_64-Linux image; aarch64-musl + the darwin targets come from the CI
+# release matrix (see .github/workflows/ci.yml) and are a follow-up to bake in.
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/chuk-compute-worker \
+     /app/agents/x86_64-unknown-linux-musl
 # Store comes from CHUK_TRAIN_STORE at runtime (Neon via `fly secrets`); no
 # image-level default so nothing silently shadows the secret.
-# The control plane serves this at /agent/linux-x86_64 for the bootstrap cell.
-ENV CHUK_TRAIN_AGENT_BIN=/app/chuk-compute-worker
+ENV CHUK_TRAIN_AGENT_DIR=/app/agents
+# The mock provider (local only) launches this path; unused in the deploy.
+ENV CHUK_TRAIN_AGENT_BIN=/app/agents/x86_64-unknown-linux-musl
 EXPOSE 8700
 CMD ["chuk-train-cp"]
