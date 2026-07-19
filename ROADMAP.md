@@ -104,9 +104,12 @@ messages**; training stays the product, every other workload earns its place by 
 training loop. §12 fixes the experiment-vs-service rule and the CP-fork tripwires so the
 agent/MCP-deployment platform never colonizes the rig. Sequencing (spec §11):
 
-- **M1 — extract the substrate** — `chuk-compute-wire` + `chuk-compute-worker` with the `Hello`
-  handshake + batch jobs, single-target build, **behaviour parity with today**. (Renames the
-  worker; retires the `train`-named paths in the wire/worker layer.)
+- **M1 — extract the substrate** ✅ **done** — `chuk-compute-wire` (serde-only generic protocol,
+  lexical guard, ~99% cov) + `chuk-compute-worker` (domain-free executor, depends only on the wire
+  crate). CP translates `RunSpec`→`Job` and interprets `Artifact` events back into checkpoints
+  (lineage merge moved CP-side). **Parity proven** on the local demo — a train run completes with
+  lineage-complete checkpoints, and the E1 resume path yields slices `[[0,10],[10,40]]`. CI runs the
+  guards. Single-target build retained (M2 changes that).
 - **M2 — target matrix + bootstrap** — build `x86_64`/`aarch64` musl + `aarch64-apple-darwin`;
   serve `/agent/{os}-{arch}` + `.sha256` + `/agent/version`; one `install.sh` (rustup-style)
   the Colab cell and Vast onstart wrap. Retires the hardcoded `/agent/linux-x86_64`.

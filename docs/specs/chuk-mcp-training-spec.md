@@ -1,9 +1,9 @@
 # chuk-mcp-training — Specification v0.7
 
 **MCP-controlled remote training harness for Colab and rented single GPUs**
-Control plane + worker agent in **Rust** (axum · tokio · sqlx) · MCP tool surface in
-**Python** on `chuk-mcp-server` (thin client over the control plane's REST API) ·
-Workers: Google Colab, Vast.ai, Lambda Cloud
+Control plane + a compute-generic worker (`chuk-compute-worker`) in **Rust** (axum · tokio ·
+sqlx) · MCP tool surface in **Python** on `chuk-mcp-server` (thin client over the control
+plane's REST API) · Workers: Google Colab, Vast.ai, Lambda Cloud
 
 v0.7 changes: the control plane is **stateless on Neon** (serverless Postgres) via the
 `Store` seam (SQLite kept for local dev + tests). The **archive tier (§11.5) is complete** —
@@ -59,13 +59,18 @@ scheduler (M3), budget caps + watchdog gates (M4), sweeps + lazarus integration 
 driver (M5). (The R2 lifecycle rules that expire the hot copies need an Admin R/W R2 token,
 or a manual dashboard config.)
 
+**Substrate:** the worker + wire protocol are now the compute-generic **chuk-compute** crates
+(`chuk-compute-wire` + `chuk-compute-worker`; **M1 done**, parity proven — see §7 and
+`chuk-compute-spec.md`). The control plane translates a run into a generic job and interprets the
+results back into checkpoints; the worker is domain-free.
+
 ---
 
 ## 1. Overview
 
 `chuk-mcp-training` is a control plane, exposed as an MCP server, that provisions
 **leased** GPU workers, packs queued experiments into those leases, and tears workers
-down — guaranteed — when the lease expires. A single pip-installable worker agent
+down — guaranteed — when the lease expires. A single worker binary
 (`chuk-compute-worker`) runs identically inside a Colab notebook, a Vast.ai container, or a
 Lambda instance, dials **out** to the control plane, and executes assigned jobs
 back-to-back until its lease ends.
@@ -81,8 +86,8 @@ Mac) reads them via one `load_checkpoint(run_id, step)` tool. No shared code, no
 
 1. **Workers dial out, always.** All worker↔control-plane traffic is one outbound
    websocket. No worker-side listener, ever.
-2. **One agent, every backend.** Only provisioning differs per provider; everything after
-   `agent --join <token>` is identical.
+2. **One worker, every backend.** Only provisioning differs per provider; everything after
+   `chuk-compute-worker --join <token>` is identical.
 3. **A lease is a wall.** Every worker is provisioned with a runtime budget. When it
    expires: drain, checkpoint, upload, destroy. The only way past the wall is an explicit
    `extend_lease` MCP call, which is a budget decision, not a default.
@@ -374,13 +379,16 @@ Watchdogs are gates with `action="stop_run"`: `isnan(last(loss))`,
 
 ## 7. Agent protocol
 
-> **Being reworked → `chuk-compute-spec.md`.** The worker daemon + wire protocol are being
-> extracted into a compute-generic substrate (crates `chuk-compute-wire` + `chuk-compute-worker`):
-> the daemon is a **worker** (not "agent"), the workload model generalizes to batch-vs-service,
-> and per-run `sys/*` telemetry + a persistent (BYO/Mac) worker class are folded in. This section
-> describes today's implementation; the target design and its M1–M7 sequencing live in
-> `chuk-compute-spec.md`, with §12 there fixing the experiment-vs-service boundary against the
-> agent/MCP deployment platform.
+> **Now on the `chuk-compute` substrate (M1 done) → `chuk-compute-spec.md`.** The worker daemon
+> + wire protocol have been extracted into a compute-generic substrate (crates
+> `chuk-compute-wire` + `chuk-compute-worker`): the daemon is a **worker** (not "agent"), the
+> workload model is batch-vs-service, and the worker is domain-free — the control plane
+> translates a run into a generic `Job` (inputs → command → outputs) and interprets the results
+> back into checkpoints. **M1 is proven** (parity incl. the E1 resume/slice path). Still to come
+> (M2–M7): the target-triple matrix + `install.sh`, a persistent BYO/Mac worker class, per-run
+> `sys/*` telemetry, service jobs, campaigns, and RL. §12 there fixes the experiment-vs-service
+> boundary against the agent/MCP deployment platform. This section describes the run lifecycle
+> semantics, which are unchanged.
 
 Single outbound WSS; JSON messages; per-worker monotonic sequence numbers; reconnect
 replays from last acked seq. **The agent must tolerate a dark control plane**: if the

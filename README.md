@@ -33,17 +33,34 @@ and no chuk-experiments-server (reporting mirror off). The harness's own Neon/
 SQLite store + queue are always the source of truth; nothing outside is a hard
 dependency.
 
-**Stack:** Rust control plane + Rust worker agent; the MCP tool surface is
-Python on `chuk-mcp-server`, a thin client over the control plane's REST API.
-House rules: async native, no magic strings, no magic numbers, pydantic native
-on the Python side — shared names/numbers live in `chuk-train-proto`
-(Rust) and are mirrored in `chuk_train_mcp/constants.py` (Python).
+**chuk-compute substrate (in progress).** Underneath the training-first control
+plane the rig is being factored into a **compute fabric**: a permanently
+compute-generic worker + wire protocol. **M1 is done** — the worker
+(`chuk-compute-worker`) is a domain-free executor that runs generic *jobs*
+(stage inputs → command → outputs) and speaks `chuk-compute-wire`; the control
+plane translates a run into a generic job and interprets the results back into
+checkpoints. Same behaviour as before (proven — including the E1 resume/slice
+path), now on a substrate that will grow to run evals, benchmarks, cells, agents,
+and RL loops. Spec: `docs/specs/chuk-compute-spec.md`.
+
+**Stack:** Rust control plane + Rust worker (`chuk-compute-worker`); the MCP tool
+surface is Python on `chuk-mcp-server`, a thin client over the control plane's
+REST API. House rules: async native, no magic strings, no magic numbers, pydantic
+native on the Python side, clean/decoupled modules, ≥90% test coverage per file.
+The worker↔control-plane protocol lives in `chuk-compute-wire` (generic, serde-
+only); training domain types + constants live in `chuk-train-proto` (Rust,
+control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
 
 ## Layout
 
-- `crates/chuk-train-proto` — shared wire protocol, domain types, constants,
-  and the store key layout. The single source of truth for everything that
-  crosses a process boundary.
+- `crates/chuk-compute-wire` — the compute-generic worker↔control-plane protocol
+  (chuk-compute-spec): the `Hello` handshake, the generic `Job` model (inputs →
+  command → outputs, batch-vs-service), capabilities, worker classes, telemetry
+  config, and the blob-transfer contract. Serde-only, no domain vocabulary (a
+  lexical guard enforces it). The worker depends on nothing else in the workspace.
+- `crates/chuk-train-proto` — control-plane domain types, constants, and the
+  store key layout (run/train/checkpoint specs, RBAC types, REST payloads). The
+  source of truth for the training domain + the CP↔MCP REST surface.
 - `crates/chuk-train-cp` — control plane daemon (axum + tokio + sqlx):
   `/ws/agent` (worker websocket), `/api/*` (role-authed REST + grant-auth
   upload/fetch), `/` (the operator dashboard), `/healthz`. Adapter seams — the
@@ -55,10 +72,13 @@ on the Python side — shared names/numbers live in `chuk-train-proto`
   dashboard). Builds code units, mints run-scoped upload grants, ingests metrics
   + checkpoints, resumes, auto-archives completed runs, and runs the lease clock
   + reconcile loop that enforce the wall and kill orphans.
-- `crates/chuk-compute-worker` — worker agent binary: dials out, registers
-  hardware, heartbeats, runs shell + train jobs, streams logs/metrics, fetches
-  code units (cached by sha), uploads lineage-complete checkpoints, resumes,
-  reconnects with backoff. Builds to a static musl binary workers download.
+- `crates/chuk-compute-worker` — the join-anywhere worker binary (depends only on
+  `chuk-compute-wire`): dials out, `Hello` handshake, heartbeats, and runs generic
+  jobs — stages inputs (fetch/unpack into a sandbox), runs the command under
+  supervision, streams logs/metrics, collects outputs (uploaded as artifacts),
+  reconnects with backoff. Domain-free: the training-ness (code units, resume,
+  checkpoint lineage) is expressed by the control plane in the job it sends.
+  Builds to a static musl binary workers download.
 - `mcp/` — `chuk-train-mcp` Python package: `fleet`, `submit_shell`, `list_runs`,
   `run_status`, `tail_logs`, `run_events`, `build_code_unit`, `submit_run`,
   `run_metrics`, `list_checkpoints`, `pin_checkpoint`, `artifact_url`,

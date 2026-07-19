@@ -248,8 +248,13 @@ campaign budget bounds its spend, and the controller's transcript joins the expe
 
 ## 11. Sequencing
 
-M1 — extract `chuk-compute-wire` and `chuk-compute-worker` with the Hello handshake, batch jobs,
-and the current single-target build; behaviour parity with today. M2 — target matrix, bootstrap
+**M1 — DONE** — extracted `chuk-compute-wire` (serde-only generic protocol; lexical guard; ~99%
+coverage) and `chuk-compute-worker` (domain-free executor depending only on the wire crate), with
+the Hello handshake, batch jobs, and the current single-target build. The control plane translates
+`RunSpec`→`Job` and interprets `Artifact` events back into checkpoints (lineage merge moved
+control-plane-side). **Behaviour parity proven** on the local demo: a train run completes with
+lineage-complete checkpoints, and the E1 resume path yields slices `[[0,10],[10,40]]`. CI runs
+both lexical guards. M2 — target matrix, bootstrap
 script, `/agent/{os}-{arch}` serving, checksum + version endpoints. M3 — persistent worker class:
 long-lived tokens, reconnect with resume, metric spool, self-update; the Mac joins. M4 — `sys/*`
 sampler (NVML + sysinfo first; macmon-based MPS once the Mac is on). M5 — service jobs, registry,

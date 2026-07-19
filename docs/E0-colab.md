@@ -1,10 +1,10 @@
 # E0 · first real run on a Colab T4
 
-Goal (spec §15 E0): the agent joins from a real Colab T4, `fleet` shows it with
+Goal (spec §15 E0): the worker joins from a real Colab T4, `fleet` shows it with
 the right GPU, a shell job runs `nvidia-smi` + a matmul throughput probe, and
 logs stream live through `tail_logs`. Costs only Colab units.
 
-The control plane is deployed to Fly and **serves the agent binary itself**, so
+The control plane is deployed to Fly and **serves the worker binary itself**, so
 the Colab cell needs only the Fly URL + join token — nothing else to host.
 
 ## 1 · Deploy the control plane to Fly
@@ -24,7 +24,7 @@ fly secrets set -c deploy/fly.toml \
 fly deploy -c deploy/fly.toml --dockerfile deploy/Dockerfile
 ```
 
-The Dockerfile builds the control plane (native) and the agent (static musl,
+The Dockerfile builds the control plane (native) and the worker (static musl,
 portable to Colab) on Fly's x86_64 builder. After deploy, point public URLs at
 the real host:
 
@@ -54,7 +54,7 @@ Read the two secret values back for the next steps:
 1. New Colab notebook → Runtime → Change runtime type → **T4 GPU**.
 2. Paste `bootstrap/colab_cell.py` into one cell.
 3. Fill in `CP_URL = "https://<app>.fly.dev"` and `JOIN_TOKEN = "<join token>"`.
-4. Run the cell. It downloads the agent and dials home; **leave it running**.
+4. Run the cell. It downloads the worker and dials home; **leave it running**.
 
 Within a second the worker appears in `fleet`.
 
@@ -90,15 +90,15 @@ Then, via the MCP tools (mcp-cli / Claude / a quick `uv run python`):
 
 ## 4 · Tear down
 
-Close the Colab tab (the agent exits; the worker goes `disconnected`). Nothing
+Close the Colab tab (the worker exits; the worker goes `disconnected`). Nothing
 to clean up — no lease, no rented instance. That's the whole point of proving on
 Colab first.
 
 ## Notes
 
-- The agent is a 5.5 MB static binary — no Python deps, no glibc concerns.
+- The worker is a 5.5 MB static binary — no Python deps, no glibc concerns.
 - If the TLS handshake ever fails on an unusual image, the fix is swapping the
-  agent's rustls roots from `native-roots` to bundled `webpki-roots` (one line
+  worker's rustls roots from `native-roots` to bundled `webpki-roots` (one line
   in `crates/chuk-compute-worker/Cargo.toml`); Colab's normal image has the certs.
 - E1 (real training) reuses this exact setup: build a code unit from your v11
   trainer repo with `build_code_unit`, then `submit_run` against the Colab
