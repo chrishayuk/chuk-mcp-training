@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# The control plane embeds scripts/install.sh via include_str!, so it must be in
+# the build context (not just crates/).
+COPY scripts ./scripts
 # Control plane: native, runs inside the runtime image below.
 RUN cargo build --release -p chuk-train-cp
 # Agent: static musl, downloaded + run on bare Colab/Vast Linux.
