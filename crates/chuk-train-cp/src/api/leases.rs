@@ -146,7 +146,7 @@ JOIN_TOKEN = "{token}"
 LABELS = "{labels}"
 
 import os, stat, subprocess, urllib.request
-base = CP_URL.rstrip("/"); agent = "/tmp/chuk-train-agent"
+base = CP_URL.rstrip("/"); agent = "/tmp/chuk-compute-worker"
 urllib.request.urlretrieve(base + "/agent/linux-x86_64", agent)
 os.chmod(agent, os.stat(agent).st_mode | stat.S_IEXEC)
 ws = base.replace("https://", "wss://").replace("http://", "ws://") + "/ws/agent"

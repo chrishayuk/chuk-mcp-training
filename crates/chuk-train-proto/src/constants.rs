@@ -7,8 +7,6 @@ pub const DEFAULT_PORT: u16 = 8700;
 
 /// Path agents dial for the outbound websocket (spec §7).
 pub const AGENT_WS_PATH: &str = "/ws/agent";
-/// Prefix for the bearer-authenticated REST API.
-pub const API_PREFIX: &str = "/api";
 /// Unauthenticated liveness probe.
 pub const HEALTH_PATH: &str = "/healthz";
 /// Unauthenticated download of the worker agent binary (public code, spec §12).

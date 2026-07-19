@@ -55,7 +55,7 @@ on the Python side — shared names/numbers live in `chuk-train-proto`
   dashboard). Builds code units, mints run-scoped upload grants, ingests metrics
   + checkpoints, resumes, auto-archives completed runs, and runs the lease clock
   + reconcile loop that enforce the wall and kill orphans.
-- `crates/chuk-train-agent` — worker agent binary: dials out, registers
+- `crates/chuk-compute-worker` — worker agent binary: dials out, registers
   hardware, heartbeats, runs shell + train jobs, streams logs/metrics, fetches
   code units (cached by sha), uploads lineage-complete checkpoints, resumes,
   reconnects with backoff. Builds to a static musl binary workers download.
@@ -81,7 +81,7 @@ export CHUK_TRAIN_API_TOKEN=$(openssl rand -hex 24)
 export CHUK_TRAIN_JOIN_TOKEN=$(openssl rand -hex 24)
 
 cargo run -p chuk-train-cp                                   # control plane :8700
-cargo run -p chuk-train-agent -- \
+cargo run -p chuk-compute-worker -- \
   --url ws://127.0.0.1:8700/ws/agent --token $CHUK_TRAIN_JOIN_TOKEN
 
 cd mcp && uv sync && CHUK_TRAIN_URL=http://127.0.0.1:8700 \

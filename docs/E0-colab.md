@@ -99,7 +99,7 @@ Colab first.
 - The agent is a 5.5 MB static binary — no Python deps, no glibc concerns.
 - If the TLS handshake ever fails on an unusual image, the fix is swapping the
   agent's rustls roots from `native-roots` to bundled `webpki-roots` (one line
-  in `crates/chuk-train-agent/Cargo.toml`); Colab's normal image has the certs.
+  in `crates/chuk-compute-worker/Cargo.toml`); Colab's normal image has the certs.
 - E1 (real training) reuses this exact setup: build a code unit from your v11
   trainer repo with `build_code_unit`, then `submit_run` against the Colab
   worker — checkpoints upload to `/data/artifacts` on Fly with full lineage.

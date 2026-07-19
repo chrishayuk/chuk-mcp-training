@@ -66,7 +66,7 @@ or a manual dashboard config.)
 `chuk-mcp-training` is a control plane, exposed as an MCP server, that provisions
 **leased** GPU workers, packs queued experiments into those leases, and tears workers
 down — guaranteed — when the lease expires. A single pip-installable worker agent
-(`chuk-train-agent`) runs identically inside a Colab notebook, a Vast.ai container, or a
+(`chuk-compute-worker`) runs identically inside a Colab notebook, a Vast.ai container, or a
 Lambda instance, dials **out** to the control plane, and executes assigned jobs
 back-to-back until its lease ends.
 
@@ -123,7 +123,7 @@ Mac) reads them via one `load_checkpoint(run_id, step)` tool. No shared code, no
    ┌────────┴──────────┬───────────────────────┴──────┐
    ▼                   ▼                              ▼
  Colab notebook    Vast.ai instance             Lambda instance
- chuk-train-agent  chuk-train-agent             chuk-train-agent
+ chuk-compute-worker  chuk-compute-worker       chuk-compute-worker
 ```
 
 The VPS is the only always-on component (SQLite + websocket server + static dashboard —

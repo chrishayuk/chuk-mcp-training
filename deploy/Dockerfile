@@ -11,16 +11,16 @@ COPY crates ./crates
 # Control plane: native, runs inside the runtime image below.
 RUN cargo build --release -p chuk-train-cp
 # Agent: static musl, downloaded + run on bare Colab/Vast Linux.
-RUN cargo build --release -p chuk-train-agent --target x86_64-unknown-linux-musl
+RUN cargo build --release -p chuk-compute-worker --target x86_64-unknown-linux-musl
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/chuk-train-cp /usr/local/bin/chuk-train-cp
-COPY --from=build /src/target/x86_64-unknown-linux-musl/release/chuk-train-agent /app/chuk-train-agent
+COPY --from=build /src/target/x86_64-unknown-linux-musl/release/chuk-compute-worker /app/chuk-compute-worker
 # Store comes from CHUK_TRAIN_STORE at runtime (Neon via `fly secrets`); no
 # image-level default so nothing silently shadows the secret.
 # The control plane serves this at /agent/linux-x86_64 for the bootstrap cell.
-ENV CHUK_TRAIN_AGENT_BIN=/app/chuk-train-agent
+ENV CHUK_TRAIN_AGENT_BIN=/app/chuk-compute-worker
 EXPOSE 8700
 CMD ["chuk-train-cp"]

@@ -9,9 +9,8 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chuk_train_proto::{
-    ApiError, BlobMethod, BlobUrlRequest, BlobUrlResponse, API_PREFIX, DEFAULT_ARTIFACT_URL_TTL,
-};
+use chuk_compute_wire::{BlobMethod, BlobUrlRequest, BlobUrlResponse, API_PREFIX};
+use chuk_train_proto::{ApiError, DEFAULT_ARTIFACT_URL_TTL};
 
 use crate::grant::Grant;
 use crate::AppState;

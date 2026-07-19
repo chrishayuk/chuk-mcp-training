@@ -7,6 +7,9 @@
 /// control plane's minimum.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Prefix for the bearer-authenticated REST API.
+pub const API_PREFIX: &str = "/api";
+
 /// Default seconds between SIGTERM and SIGKILL when a job is stopped — the
 /// window a workload has to flush state before it is force-killed. Overridable
 /// per job ([`crate::Job::term_grace_secs`]).

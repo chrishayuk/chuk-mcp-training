@@ -14,7 +14,7 @@ import subprocess
 import urllib.request
 
 base = CP_URL.rstrip("/")
-agent_path = "/tmp/chuk-train-agent"
+agent_path = "/tmp/chuk-compute-worker"
 
 # 1. Download the agent binary the control plane serves (public, no auth).
 urllib.request.urlretrieve(base + "/agent/linux-x86_64", agent_path)

@@ -19,9 +19,9 @@ const API_BASE: &str = "https://console.vast.ai/api/v0";
 /// Boot script the rented instance runs: fetch the static agent and join.
 /// The real binary URL is filled from an env/release in E2 wiring.
 const ONSTART_TEMPLATE: &str = "\
-curl -fsSL \"$CHUK_AGENT_URL\" -o /usr/local/bin/chuk-train-agent && \
-chmod +x /usr/local/bin/chuk-train-agent && \
-chuk-train-agent --url '{ws_url}' --token '{join_token}' \
+curl -fsSL \"$CHUK_AGENT_URL\" -o /usr/local/bin/chuk-compute-worker && \
+chmod +x /usr/local/bin/chuk-compute-worker && \
+chuk-compute-worker --url '{ws_url}' --token '{join_token}' \
 --worker-id '{worker_id}' --lease-min {lease_min} --drain-window-min {drain_window_min}";
 
 pub struct VastProvider {

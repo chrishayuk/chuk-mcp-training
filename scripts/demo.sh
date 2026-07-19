@@ -25,7 +25,7 @@ set -a; [ -f "$REPO/.env" ] && . "$REPO/.env"; set +a
 export CHUK_TRAIN_STORE="sqlite:$SCRATCH/demo.db"
 export CHUK_TRAIN_ARTIFACTS="file:$SCRATCH/artifacts"
 export CHUK_TRAIN_PROVIDERS="mock"
-export CHUK_TRAIN_AGENT_BIN="$REPO/target/debug/chuk-train-agent"
+export CHUK_TRAIN_AGENT_BIN="$REPO/target/debug/chuk-compute-worker"
 export CHUK_TRAIN_AGENT_WS_URL="ws://127.0.0.1:8700/ws/agent"
 export CHUK_TRAIN_PUBLIC_URL="http://127.0.0.1:8700"
 export CHUK_TRAIN_HOST="127.0.0.1"
@@ -40,7 +40,7 @@ BASE="http://127.0.0.1:8700"
 TOK="$CHUK_TRAIN_API_TOKEN"   # used only for the seed's own /api calls below
 
 echo "› building control plane + agent (debug)…"
-cargo build -q -p chuk-train-cp -p chuk-train-agent
+cargo build -q -p chuk-train-cp -p chuk-compute-worker
 rm -f "$SCRATCH"/demo.db*
 
 echo "› starting control plane…"
@@ -49,7 +49,7 @@ echo "› starting control plane…"
 # fully isolated — only the exported vars above configure it.
 ( cd "$SCRATCH" && exec "$REPO/target/debug/chuk-train-cp" ) >"$SCRATCH/cp.log" 2>&1 &
 CP_PID=$!
-cleanup(){ echo; echo "› stopping demo…"; kill "$CP_PID" 2>/dev/null || true; pkill -f 'target/debug/chuk-train-agent' 2>/dev/null || true; }
+cleanup(){ echo; echo "› stopping demo…"; kill "$CP_PID" 2>/dev/null || true; pkill -f 'target/debug/chuk-compute-worker' 2>/dev/null || true; }
 trap cleanup INT TERM EXIT
 
 for _ in $(seq 1 60); do curl -fsS "$BASE/healthz" >/dev/null 2>&1 && break; sleep 0.5; done

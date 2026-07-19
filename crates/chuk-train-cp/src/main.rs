@@ -1,7 +1,7 @@
 //! chuk-train-cp — the chuk-mcp-training control plane daemon (M0).
 //!
 //! Surfaces:
-//!   * `/ws/agent`  — outbound-dial websocket for chuk-train-agent workers
+//!   * `/ws/agent`  — outbound-dial websocket for chuk-compute-worker workers
 //!   * `/api/*`     — bearer-authenticated REST for the MCP server + dashboard
 //!   * `/`          — dashboard stub
 //!   * `/healthz`   — unauthenticated liveness
@@ -30,7 +30,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chuk_train_proto::{AGENT_DOWNLOAD_PATH, AGENT_WS_PATH, API_PREFIX, HEALTH_PATH};
+use chuk_compute_wire::API_PREFIX;
+use chuk_train_proto::{AGENT_DOWNLOAD_PATH, AGENT_WS_PATH, HEALTH_PATH};
 use tracing::{info, warn};
 
 use crate::archive::Archiver;

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # The test suite includes the lexical guards (no domain vocabulary in the
+      # wire + worker crates). Note: the house style is hand-formatted by
+      # convention (no rustfmt.toml), so `cargo fmt --check` is intentionally
+      # not gated here.
+      - name: Test
+        run: cargo test --workspace

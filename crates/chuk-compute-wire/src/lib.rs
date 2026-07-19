@@ -21,6 +21,7 @@
 //! The daemon that speaks this protocol is a **worker**, never an "agent" — that
 //! word is reserved for the agentic workloads that run *on* the fabric.
 
+mod blob;
 mod capability;
 mod constants;
 mod ids;
@@ -28,10 +29,11 @@ mod job;
 mod message;
 mod telemetry;
 
+pub use blob::{BlobMethod, BlobUrlRequest, BlobUrlResponse};
 pub use capability::{Accelerator, Capabilities, GpuInfo, WorkerClass};
 pub use constants::{
-    DEFAULT_TELEMETRY_INTERVAL_SECS, DEFAULT_TERM_GRACE_SECS, PROTOCOL_VERSION, SANDBOX_PLACEHOLDER,
-    SYS_METRIC_PREFIX,
+    API_PREFIX, DEFAULT_TELEMETRY_INTERVAL_SECS, DEFAULT_TERM_GRACE_SECS, PROTOCOL_VERSION,
+    SANDBOX_PLACEHOLDER, SYS_METRIC_PREFIX,
 };
 pub use ids::{ArtifactClass, CampaignId, JobId, Template, WorkerId};
 pub use job::{

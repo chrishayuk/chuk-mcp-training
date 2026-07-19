@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::{Provider, ProvisionContext};
 
 pub const NAME: &str = "mock";
-const AGENT_BIN_NAME: &str = "chuk-train-agent";
+const AGENT_BIN_NAME: &str = "chuk-compute-worker";
 /// Fake catalogue the mock advertises.
 const MOCK_OFFERS: [(&str, f64, u64); 2] = [("mock-t4", 0.10, 16), ("mock-a6000", 0.40, 48)];
 

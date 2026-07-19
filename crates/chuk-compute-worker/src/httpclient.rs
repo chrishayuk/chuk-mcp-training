@@ -8,7 +8,7 @@
 //! plane and the agent attaches its grant token.
 
 use anyhow::{Context, Result};
-use chuk_train_proto::{BlobMethod, BlobUrlRequest, BlobUrlResponse, API_PREFIX};
+use chuk_compute_wire::{BlobMethod, BlobUrlRequest, BlobUrlResponse, API_PREFIX};
 
 const BEARER_PREFIX: &str = "Bearer ";
 

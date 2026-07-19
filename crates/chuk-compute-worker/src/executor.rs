@@ -9,13 +9,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chuk_compute_wire::{Job, JobId, KillReason, UploadPolicy, WorkerToCp};
-// Reused, domain-free: the cadence at which we rescan for new outputs.
-use chuk_train_proto::{CHECKPOINT_SCAN_INTERVAL as OUTPUT_SCAN_INTERVAL, EXIT_CODE_AGENT_ERROR};
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::constants::{EXIT_CODE_AGENT_ERROR, OUTPUT_SCAN_INTERVAL};
 use crate::httpclient::HttpClient;
 use crate::inputs;
 use crate::metrics::MetricTail;

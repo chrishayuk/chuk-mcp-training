@@ -1,8 +1,8 @@
-//! chuk-train-agent — a generic compute worker (chuk-compute-spec §7).
+//! chuk-compute-worker — a generic compute worker (chuk-compute-spec §7).
 //!
 //! Runs identically on Colab, a Vast container, or any Linux/macOS box:
 //!
-//!     chuk-train-agent --url wss://cp.example.com/ws/agent --token <JOIN_TOKEN>
+//!     chuk-compute-worker --url wss://cp.example.com/ws/agent --token <JOIN_TOKEN>
 //!
 //! Dials OUT to the control plane, advertises its capabilities, heartbeats,
 //! executes assigned jobs (stage inputs, run one command, stream logs/metrics,
@@ -15,6 +15,7 @@
 //! drops mid-job the child is killed and the control plane requeues.
 
 mod capabilities;
+mod constants;
 mod executor;
 mod httpclient;
 mod inputs;
@@ -28,9 +29,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chuk_compute_wire::{CpToWorker, KillReason, Resume, WorkerId, WorkerToCp, PROTOCOL_VERSION};
-use chuk_train_proto::{
-    DEFAULT_DRAIN_WINDOW_MIN, HEARTBEAT_INTERVAL, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
-};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -38,6 +36,9 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
+use crate::constants::{
+    DEFAULT_DRAIN_WINDOW_MIN, HEARTBEAT_INTERVAL, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
+};
 use crate::executor::RunningJob;
 use crate::seq::Seq;
 
@@ -47,7 +48,7 @@ const LABEL_SEPARATOR: char = ',';
 const SECONDS_PER_MINUTE: f64 = 60.0;
 
 #[derive(Parser, Debug)]
-#[command(name = "chuk-train-agent", about)]
+#[command(name = "chuk-compute-worker", about)]
 struct Args {
     /// Control plane websocket URL, e.g. wss://cp.example.com/ws/agent
     #[arg(long)]

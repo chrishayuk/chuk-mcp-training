@@ -13,114 +13,6 @@ use crate::lease::Lease;
 use crate::manifest::{CheckpointMeta, CodeUnitManifest};
 
 // ---------------------------------------------------------------------------
-// Agent websocket (spec §7): worker → control plane
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentToCp {
-    /// First message on every connection; the join token is exchanged for a
-    /// worker identity.
-    Register {
-        token: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        worker_id: Option<WorkerId>,
-        #[serde(default)]
-        labels: Vec<String>,
-        hardware: Hardware,
-    },
-    Heartbeat,
-    Log {
-        run_id: RunId,
-        line: String,
-    },
-    /// One parsed metrics record (spec §5.1: JSONL to `$CHUK_METRICS`).
-    Metric {
-        run_id: RunId,
-        step: u64,
-        values: BTreeMap<String, f64>,
-    },
-    /// A checkpoint the agent has finished uploading to the artifact store.
-    /// The bytes went up out-of-band (REST, scoped grant); this records the
-    /// lineage sidecar and the weights hash for provenance.
-    Checkpoint {
-        run_id: RunId,
-        step: u64,
-        model_hash: String,
-        meta: CheckpointMeta,
-    },
-    JobStarted {
-        run_id: RunId,
-    },
-    JobExited {
-        run_id: RunId,
-        code: i64,
-    },
-    /// The worker has drained (flushed logs/metrics, uploaded, stopped work) in
-    /// response to a `Drain` or its own lease clock (spec §7).
-    Drained,
-}
-
-// ---------------------------------------------------------------------------
-// Agent websocket (spec §7): control plane → worker
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum CpToAgent {
-    Registered {
-        worker_id: WorkerId,
-    },
-    Rejected {
-        reason: String,
-    },
-    Assign {
-        job: JobAssignment,
-    },
-    Cancel {
-        run_id: RunId,
-    },
-    /// Wind down before the lease wall: stop taking new work, checkpoint +
-    /// upload the current job, then report `Drained` (spec §7). `deadline` is
-    /// the T-0 wall as a unix timestamp; the control plane destroys at T-0
-    /// regardless of whether the agent answered.
-    Drain {
-        deadline: UnixSeconds,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct JobAssignment {
-    pub run_id: RunId,
-    pub spec: RunSpec,
-    /// Present when this is a resumed train slice: where to pick up from.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume: Option<ResumeInfo>,
-    /// Present for train runs: the scoped capability to fetch inputs and
-    /// upload checkpoints for this run (spec §7 `credentials(scoped)`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant: Option<UploadGrant>,
-}
-
-/// Where a resumed slice continues from (spec §5.3 `resumed(from_step)`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResumeInfo {
-    pub from_step: u64,
-    /// Store-relative path to the checkpoint directory to resume from,
-    /// e.g. `runs/<run_id>/ckpt/step_<n>`. The agent fetches it via the grant.
-    pub checkpoint_path: String,
-}
-
-/// A short-lived, run-scoped capability (spec §12: workers never hold provider
-/// or admin credentials — only a token bound to one run's read/write needs).
-/// The agent derives the REST base from its own control-plane URL, so the
-/// grant carries only the bearer token.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UploadGrant {
-    pub token: String,
-}
-
-// ---------------------------------------------------------------------------
 // REST API payloads
 // ---------------------------------------------------------------------------
 
@@ -352,46 +244,9 @@ pub struct ColabCell {
     pub cell: String,
 }
 
-/// Which direction a worker wants to transfer a blob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BlobMethod {
-    Put,
-    Get,
-}
-
-/// A worker asking the control plane where to transfer a blob (spec §12).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BlobUrlRequest {
-    pub key: String,
-    pub method: BlobMethod,
-}
-
-/// Where to transfer it. With an S3/R2 backend `url` is a presigned URL the
-/// worker hits directly (bytes bypass the control plane); with the filesystem
-/// backend it points back at the control plane's own upload/fetch endpoint and
-/// `requires_grant_header` is set so the worker attaches its grant token.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BlobUrlResponse {
-    pub url: String,
-    #[serde(default)]
-    pub requires_grant_header: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn wire_messages_round_trip_with_snake_case_tags() {
-        let msg = AgentToCp::JobExited {
-            run_id: RunId::from("abc123"),
-            code: 0,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"job_exited""#), "{json}");
-        assert_eq!(serde_json::from_str::<AgentToCp>(&json).unwrap(), msg);
-    }
 
     #[test]
     fn shell_spec_is_internally_tagged_and_defaults_timeout() {
@@ -426,23 +281,5 @@ mod tests {
         assert_eq!(train.checkpoint.every_steps, 500); // default applied
                                                        // kind is injected back on serialize (internal tagging).
         assert_eq!(serde_json::to_value(&spec).unwrap()["kind"], "train");
-    }
-
-    #[test]
-    fn assign_message_shape() {
-        let msg = CpToAgent::Assign {
-            job: JobAssignment {
-                run_id: RunId::from("r1"),
-                spec: RunSpec::Shell(crate::domain::ShellSpec {
-                    command: "echo hi".into(),
-                    timeout_s: 5,
-                }),
-                resume: None,
-                grant: None,
-            },
-        };
-        let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "assign");
-        assert_eq!(json["job"]["spec"]["kind"], "shell");
     }
 }

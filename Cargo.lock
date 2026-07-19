@@ -654,12 +654,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "chuk-train-agent"
+name = "chuk-compute-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chuk-compute-wire",
- "chuk-train-proto",
  "clap",
  "futures-util",
  "hex",

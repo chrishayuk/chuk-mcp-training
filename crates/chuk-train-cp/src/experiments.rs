@@ -16,8 +16,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use chuk_compute_wire::API_PREFIX;
 use chuk_train_proto::{
-    env, CheckpointMeta, RunId, RunSpec, RunState, TrainSpec, API_PREFIX, CHECKPOINT_MODEL_FILE,
+    env, CheckpointMeta, RunId, RunSpec, RunState, TrainSpec, CHECKPOINT_MODEL_FILE,
     DEFAULT_EXPERIMENTS_EXPERIMENT, DEFAULT_EXPERIMENTS_EXPERIMENT_TITLE,
     DEFAULT_EXPERIMENTS_PROGRAMME, DEFAULT_EXPERIMENTS_PROGRAMME_TITLE,
 };

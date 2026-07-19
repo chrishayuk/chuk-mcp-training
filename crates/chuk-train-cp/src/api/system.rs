@@ -15,7 +15,7 @@ pub async fn healthz() -> Json<serde_json::Value> {
 }
 
 /// Default path the agent binary lives at inside the deployed image.
-const DEFAULT_AGENT_BIN: &str = "/app/chuk-train-agent";
+const DEFAULT_AGENT_BIN: &str = "/app/chuk-compute-worker";
 
 /// Serve the worker agent binary (unauthenticated: it is public code, spec
 /// §12). The Colab/Vast bootstrap downloads it from here, so a worker needs
@@ -32,7 +32,7 @@ pub async fn serve_agent(State(state): State<Arc<AppState>>) -> Response {
                 (header::CONTENT_TYPE, "application/octet-stream"),
                 (
                     header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"chuk-train-agent\"",
+                    "attachment; filename=\"chuk-compute-worker\"",
                 ),
             ],
             bytes,
