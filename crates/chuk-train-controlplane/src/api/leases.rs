@@ -130,29 +130,28 @@ pub async fn colab_cell(
     let labels = params
         .labels
         .unwrap_or_else(|| DEFAULT_COLAB_LABELS.to_owned());
-    // Optional lease line: passing lease_min makes the worker self-drain at
+    // Optional lease flags: passing lease_min makes the worker self-drain at
     // T-drain (belt) matching the control plane's window.
-    let lease_args = match params.lease_min {
+    let lease_flags = match params.lease_min {
         Some(m) => format!(
-            "\nargs += [\"--lease-min\", \"{m}\", \"--drain-window-min\", \"{}\"]",
+            " --lease-min {m} --drain-window-min {}",
             state.config.drain_window_min
         ),
         None => String::new(),
     };
+    // Bootstrap through install.sh (uname → target triple → download + verify →
+    // exec), so the cell never hardcodes a per-target agent path.
     let cell = format!(
         r#"# chuk-train · Colab worker — paste into ONE cell (Runtime → T4 GPU), then run.
 CP_URL = "{url}"
 JOIN_TOKEN = "{token}"
 LABELS = "{labels}"
 
-import os, stat, subprocess, urllib.request
-base = CP_URL.rstrip("/"); agent = "/tmp/chuk-compute-worker"
-urllib.request.urlretrieve(base + "/agent/linux-x86_64", agent)
-os.chmod(agent, os.stat(agent).st_mode | stat.S_IEXEC)
-ws = base.replace("https://", "wss://").replace("http://", "ws://") + "/ws/agent"
-args = [agent, "--url", ws, "--token", JOIN_TOKEN, "--labels", LABELS]{lease_args}
-print("[chuk-train] joining", ws)
-subprocess.run(args, check=False)
+import subprocess
+cmd = ("curl -fsSL " + CP_URL + "/install.sh | sh -s -- "
+       "--cp " + CP_URL + " --token " + JOIN_TOKEN + " --labels " + LABELS + "{lease_flags}")
+print("[chuk-train] bootstrapping worker via install.sh …")
+subprocess.run(cmd, shell=True, check=False)
 "#,
         url = state.config.public_url,
         token = state.config.join_token,
