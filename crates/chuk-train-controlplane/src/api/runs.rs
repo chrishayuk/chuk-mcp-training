@@ -158,6 +158,51 @@ pub async fn submit_run(
     }
 }
 
+/// `POST /runs/{id}/stop` — cancel a run. Signals the worker (Cancel →
+/// Cancelled); a queued run is cancelled immediately. Returns the run's current
+/// record (a running run may still show `running` until the worker confirms).
+pub async fn stop_run(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Path(run_id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Write) {
+        return resp;
+    }
+    let run_id = RunId(run_id);
+    match state.hub.stop_run(&run_id).await {
+        Ok(()) => current_run(&state, &run_id).await,
+        // Bad state (already terminal) or unknown id — a client error.
+        Err(error) => bad_request(&error.to_string()),
+    }
+}
+
+/// `POST /runs/{id}/resume` — re-queue a terminal run; a train run resumes from
+/// its latest checkpoint on reassignment.
+pub async fn resume_run(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Path(run_id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Write) {
+        return resp;
+    }
+    let run_id = RunId(run_id);
+    match state.hub.resume_run(&run_id).await {
+        Ok(()) => current_run(&state, &run_id).await,
+        Err(error) => bad_request(&error.to_string()),
+    }
+}
+
+/// Fetch and return a run's current record (shared by stop/resume responses).
+async fn current_run(state: &Arc<AppState>, run_id: &RunId) -> Response {
+    match state.hub.store.run(run_id).await {
+        Ok(Some(run)) => Json::<RunRecord>(run).into_response(),
+        Ok(None) => not_found(),
+        Err(error) => internal(error),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct MetricParams {
     keys: Option<String>,

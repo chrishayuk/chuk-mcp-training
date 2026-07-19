@@ -157,6 +157,9 @@ pub const EXIT_CODE_TIMEOUT: i64 = -9;
 /// Synthetic exit code recorded when the agent failed to spawn or supervise
 /// the process at all.
 pub const EXIT_CODE_AGENT_ERROR: i64 = -1;
+/// Synthetic exit code recorded for an operator-cancelled run (mirrors SIGTERM,
+/// the first signal the worker sends on `Cancel`).
+pub const EXIT_CODE_CANCELLED: i64 = -15;
 
 /// Environment variable names shared across components.
 pub mod env {

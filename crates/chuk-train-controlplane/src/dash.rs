@@ -101,6 +101,8 @@ td .name{font-weight:600} .empty{color:var(--muted);padding:.9rem;font-size:.86r
 .chip.hot{color:#e6b8a8;border-color:rgba(236,131,90,.4)} .chip.final{color:#a9d3f5;border-color:rgba(57,135,229,.4)}
 .chip.drive{color:#a7e0c2;border-color:rgba(34,180,90,.4)} .pin{color:var(--warning)}
 .btn{background:transparent;color:var(--critical);border:1px solid var(--critical);border-radius:6px;padding:.18rem .5rem;font-size:.76rem;cursor:pointer}
+.btn.go{color:var(--accent);border-color:var(--accent)}
+.runacts{display:flex;gap:.5rem;align-items:flex-start}
 .btn:hover{background:var(--critical);color:#fff}
 .runhead{display:flex;align-items:flex-start;gap:1rem;flex-wrap:wrap;margin-bottom:1.1rem}
 .back{color:var(--muted);border:1px solid var(--ring);border-radius:8px;padding:.3rem .6rem;font-size:.8rem;cursor:pointer;background:transparent}
@@ -304,6 +306,7 @@ function renderRunShell(run){
           <span>· started ${ago(nows()-run.created_at)} ago</span></div>
       </div>
       <div class="links">${links}</div>
+      <div class="runacts">${runActions(run)}</div>
     </div>
     <div class="telem" id="telem"></div>`;
   const configCard=`<div class="card"><div class="hd"><h3>Config</h3></div>${configBody(run)}</div>`;
@@ -465,6 +468,24 @@ async function teardown(id){
   if(!confirm(`Tear down ${id}? Drains, then destroys the instance (provider-verified).`))return;
   try{await api("/api/workers/"+encodeURIComponent(id)+"/teardown",{method:"POST",body:JSON.stringify({force:false})});route();}
   catch(e){alert("teardown failed: "+e.message);}
+}
+// Stop is offered while a run is live; resume once it has reached a terminal
+// state. The API enforces the write role either way.
+function runActions(run){
+  const term=["completed","failed","cancelled"].includes(run.state);
+  return term
+    ? `<button class="btn go" onclick="resumeRun('${esc(run.id)}')">↻ resume</button>`
+    : `<button class="btn" onclick="stopRun('${esc(run.id)}')">■ stop</button>`;
+}
+async function stopRun(id){
+  if(!confirm(`Stop ${id}? Signals its worker to cancel the run (it checkpoints, then stops).`))return;
+  try{await api("/api/runs/"+encodeURIComponent(id)+"/stop",{method:"POST"});route();}
+  catch(e){alert("stop failed: "+e.message);}
+}
+async function resumeRun(id){
+  if(!confirm(`Resume ${id}? Re-queues it; a train run resumes from its latest checkpoint.`))return;
+  try{await api("/api/runs/"+encodeURIComponent(id)+"/resume",{method:"POST"});route();}
+  catch(e){alert("resume failed: "+e.message);}
 }
 
 /* ---------------- access (users + api keys) ---------------- */

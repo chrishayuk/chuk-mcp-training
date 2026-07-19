@@ -31,6 +31,8 @@ from .constants import (
     api_run_events,
     api_run_logs,
     api_run_metrics,
+    api_run_resume,
+    api_run_stop,
     api_worker_extend,
     api_worker_lease,
     api_worker_teardown,
@@ -118,6 +120,22 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
     async def run_status(run_id: str) -> dict[str, Any]:
         """Full record for one run: state, spec, worker, exit code, timestamps."""
         return await _envelope(cp.get_model(api_run(run_id), RunRecord))
+
+    @mcp.tool
+    async def stop_run(run_id: str) -> dict[str, Any]:
+        """Cancel a run. Signals its worker to stop the process
+        (SIGTERM → grace → SIGKILL); the run lands in `cancelled`. A queued run
+        is cancelled immediately. Returns the run's current record — a running
+        run may still show `running` until the worker confirms the kill.
+        Write-scoped."""
+        return await _envelope(cp.post_params(api_run_stop(run_id)))
+
+    @mcp.tool
+    async def resume_run(run_id: str) -> dict[str, Any]:
+        """Re-queue a terminal run (cancelled/failed/completed) to run again. A
+        train run resumes from its latest uploaded checkpoint when reassigned; a
+        shell run restarts. Write-scoped."""
+        return await _envelope(cp.post_params(api_run_resume(run_id)))
 
     @mcp.tool
     async def tail_logs(run_id: str, lines: int = DEFAULT_LOG_TAIL_LINES) -> dict[str, Any]:

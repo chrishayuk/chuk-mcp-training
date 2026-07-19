@@ -39,6 +39,14 @@ def api_run(run_id: str) -> str:
     return f"{API_RUNS}/{run_id}"
 
 
+def api_run_stop(run_id: str) -> str:
+    return f"{API_RUNS}/{run_id}/stop"
+
+
+def api_run_resume(run_id: str) -> str:
+    return f"{API_RUNS}/{run_id}/resume"
+
+
 def api_run_logs(run_id: str) -> str:
     return f"{API_RUNS}/{run_id}/logs"
 

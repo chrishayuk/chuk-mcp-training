@@ -20,7 +20,7 @@ use chuk_compute_wire as wire;
 use chuk_train_proto::{
     keys, CheckpointMeta, EventKind, Hardware, LeaseState, RunId, RunSpec, RunState, TrainSpec,
     WorkerId, CHECKPOINT_DIR_PREFIX, CHECKPOINT_META_FILE, CHECKPOINT_MODEL_FILE,
-    EXIT_CODE_AGENT_ERROR,
+    EXIT_CODE_AGENT_ERROR, EXIT_CODE_CANCELLED,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -367,13 +367,8 @@ impl Hub {
             }
             wire::WorkerToCp::JobKilled { job_id, reason, .. } => {
                 info!(run = %run_id(&job_id), ?reason, "job killed");
-                self.finish_run(
-                    worker_id,
-                    &run_id(&job_id),
-                    RunState::Failed,
-                    EXIT_CODE_AGENT_ERROR,
-                )
-                .await?;
+                let (state, code) = kill_reason_state(&reason);
+                self.finish_run(worker_id, &run_id(&job_id), state, code).await?;
             }
             wire::WorkerToCp::ServiceReady { job_id, ports, .. } => {
                 // Services land at M5; for now just note readiness.
@@ -515,6 +510,100 @@ impl Hub {
         self.pump().await?;
         Ok(run_id)
     }
+
+    /// Cancel a run. A running/assigned run with a still-connected worker is
+    /// signalled (`Cancel` → the worker stops the process and reports
+    /// `JobKilled{Cancel}`, which lands the run in `Cancelled`); a queued run, or
+    /// one whose worker link is already gone, is finalised here and now. A
+    /// terminal run is rejected.
+    pub async fn stop_run(&self, run_id: &RunId) -> Result<()> {
+        let run = self
+            .store
+            .run(run_id)
+            .await?
+            .with_context(|| format!("no such run: {}", run_id.0))?;
+        if run.summary.state.is_terminal() {
+            anyhow::bail!(
+                "run {} is already {} — nothing to cancel",
+                run_id.0,
+                run.summary.state.as_str()
+            );
+        }
+        // Prefer signalling the live worker so it can checkpoint/clean up; the
+        // `JobKilled{Cancel}` it reports is what finalises the run.
+        if let Some(worker_id) = run.summary.worker_id.clone() {
+            let job_id = wire::JobId::from(run_id.0.clone());
+            if self.send_to(&worker_id, wire::CpToWorker::Cancel { job_id }).await {
+                info!(run = %run_id.0, worker = %worker_id, "cancel signalled to worker");
+                return Ok(());
+            }
+        }
+        // Queued (no worker), or the worker vanished: finalise directly.
+        self.cancel_now(run_id, run.summary.worker_id.as_ref()).await
+    }
+
+    /// Finalise a run to `Cancelled` without a worker round-trip.
+    async fn cancel_now(&self, run_id: &RunId, worker_id: Option<&WorkerId>) -> Result<()> {
+        self.grants.revoke_run(run_id);
+        self.store
+            .transition(
+                run_id,
+                RunState::Cancelled,
+                None,
+                Some(EXIT_CODE_CANCELLED),
+                serde_json::json!({ "reason": "operator_cancel" }),
+            )
+            .await?;
+        self.mirror_state(run_id, RunState::Cancelled);
+        self.resume_state
+            .lock()
+            .expect("resume_state lock")
+            .remove(run_id);
+        if let Some(worker_id) = worker_id {
+            self.store.set_worker_run(worker_id, None).await?;
+        }
+        self.pump().await
+    }
+
+    /// Re-queue a terminal run so it runs again. On reassignment a train run
+    /// resumes from its latest uploaded checkpoint (a shell run restarts); a
+    /// non-terminal run is rejected.
+    pub async fn resume_run(&self, run_id: &RunId) -> Result<()> {
+        let run = self
+            .store
+            .run(run_id)
+            .await?
+            .with_context(|| format!("no such run: {}", run_id.0))?;
+        if !run.summary.state.is_terminal() {
+            anyhow::bail!(
+                "run {} is {} — only a terminal run can be resumed",
+                run_id.0,
+                run.summary.state.as_str()
+            );
+        }
+        self.store
+            .transition(
+                run_id,
+                RunState::Queued,
+                None,
+                None,
+                serde_json::json!({ "reason": "operator_resume" }),
+            )
+            .await?;
+        info!(run = %run_id.0, "run re-queued for resume");
+        self.pump().await
+    }
+}
+
+/// Map a worker's kill reason to the run's terminal state + recorded exit code.
+/// An explicit `Cancel` lands in `Cancelled`; every other reason is a failure
+/// (drain/wall preemption of a resumable run is handled by the requeue paths,
+/// not here).
+fn kill_reason_state(reason: &wire::KillReason) -> (RunState, i64) {
+    match reason {
+        wire::KillReason::Cancel => (RunState::Cancelled, EXIT_CODE_CANCELLED),
+        _ => (RunState::Failed, EXIT_CODE_AGENT_ERROR),
+    }
 }
 
 /// A [`wire::JobId`] is a run's id verbatim on the fabric.
@@ -550,6 +639,9 @@ fn step_from_uri(uri: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::FsArtifactStore;
+    use crate::store::SqliteStore;
+    use chuk_train_proto::ShellSpec;
 
     #[test]
     fn step_parses_from_the_trailing_segment() {
@@ -562,5 +654,103 @@ mod tests {
     #[test]
     fn job_id_maps_to_run_id_verbatim() {
         assert_eq!(run_id(&wire::JobId::from("RUN-9")), RunId::from("RUN-9"));
+    }
+
+    #[test]
+    fn cancel_lands_cancelled_every_other_reason_fails() {
+        assert_eq!(
+            kill_reason_state(&wire::KillReason::Cancel),
+            (RunState::Cancelled, EXIT_CODE_CANCELLED)
+        );
+        for reason in [
+            wire::KillReason::Wall,
+            wire::KillReason::MaxRuntime,
+            wire::KillReason::Drain,
+            wire::KillReason::OomGuard,
+        ] {
+            assert_eq!(
+                kill_reason_state(&reason),
+                (RunState::Failed, EXIT_CODE_AGENT_ERROR)
+            );
+        }
+    }
+
+    async fn test_hub() -> Arc<Hub> {
+        let store = Arc::new(SqliteStore::open(":memory:").await.expect("store"));
+        // Shell runs never touch the artifact store; temp_dir is never written.
+        let artifacts = Arc::new(FsArtifactStore::new(std::env::temp_dir()));
+        Hub::new(store, artifacts, None)
+    }
+
+    fn shell_run() -> RunSpec {
+        RunSpec::Shell(ShellSpec { command: "sleep 1".into(), timeout_s: 60 })
+    }
+
+    #[tokio::test]
+    async fn stop_queued_run_cancels_immediately() {
+        let hub = test_hub().await;
+        let run = hub.submit("q", &shell_run(), None).await.unwrap();
+        // No worker connected — the run is queued; stop finalises it here.
+        hub.stop_run(&run).await.unwrap();
+        let rec = hub.store.run(&run).await.unwrap().unwrap();
+        assert_eq!(rec.summary.state, RunState::Cancelled);
+        assert_eq!(rec.summary.exit_code, Some(EXIT_CODE_CANCELLED));
+    }
+
+    #[tokio::test]
+    async fn stop_rejects_an_already_terminal_run() {
+        let hub = test_hub().await;
+        let run = hub.submit("q", &shell_run(), None).await.unwrap();
+        hub.stop_run(&run).await.unwrap();
+        assert!(hub.stop_run(&run).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resume_requeues_a_terminal_run_but_not_a_live_one() {
+        let hub = test_hub().await;
+        let run = hub.submit("q", &shell_run(), None).await.unwrap();
+        hub.stop_run(&run).await.unwrap(); // → Cancelled
+        hub.resume_run(&run).await.unwrap();
+        let rec = hub.store.run(&run).await.unwrap().unwrap();
+        assert_eq!(rec.summary.state, RunState::Queued);
+        // A queued (non-terminal) run cannot be resumed.
+        assert!(hub.resume_run(&run).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_running_run_signals_worker_then_jobkilled_finalises() {
+        let hub = test_hub().await;
+        let run = hub.submit("r", &shell_run(), None).await.unwrap();
+        // Attach a worker; the pump assigns the queued run to it.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = WorkerId("w-test".into());
+        hub.attach(&worker, tx, &[], &Hardware::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.expect("assign"),
+            wire::CpToWorker::AssignJob { .. }
+        ));
+        // Stop signals the worker (run assigned, link live) — not finalised yet.
+        hub.stop_run(&run).await.unwrap();
+        match rx.recv().await.expect("cancel") {
+            wire::CpToWorker::Cancel { job_id } => assert_eq!(job_id.0, run.0),
+            other => panic!("expected Cancel, got {other:?}"),
+        }
+        let mid = hub.store.run(&run).await.unwrap().unwrap();
+        assert!(!mid.summary.state.is_terminal(), "state={:?}", mid.summary.state);
+        // The worker confirms the kill; the run lands in Cancelled.
+        hub.on_message(
+            &worker,
+            wire::WorkerToCp::JobKilled {
+                seq: 1,
+                job_id: wire::JobId::from(run.0.clone()),
+                reason: wire::KillReason::Cancel,
+            },
+        )
+        .await
+        .unwrap();
+        let done = hub.store.run(&run).await.unwrap().unwrap();
+        assert_eq!(done.summary.state, RunState::Cancelled);
     }
 }
