@@ -61,11 +61,18 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-zigbuild + zig
+      # cargo-zigbuild needs the `zig` binary on PATH; the `ziglang` pip package
+      # only exposes `python -m ziglang` (a `python-zig` shim), which it can't
+      # find. Use the dedicated setup action so a real `zig` is on PATH.
+      - name: Install zig
         if: matrix.zig
-        run: |
-          pipx install ziglang || pip install ziglang
-          cargo install cargo-zigbuild --locked
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        run: cargo install cargo-zigbuild --locked
 
       - name: Build worker
         run: |
