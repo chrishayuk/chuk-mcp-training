@@ -11,7 +11,7 @@ use chuk_train_proto::{
 };
 use serde::Deserialize;
 
-use super::{bad_request, forbidden, internal, not_found, now, require_role};
+use super::{bad_request, forbidden, internal, not_found, now, require_role, service_unavailable};
 use crate::apikey::{self, AuthContext};
 use crate::AppState;
 
@@ -246,11 +246,88 @@ pub async fn revoke_worker_token(
 }
 
 /// The caller's own role/identity — lets the dashboard show admin-only controls.
-pub async fn whoami(axum::Extension(ctx): axum::Extension<AuthContext>) -> Response {
+pub async fn whoami(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+) -> Response {
+    let experiments_key_set = state
+        .hub
+        .store
+        .user_experiments_key(&ctx.owner_email)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
     Json(serde_json::json!({
         "role": ctx.role.as_str(),
         "team_id": ctx.team_id,
         "subject": ctx.subject,
+        "experiments_key_set": experiments_key_set,
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SetExperimentsKeyRequest {
+    api_key: String,
+}
+
+/// Link the caller's own chuk-experiments-server API key (one they minted
+/// themselves on chuk-experiments-server's own Team screen) so their mirrored
+/// runs report under their own identity instead of the shared default. Stored
+/// encrypted; never echoed back after this call.
+pub async fn set_experiments_key(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Json(request): Json<SetExperimentsKeyRequest>,
+) -> Response {
+    let Some(encryption_key) = &state.key_encryption_key else {
+        return service_unavailable("CHUK_EXPERIMENTS_KEY_ENCRYPTION_KEY not configured");
+    };
+    if ctx.owner_email == apikey::MASTER_TOKEN_SENTINEL {
+        return bad_request(
+            "the shared master token has no per-user identity to link a key against — \
+             sign in or use a scoped API key",
+        );
+    }
+    let raw = request.api_key.trim();
+    if raw.is_empty() {
+        return bad_request("api_key required");
+    }
+    let encrypted = crate::crypto::encrypt(encryption_key, raw);
+    match state
+        .hub
+        .store
+        .set_user_experiments_key(&ctx.owner_email, Some(&encrypted))
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "experiments_key_set": true })).into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+/// Clear the caller's own linked chuk-experiments-server key; their mirrored
+/// runs fall back to the shared default.
+pub async fn clear_experiments_key(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+) -> Response {
+    if state.key_encryption_key.is_none() {
+        return service_unavailable("CHUK_EXPERIMENTS_KEY_ENCRYPTION_KEY not configured");
+    }
+    if ctx.owner_email == apikey::MASTER_TOKEN_SENTINEL {
+        return bad_request(
+            "the shared master token has no per-user identity to link a key against — \
+             sign in or use a scoped API key",
+        );
+    }
+    match state
+        .hub
+        .store
+        .set_user_experiments_key(&ctx.owner_email, None)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "experiments_key_set": false })).into_response(),
+        Err(error) => internal(error),
+    }
 }

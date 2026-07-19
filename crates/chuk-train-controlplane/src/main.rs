@@ -13,6 +13,7 @@ mod artifacts;
 mod auth;
 mod codeunit;
 mod config;
+mod crypto;
 mod dash;
 mod drive;
 mod experiments;
@@ -55,6 +56,10 @@ pub struct AppState {
     pub drive: Option<Arc<DriveClient>>,
     /// Archive/retention worker; `None` when the archive tier is off.
     pub archiver: Option<Arc<Archiver>>,
+    /// Decrypts/encrypts a user's own linked chuk-experiments-server key
+    /// (`api::access`'s `/me/experiments-key` routes). `None` — that feature
+    /// is off — unless `CHUK_EXPERIMENTS_KEY_ENCRYPTION_KEY` is set and valid.
+    pub key_encryption_key: Option<[u8; 32]>,
 }
 
 #[tokio::main]
@@ -173,6 +178,7 @@ async fn main() -> Result<()> {
         leases,
         drive,
         archiver,
+        key_encryption_key: crypto::key_from_env(),
     });
 
     // Bearer-authenticated surface: the MCP server and dashboard.
@@ -194,6 +200,7 @@ async fn main() -> Result<()> {
         .route("/provider_offers", get(api::provider_offers))
         .route("/provision", post(api::provision))
         .route("/colab_cell", get(api::colab_cell))
+        .route("/workers/{worker_id}/telemetry", get(api::worker_telemetry))
         .route("/workers/{worker_id}/lease", get(api::lease_status))
         .route("/workers/{worker_id}/extend", post(api::extend_lease))
         .route("/workers/{worker_id}/teardown", post(api::teardown))
@@ -205,6 +212,10 @@ async fn main() -> Result<()> {
             get(api::serve_checkpoint),
         )
         .route("/me", get(api::whoami))
+        .route(
+            "/me/experiments-key",
+            put(api::set_experiments_key).delete(api::clear_experiments_key),
+        )
         .route("/users", get(api::list_users).post(api::upsert_user))
         .route("/users/{email}", delete(api::remove_user))
         .route("/apikeys", get(api::list_api_keys).post(api::create_api_key))

@@ -63,6 +63,10 @@ pub struct Experiments {
     store: Arc<dyn Store>,
     /// The default experiment is ensured (created-or-exists) exactly once.
     ensured: AtomicBool,
+    /// Decrypts a user's linked personal chuk-experiments-server key
+    /// (`bearer_for`). `None` — the per-user-key feature is off — unless
+    /// `CHUK_EXPERIMENTS_KEY_ENCRYPTION_KEY` is set and valid.
+    key_encryption_key: Option<[u8; 32]>,
 }
 
 impl Experiments {
@@ -95,7 +99,30 @@ impl Experiments {
             public_url: public_url.trim().trim_end_matches('/').to_owned(),
             store,
             ensured: AtomicBool::new(false),
+            key_encryption_key: crate::crypto::key_from_env(),
         }))
+    }
+
+    /// Resolve which bearer token to use for this run's mirror calls: the
+    /// submitting user's own linked chuk-experiments-server key if they have
+    /// one (and it decrypts cleanly), else the shared default. Never fails —
+    /// any missing link in the chain (per-user-key feature off, no owner, no
+    /// linked key, bad ciphertext) falls back silently, same principle as the
+    /// rest of this module: the mirror never blocks or fails a run over this.
+    async fn bearer_for(&self, run_id: &RunId) -> String {
+        let Some(key_encryption_key) = &self.key_encryption_key else {
+            return self.key.clone();
+        };
+        let Ok(Some(run)) = self.store.run(run_id).await else {
+            return self.key.clone();
+        };
+        let Some(email) = run.summary.created_by else {
+            return self.key.clone();
+        };
+        let Ok(Some(encrypted)) = self.store.user_experiments_key(&email).await else {
+            return self.key.clone();
+        };
+        crate::crypto::decrypt(key_encryption_key, &encrypted).unwrap_or_else(|_| self.key.clone())
     }
 
     // ---- best-effort entrypoints (the hub spawns these) -------------------
@@ -293,6 +320,7 @@ impl Experiments {
 
     async fn try_create(&self, run_id: &RunId, train: &TrainSpec) -> Result<()> {
         self.ensure().await?;
+        let token = self.bearer_for(run_id).await;
         let config = json!({
             "entrypoint": train.entrypoint,
             "config_path": train.config,
@@ -304,7 +332,7 @@ impl Experiments {
         let resp = self
             .http
             .post(format!("{}/v1/experiments/{}/runs", self.base, self.experiment))
-            .bearer_auth(&self.key)
+            .bearer_auth(&token)
             .json(&json!({
                 "slug": run_id.0,
                 "config": config,
@@ -321,7 +349,10 @@ impl Experiments {
         }
         let created: CreatedRun = resp.json().await.context("parse created run")?;
         // Best-effort; the primary link is `slug` = our id even if this PATCH fails.
-        if let Err(e) = self.patch_run(&created.id, linkback_patch(run_id, train)).await {
+        if let Err(e) = self
+            .patch_run(&created.id, linkback_patch(run_id, train), &token)
+            .await
+        {
             warn!(run = %run_id.0, ext = %created.id, error = %e, "experiments: linkback patch failed");
         }
         self.store.set_experiments_run_id(run_id, &created.id).await?;
@@ -335,7 +366,8 @@ impl Experiments {
     /// we bail *without* recording the id, rather than committing to a bad ref
     /// that would make every later report warn.
     async fn try_attach(&self, run_id: &RunId, train: &TrainSpec, ext: &str) -> Result<()> {
-        self.patch_run(ext, linkback_patch(run_id, train)).await?;
+        let token = self.bearer_for(run_id).await;
+        self.patch_run(ext, linkback_patch(run_id, train), &token).await?;
         self.store.set_experiments_run_id(run_id, ext).await?;
         info!(run = %run_id.0, ext = %ext, "experiments: execution attached to existing run");
         Ok(())
@@ -359,7 +391,8 @@ impl Experiments {
         } else if state.is_terminal() {
             body["ended_at"] = json!(stamp);
         }
-        self.patch_run(&ext, body).await
+        let token = self.bearer_for(run_id).await;
+        self.patch_run(&ext, body, &token).await
     }
 
     async fn try_checkpoint(
@@ -381,10 +414,11 @@ impl Experiments {
             .clone()
             .or_else(|| meta.code.as_ref().map(|c| c.name.clone()))
             .unwrap_or_else(|| run_id.0.clone());
+        let token = self.bearer_for(run_id).await;
         let resp = self
             .http
             .post(format!("{}/v1/runs/{}/artifacts", self.base, ext))
-            .bearer_auth(&self.key)
+            .bearer_auth(&token)
             .json(&json!({
                 "kind": "checkpoint",
                 "uri": uri,
@@ -406,10 +440,11 @@ impl Experiments {
         let Some(ext) = self.store.experiments_run_id(run_id).await? else {
             anyhow::bail!("run not yet mirrored (created event still pending)");
         };
+        let token = self.bearer_for(run_id).await;
         let resp = self
             .http
             .post(format!("{}/v1/runs/{}/results", self.base, ext))
-            .bearer_auth(&self.key)
+            .bearer_auth(&token)
             .json(&json!({ "name": name, "value": value }))
             .send()
             .await
@@ -421,11 +456,11 @@ impl Experiments {
         Ok(())
     }
 
-    async fn patch_run(&self, ext_id: &str, body: Value) -> Result<()> {
+    async fn patch_run(&self, ext_id: &str, body: Value, token: &str) -> Result<()> {
         let resp = self
             .http
             .patch(format!("{}/v1/runs/{}", self.base, ext_id))
-            .bearer_auth(&self.key)
+            .bearer_auth(token)
             .json(&body)
             .send()
             .await
@@ -677,7 +712,10 @@ mod live {
         let spec = RunSpec::Train(Box::new(train));
         // A real `runs` row, exactly as Hub::submit creates before mirroring —
         // set_experiments_run_id later needs a matching row to update.
-        let run_id = store.create_run("outbox-smoke-test", &spec, None).await.expect("create_run");
+        let run_id = store
+            .create_run("outbox-smoke-test", &spec, None, None)
+            .await
+            .expect("create_run");
 
         // Phase 1: nothing listens here -- the create must fail and land
         // durably in the outbox rather than being silently dropped.
@@ -710,5 +748,76 @@ mod live {
         );
 
         std::env::remove_var(env::EXPERIMENTS_URL); // don't leak into other tests
+    }
+
+    /// Live proof that `bearer_for` really *prefers* a linked personal key —
+    /// not just that each half works in isolation. The shared default stays
+    /// valid (so `ensure()`, which always uses it, still succeeds); the
+    /// user's *linked* key is deliberately garbage. If resolution ever fell
+    /// back to the working shared default instead of genuinely preferring the
+    /// (here broken) personal key, this mirror call would succeed — it must
+    /// not.
+    ///   CHUK_EXPERIMENTS_URL=http://localhost:8123 CHUK_EXPERIMENTS_API_KEY=<a real write key> \
+    ///   cargo test -p chuk-train-controlplane experiments::live::bearer_for_prefers_the_submitting_users_own_linked_key -- --ignored --nocapture
+    #[ignore]
+    #[tokio::test]
+    async fn bearer_for_prefers_the_submitting_users_own_linked_key() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        use chuk_train_proto::Role;
+
+        let base = std::env::var(env::EXPERIMENTS_URL).unwrap_or_default();
+        let real_key = std::env::var(env::EXPERIMENTS_API_KEY).unwrap_or_default();
+        if base.is_empty() || real_key.is_empty() {
+            eprintln!(
+                "skip: need {} + {} pointed at a real local chuk-experiments-server",
+                env::EXPERIMENTS_URL,
+                env::EXPERIMENTS_API_KEY
+            );
+            return;
+        }
+        let _ = real_key; // the shared default stays valid throughout this test
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open(":memory:").await.expect("store"));
+        let email = "personal-key-test@example.com";
+        store
+            .upsert_user(email, "default", Role::Write)
+            .await
+            .expect("upsert user");
+
+        let encryption_key = [3u8; 32];
+        let encrypted = crate::crypto::encrypt(&encryption_key, "deliberately-invalid-personal-key");
+        store
+            .set_user_experiments_key(email, Some(&encrypted))
+            .await
+            .expect("link key");
+        std::env::set_var(env::EXPERIMENTS_KEY_ENCRYPTION_KEY, STANDARD.encode(encryption_key));
+
+        let exp = Experiments::from_env(store.clone(), "http://localhost:9").expect("client");
+        let train: TrainSpec = serde_json::from_value(json!({
+            "code": { "name": "bearer-for-test", "sha": "1111111111111111111111111111111111111111" },
+            "entrypoint": "true",
+        }))
+        .expect("valid TrainSpec");
+        let spec = RunSpec::Train(Box::new(train));
+        let run_id = store
+            .create_run("bearer-for-test", &spec, None, Some(email))
+            .await
+            .expect("create_run");
+
+        exp.report_created(run_id.clone(), spec, None).await;
+
+        assert!(
+            store.experiments_run_id(&run_id).await.unwrap().is_none(),
+            "must have failed using the user's own (deliberately invalid) linked key, \
+             not silently succeeded by falling back to the still-valid shared default"
+        );
+        let pending = store
+            .due_outbox_events(now_secs() + 3_700.0, 10)
+            .await
+            .expect("due");
+        assert_eq!(pending.len(), 1, "the failed create must be sitting in the outbox");
+
+        std::env::remove_var(env::EXPERIMENTS_KEY_ENCRYPTION_KEY);
     }
 }

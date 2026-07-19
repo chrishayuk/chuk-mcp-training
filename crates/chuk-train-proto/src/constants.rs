@@ -244,6 +244,11 @@ pub mod env {
     pub const EXPERIMENTS_PROGRAMME: &str = "CHUK_EXPERIMENTS_PROGRAMME";
     /// Experiment slug harness runs attach to (default: harness-runs).
     pub const EXPERIMENTS_EXPERIMENT: &str = "CHUK_EXPERIMENTS_EXPERIMENT";
+    /// 32 raw key bytes (base64), used to encrypt each user's own linked
+    /// chuk-experiments-server API key at rest. Unset ⇒ the per-user-key
+    /// feature is off (set/clear routes refuse); the shared
+    /// `EXPERIMENTS_API_KEY` above keeps working regardless.
+    pub const EXPERIMENTS_KEY_ENCRYPTION_KEY: &str = "CHUK_EXPERIMENTS_KEY_ENCRYPTION_KEY";
 }
 
 /// Environment variables the harness exports to a train entrypoint — the

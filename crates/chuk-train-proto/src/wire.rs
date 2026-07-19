@@ -45,6 +45,16 @@ pub struct WorkerInfo {
     pub lease: Option<Lease>,
 }
 
+/// A worker's latest host-telemetry sample (chuk-compute M4): the `sys/*` metric
+/// map (GPU/CPU/memory utilisation, VRAM, temperature, power) as of `sampled_at`.
+/// One sample per worker — the live values a dashboard renders as gauges.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerTelemetry {
+    pub worker_id: WorkerId,
+    pub sampled_at: UnixSeconds,
+    pub values: BTreeMap<String, f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub id: RunId,
@@ -61,6 +71,12 @@ pub struct RunSummary {
     /// for an unattached scratch run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experiment_ref: Option<String>,
+    /// Email of the user who submitted this run (resolved from their session or
+    /// the owning email of the API key they used — never a bare key prefix).
+    /// `None` for runs submitted before this was tracked, or via the legacy
+    /// master token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
     pub created_at: UnixSeconds,
     pub updated_at: UnixSeconds,
 }

@@ -219,6 +219,27 @@ unmistakable — the harness reports **observations, never conclusions**.*
   outbox_recovers_after_experiments_server_was_unreachable`, `--ignored`): points a client at an
   unreachable address, confirms the event lands in the outbox instead of being lost, then replays it
   against a client pointed at the real server and confirms it's genuinely delivered.
+- **Per-run attribution + per-user chuk-experiments-server key** ✅ *done (2026-07-19).* Both
+  systems already have their own team/user model and self-service API-key issuance, so instead of
+  one shared instance-wide `CHUK_EXPERIMENTS_API_KEY` mirroring every run under the same identity,
+  each harness user can now link *their own* chuk-experiments-server key and have their mirrored
+  runs attributed to it. `AuthContext` gained `owner_email` — always a real email (or the
+  master-token sentinel) regardless of auth method, resolved from the already-fetched
+  `ApiKeyInfo.created_by` for API-key calls rather than the bare key prefix `subject` carries.
+  `runs.created_by` records who submitted each run; `users.experiments_api_key_encrypted` (new
+  AES-256-GCM `crypto.rs` module, key from `CHUK_EXPERIMENTS_KEY_ENCRYPTION_KEY`) stores each user's
+  linked key. `Experiments::bearer_for(run_id)` resolves the run's submitter's own key at mirror
+  time, falling back to the shared default when any link in that chain is missing — the mirror
+  never blocks or fails a run over this. New self-service `PUT`/`DELETE /api/me/experiments-key` +
+  a dashboard card mirror the existing API-keys card's shape. Verified live
+  (`experiments::live::bearer_for_prefers_the_submitting_users_own_linked_key`, `--ignored`) that
+  resolution genuinely prefers the personal key over a working shared default. A real bug turned up
+  in manual REST smoke-testing: `set_user_experiments_key` was `UPDATE`-only, so it silently no-oped
+  (while still reporting success) for any caller with no pre-existing `users` row — true of the
+  master-token sentinel, and of any first-time session sign-in before an admin grants them a role.
+  Fixed as an upsert (defaulting a new row to `Role::Read`/the default team, never clobbering an
+  existing role), and the master-token sentinel is now explicitly rejected by the link/unlink routes
+  rather than silently accepted.
 - **Required experiment reference on formal jobs** (S) — a `submit_run` for a formal experiment
   must carry an experiments-server experiment/run reference; keep an explicit *unattached scratch
   run* mode for quick probes.

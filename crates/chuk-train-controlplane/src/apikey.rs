@@ -35,6 +35,12 @@ pub fn generate_worker_token() -> (String, String, String) {
     generate_with_prefix(WORKER_TOKEN_PREFIX)
 }
 
+/// `AuthContext.owner_email`'s value for the shared legacy master token — it
+/// authenticates no particular user, so per-user features (e.g. linking a
+/// personal chuk-experiments-server key) must reject this sentinel rather
+/// than silently attaching state to it.
+pub const MASTER_TOKEN_SENTINEL: &str = "master-token";
+
 /// The sha256 hex of a bearer token — what's stored and looked up.
 pub fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
@@ -50,6 +56,13 @@ pub struct AuthContext {
     /// The email (Google session / user) or key prefix (api key) — for
     /// attribution + logging.
     pub subject: String,
+    /// Always a real email (or the master-token sentinel) regardless of auth
+    /// method — for a scoped API key this is the key's owning user
+    /// (`ApiKeyInfo.created_by`), not the key's prefix. Use this, not
+    /// `subject`, to resolve "which user made this call" (e.g. per-user
+    /// settings lookups); `subject` stays as-is for existing attribution/
+    /// logging call sites.
+    pub owner_email: String,
 }
 
 impl AuthContext {

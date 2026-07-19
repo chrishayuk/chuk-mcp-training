@@ -120,6 +120,14 @@ td .name{font-weight:600} .empty{color:var(--muted);padding:.9rem;font-size:.86r
 .telem .t .k{font-size:.68rem;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
 .telem .t .val{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:1.05rem;margin-top:.15rem;color:var(--ink)}
 .telem .t .val small{color:var(--muted);font-size:.72rem}
+.sys{display:flex;flex-direction:column;gap:.55rem}
+.sysrow{display:grid;grid-template-columns:3rem 1fr;align-items:center;gap:.6rem}
+.sysrow .sk{font-size:.7rem;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+.sysrow .sv{display:flex;align-items:center;gap:.5rem;font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:.85rem;color:var(--ink)}
+.sysrow .sv small{color:var(--muted);font-size:.72rem}
+.sysrow .bar{flex:1;height:7px;background:var(--ring);border-radius:4px;overflow:hidden}
+.sysrow .bar .fill{height:100%;background:var(--accent);border-radius:4px;transition:width .4s ease}
+.sysrow .pv{min-width:2.6rem;text-align:right}
 .grid2{display:grid;grid-template-columns:1.35fr 1fr;gap:1rem;align-items:start}
 @media (max-width:920px){.grid2{grid-template-columns:1fr}}
 .stack{display:flex;flex-direction:column;gap:1rem}
@@ -319,6 +327,7 @@ function renderRunShell(run){
           <div class="logs" id="logs"><div class="empty">loading…</div></div></div>
       </div>
       <div class="stack">
+        <div class="card"><div class="hd"><h3>System</h3><span class="sp"></span><span class="tag" id="sysage"></span></div><div class="sys" id="sys"><div class="empty">—</div></div></div>
         ${configCard}
         <div class="card"><div class="hd"><h3>Checkpoints</h3><span class="sp"></span><span class="tag" id="ckcount"></span></div><div id="cks"><div class="empty">—</div></div></div>
         <div class="card"><div class="hd"><h3>Events</h3></div><div class="tl" id="events"></div></div>
@@ -361,6 +370,28 @@ async function refreshRun(id,first){
   renderEvents(events);
   const ls=$("#logstat");if(ls){ls.className="st "+(run.state==="running"?"run":"mut");ls.textContent=run.state==="running"?"streaming":run.state;}
   const rw=$("#rs-worker");if(rw)rw.textContent=run.worker_id?"· "+run.worker_id:"";
+  // Live host telemetry (GPU/CPU/mem) for the worker running this run.
+  if(run.worker_id){
+    const t=await api("/api/workers/"+encodeURIComponent(run.worker_id)+"/telemetry").catch(()=>null);
+    if(seq===viewSeq)renderSys(t);
+  }else renderSys(null);
+}
+function gbytes(b){return (b/1073741824).toFixed(1);}
+function sysBar(frac){const p=Math.round(Math.max(0,Math.min(1,frac||0))*100);return `<div class="bar"><div class="fill" style="width:${p}%"></div></div><span class="pv">${p}%</span>`;}
+function renderSys(t){
+  const el=$("#sys");if(!el)return;
+  const age=$("#sysage");
+  const v=t&&t.values;
+  if(!v){el.innerHTML=`<div class="empty">no telemetry yet</div>`;if(age)age.textContent="";return;}
+  const rows=[],row=(k,inner)=>rows.push(`<div class="sysrow"><div class="sk">${k}</div><div class="sv">${inner}</div></div>`);
+  if(v["sys/gpu_util"]!=null)row("GPU",sysBar(v["sys/gpu_util"]));
+  if(v["sys/gpu_mem_total_bytes"])row("VRAM",sysBar(v["sys/gpu_mem_used_bytes"]/v["sys/gpu_mem_total_bytes"])+` <small>${gbytes(v["sys/gpu_mem_used_bytes"])}/${gbytes(v["sys/gpu_mem_total_bytes"])} GB</small>`);
+  if(v["sys/gpu_temp_c"]!=null)row("Temp",`<b>${Math.round(v["sys/gpu_temp_c"])}</b>°C`);
+  if(v["sys/gpu_power_w"]!=null)row("Power",`<b>${Math.round(v["sys/gpu_power_w"])}</b> W`);
+  if(v["sys/cpu_util"]!=null)row("CPU",sysBar(v["sys/cpu_util"]));
+  if(v["sys/mem_util"]!=null)row("RAM",sysBar(v["sys/mem_util"])+(v["sys/mem_total_bytes"]?` <small>${gbytes(v["sys/mem_used_bytes"])}/${gbytes(v["sys/mem_total_bytes"])} GB</small>`:""));
+  el.innerHTML=rows.length?rows.join(""):`<div class="empty">no telemetry yet</div>`;
+  if(age)age.textContent=t.sampled_at?ago(nows()-t.sampled_at)+" ago":"";
 }
 function lastVal(k){const a=cur.series[k];return a&&a.length?a[a.length-1].value:null;}
 function maxStep(){let m=0;for(const k in cur.series){const a=cur.series[k];if(a&&a.length)m=Math.max(m,a[a.length-1].step);}return m;}
@@ -506,6 +537,9 @@ async function loadAccess(){
         <div id="keyBox"></div>
         <div class="tblwrap"><table><thead><tr><th>name</th><th>prefix</th><th>role</th><th>last used</th><th></th></tr></thead><tbody>${kRows||'<tr><td class="empty" colspan="5">no keys yet</td></tr>'}</tbody></table></div>
         <div class="form"><input id="kName" type="text" placeholder="key name (e.g. laptop)"><select id="kRole">${roleOptsUpTo(me.role,keyDefault)}</select><button onclick="mkKey()">generate key</button></div></div>`;
+  const expKeyCard=`<div class="card"><div class="hd"><h3>chuk-experiments-server key</h3><span class="sp"></span><span class="tag">${me.experiments_key_set?"linked":"not linked"}</span></div>
+        <p class="muted" style="margin:.2rem 0 .6rem">Link your own chuk-experiments-server API key (minted on its own Team screen) so runs you submit report under your identity instead of the shared default.</p>
+        <div class="form"><input id="expKey" type="password" placeholder="chuk-experiments-server API key"><button onclick="setExpKey()">save</button>${me.experiments_key_set?'<button onclick="clearExpKey()">clear</button>':""}</div></div>`;
   let usersCard="";
   if(admin){
     const uRows=users.map(u=>`<tr><td class="mono">${esc(u.email)}</td><td><span class="rolechip">${esc(u.role)}</span></td>
@@ -518,6 +552,7 @@ async function loadAccess(){
     <div class="runhead" style="margin-top:.3rem"><div style="flex:1"><div class="runid">Access</div>
       <div class="runsub">${admin?"team members + MCP API keys":"your MCP API keys"} · you are <span class="rolechip">${esc(me.role)}</span></div></div></div>
     <div class="${admin?"grid2":""}">${usersCard}${keyCard}</div>
+    <div class="${admin?"grid2":""}">${expKeyCard}</div>
     <div class="foot">roles: read = view · write = submit/manage runs · admin = archive + manage access · sysadmin = all · keys can't exceed your own role</div>`;
   window.scrollTo(0,0);
   if(pendingReveal){$("#keyBox").innerHTML=`<div class="keyreveal"><div class="k">${esc(pendingReveal)}</div><div class="warn">⚠ Copy it now — the key is shown once and only its hash is stored.</div></div>`;pendingReveal=null;}
@@ -529,6 +564,10 @@ window.mkKey=async()=>{const name=($("#kName").value||"").trim(),role=$("#kRole"
   try{const r=await api("/api/apikeys",{method:"POST",body:JSON.stringify({name,role})});pendingReveal=r.key;loadAccess();}catch(e){alert("failed: "+e.message);}};
 window.rmKey=async id=>{if(!confirm("Revoke this key? MCP clients using it stop working immediately."))return;
   try{await api("/api/apikeys/"+encodeURIComponent(id),{method:"DELETE"});loadAccess();}catch(e){alert("failed: "+e.message);}};
+window.setExpKey=async()=>{const apiKey=($("#expKey").value||"").trim();if(!apiKey)return;
+  try{await api("/api/me/experiments-key",{method:"PUT",body:JSON.stringify({api_key:apiKey})});loadAccess();}catch(e){alert("failed: "+e.message);}};
+window.clearExpKey=async()=>{if(!confirm("Clear your linked chuk-experiments-server key?"))return;
+  try{await api("/api/me/experiments-key",{method:"DELETE"});loadAccess();}catch(e){alert("failed: "+e.message);}};
 
 /* ---------------- router ---------------- */
 function route(){

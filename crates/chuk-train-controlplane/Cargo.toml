@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 chuk-compute-wire = { workspace = true }
 chuk-train-proto = { workspace = true }
+aes-gcm = "0.10"
 anyhow = { workspace = true }
 async-trait = "0.1"
 aws-sdk-s3 = "1"

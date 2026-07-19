@@ -75,6 +75,18 @@ pub(crate) fn forbidden(message: &str) -> Response {
         .into_response()
 }
 
+/// A feature that's optional and gated off (e.g. no encryption key configured)
+/// rather than genuinely broken — distinct from `internal`.
+pub(crate) fn service_unavailable(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            error: message.to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 pub(crate) fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -118,7 +130,8 @@ async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> Option<AuthConte
             return Some(AuthContext {
                 role: Role::Sysadmin,
                 team_id: DEFAULT_TEAM_ID.to_owned(),
-                subject: "master-token".to_owned(),
+                subject: apikey::MASTER_TOKEN_SENTINEL.to_owned(),
+                owner_email: apikey::MASTER_TOKEN_SENTINEL.to_owned(),
             });
         }
         if let Ok(Some(info)) = state
@@ -131,6 +144,7 @@ async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> Option<AuthConte
             return Some(AuthContext {
                 role: info.role,
                 team_id: info.team_id,
+                owner_email: info.created_by.clone(),
                 subject: info.prefix,
             });
         }
@@ -144,6 +158,7 @@ async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> Option<AuthConte
             return Some(AuthContext {
                 role,
                 team_id,
+                owner_email: email.clone(),
                 subject: email,
             });
         }

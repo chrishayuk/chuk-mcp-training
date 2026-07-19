@@ -7,8 +7,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chuk_train_proto::{
     BuildCodeUnitRequest, LogsResponse, MetricSeries, Role, RunEvent, RunId, RunRecord, RunSpec,
-    RunSummary, ShellSpec, SubmitRunRequest, SubmitRunResponse, SubmitShellRequest, WorkerInfo,
-    DEFAULT_LOG_TAIL_LINES, DEFAULT_METRIC_DOWNSAMPLE, DEFAULT_RUN_LIST_LIMIT, DEFAULT_SHELL_TIMEOUT,
+    RunSummary, ShellSpec, SubmitRunRequest, SubmitRunResponse, SubmitShellRequest, WorkerId,
+    WorkerInfo, WorkerTelemetry, DEFAULT_LOG_TAIL_LINES, DEFAULT_METRIC_DOWNSAMPLE,
+    DEFAULT_RUN_LIST_LIMIT, DEFAULT_SHELL_TIMEOUT,
 };
 use serde::Deserialize;
 
@@ -22,6 +23,19 @@ const METRIC_KEYS_SEP: char = ',';
 pub async fn fleet(State(state): State<Arc<AppState>>) -> Response {
     match state.hub.store.fleet().await {
         Ok(workers) => Json::<Vec<WorkerInfo>>(workers).into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+/// `GET /workers/{id}/telemetry` — the worker's latest host sample (chuk-compute
+/// M4 `sys/*`): GPU/CPU/memory for the live dashboard. 404 if it never reported.
+pub async fn worker_telemetry(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id): Path<String>,
+) -> Response {
+    match state.hub.store.worker_telemetry(&WorkerId(worker_id)).await {
+        Ok(Some(telemetry)) => Json::<WorkerTelemetry>(telemetry).into_response(),
+        Ok(None) => not_found(),
         Err(error) => internal(error),
     }
 }
@@ -40,7 +54,11 @@ pub async fn submit_shell(
     });
     // A shell probe is always an unattached scratch run — never mirrored to an
     // experiments-server logical run.
-    match state.hub.submit(&request.name, &spec, None).await {
+    match state
+        .hub
+        .submit(&request.name, &spec, None, Some(&ctx.owner_email))
+        .await
+    {
         Ok(run_id) => Json(SubmitRunResponse { run_id }).into_response(),
         Err(error) => internal(error),
     }
@@ -150,7 +168,12 @@ pub async fn submit_run(
     }
     match state
         .hub
-        .submit(&request.name, &request.spec, request.experiment_ref.as_deref())
+        .submit(
+            &request.name,
+            &request.spec,
+            request.experiment_ref.as_deref(),
+            Some(&ctx.owner_email),
+        )
         .await
     {
         Ok(run_id) => Json(SubmitRunResponse { run_id }).into_response(),

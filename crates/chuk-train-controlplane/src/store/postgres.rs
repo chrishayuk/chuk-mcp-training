@@ -17,10 +17,11 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
-    ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
+    ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo, DEFAULT_TEAM_ID,
     CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
     MetricPoint, MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec, RunState,
-    RunSummary, UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTokenInfo,
+    RunSummary, UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTelemetry,
+    WorkerTokenInfo,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -53,6 +54,11 @@ CREATE TABLE IF NOT EXISTS workers (
   joined_at    double precision NOT NULL,
   last_seen    double precision NOT NULL
 );
+CREATE TABLE IF NOT EXISTS worker_telemetry (
+  worker_id    text PRIMARY KEY,
+  sampled_at   double precision NOT NULL,
+  payload      text NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
   id             text PRIMARY KEY,
   name           text NOT NULL,
@@ -62,6 +68,7 @@ CREATE TABLE IF NOT EXISTS runs (
   worker_id      text,
   exit_code      bigint,
   experiment_ref text,
+  created_by     text,
   created_at     double precision NOT NULL,
   updated_at     double precision NOT NULL
 );
@@ -135,10 +142,11 @@ CREATE TABLE IF NOT EXISTS teams (
   created_at   double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS users (
-  email        text PRIMARY KEY,
-  team_id      text NOT NULL,
-  role         text NOT NULL,
-  created_at   double precision NOT NULL
+  email                          text PRIMARY KEY,
+  team_id                        text NOT NULL,
+  role                           text NOT NULL,
+  created_at                     double precision NOT NULL,
+  experiments_api_key_encrypted  text
 );
 CREATE TABLE IF NOT EXISTS api_keys (
   id           text PRIMARY KEY,
@@ -188,6 +196,8 @@ ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS drive_file_ids text;
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS archived_at double precision;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS experiments_run_id text;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS experiment_ref text;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS created_by text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS experiments_api_key_encrypted text;
 -- Monotonic execution sequence (the 5-digit tail of our EXEC-… ids). Ours
 -- alone — deliberately independent of chuk-experiments-server's run_ref_seq,
 -- since our execution ids no longer share their run-id shape.
@@ -279,6 +289,40 @@ impl Store for PgStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.is_some())
+    }
+
+    async fn record_worker_samples(
+        &self,
+        worker_id: &WorkerId,
+        values: &BTreeMap<String, f64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO worker_telemetry (worker_id, sampled_at, payload) VALUES ($1, $2, $3)
+             ON CONFLICT(worker_id) DO UPDATE SET sampled_at = excluded.sampled_at,
+                                                  payload = excluded.payload",
+        )
+        .bind(&worker_id.0)
+        .bind(now())
+        .bind(serde_json::to_string(values)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn worker_telemetry(&self, worker_id: &WorkerId) -> Result<Option<WorkerTelemetry>> {
+        let row =
+            sqlx::query("SELECT sampled_at, payload FROM worker_telemetry WHERE worker_id = $1")
+                .bind(&worker_id.0)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|r| {
+            Ok(WorkerTelemetry {
+                worker_id: worker_id.clone(),
+                sampled_at: r.get("sampled_at"),
+                values: serde_json::from_str(&r.get::<String, _>("payload"))?,
+            })
+        })
+        .transpose()
     }
 
     async fn worker(&self, id: &WorkerId) -> Result<Option<WorkerInfo>> {
@@ -412,11 +456,12 @@ impl Store for PgStore {
         name: &str,
         spec: &RunSpec,
         experiment_ref: Option<&str>,
+        created_by: Option<&str>,
     ) -> Result<RunId> {
         let run_id = RunId(new_run_id(now(), self.next_run_seq().await?));
         sqlx::query(
-            "INSERT INTO runs (id, name, kind, spec, state, experiment_ref, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $7)",
+            "INSERT INTO runs (id, name, kind, spec, state, experiment_ref, created_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
         )
         .bind(&run_id.0)
         .bind(name)
@@ -424,6 +469,7 @@ impl Store for PgStore {
         .bind(serde_json::to_string(spec)?)
         .bind(RunState::Queued.as_str())
         .bind(experiment_ref)
+        .bind(created_by)
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -951,6 +997,34 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn set_user_experiments_key(&self, email: &str, encrypted: Option<&str>) -> Result<()> {
+        // Upsert: a caller linking their own key may not have a `users` row yet
+        // (e.g. a first-time session sign-in defaults to Role::Read without
+        // one — see `resolve_auth`) — an UPDATE-only query would silently
+        // no-op for them while still reporting success.
+        sqlx::query(
+            "INSERT INTO users (email, team_id, role, created_at, experiments_api_key_encrypted)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(email) DO UPDATE SET experiments_api_key_encrypted = excluded.experiments_api_key_encrypted",
+        )
+        .bind(email)
+        .bind(DEFAULT_TEAM_ID)
+        .bind(Role::Read.as_str())
+        .bind(now())
+        .bind(encrypted)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn user_experiments_key(&self, email: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT experiments_api_key_encrypted FROM users WHERE email = $1")
+            .bind(email)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("experiments_api_key_encrypted")))
+    }
+
     async fn create_api_key(
         &self,
         id: &str,
@@ -1185,6 +1259,7 @@ fn run_from_row(row: &PgRow) -> Result<RunRecord> {
             worker_id: row.get::<Option<String>, _>("worker_id").map(WorkerId),
             exit_code: row.get("exit_code"),
             experiment_ref: row.get("experiment_ref"),
+            created_by: row.get("created_by"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         },
@@ -1258,7 +1333,7 @@ mod pg_live {
 
         // runs + events + transition + sortable id
         let spec = RunSpec::Shell(ShellSpec { command: "echo hi".into(), timeout_s: 60 });
-        let run_id = store.create_run("pg-live", &spec, None).await.expect("create_run");
+        let run_id = store.create_run("pg-live", &spec, None, None).await.expect("create_run");
         assert!(run_id.0.starts_with("EXEC-"), "{}", run_id.0);
         let rec = store.run(&run_id).await.expect("run").expect("some");
         assert_eq!(rec.summary.name, "pg-live");

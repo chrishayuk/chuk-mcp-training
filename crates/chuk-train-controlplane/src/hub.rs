@@ -361,15 +361,23 @@ impl Hub {
             }
             wire::WorkerToCp::Metric {
                 job_id, step, values, ..
-            } => {
-                // Job metrics are (job, step)-indexed; host `sys/*` samples carry
-                // neither and are not yet ingested (M4).
-                if let (Some(job_id), Some(step)) = (job_id, step) {
-                    self.store
-                        .append_metrics(&run_id(&job_id), step, &values)
-                        .await?;
+            } => match job_id {
+                // A job's own metric: the (job, step)-indexed training series.
+                Some(job_id) => {
+                    if let Some(step) = step {
+                        self.store
+                            .append_metrics(&run_id(&job_id), step, &values)
+                            .await?;
+                    }
                 }
-            }
+                // Host telemetry (chuk-compute M4): `sys/*` samples carry no job
+                // or step — the latest sample per worker, for the live dashboard.
+                None => {
+                    if !values.is_empty() {
+                        self.store.record_worker_samples(worker_id, &values).await?;
+                    }
+                }
+            },
             wire::WorkerToCp::Artifact {
                 job_id, class, uri, ..
             } => {
@@ -533,8 +541,12 @@ impl Hub {
         name: &str,
         spec: &RunSpec,
         experiment_ref: Option<&str>,
+        created_by: Option<&str>,
     ) -> Result<RunId> {
-        let run_id = self.store.create_run(name, spec, experiment_ref).await?;
+        let run_id = self
+            .store
+            .create_run(name, spec, experiment_ref, created_by)
+            .await?;
         self.mirror_created(&run_id, spec, experiment_ref);
         self.pump().await?;
         Ok(run_id)
@@ -669,8 +681,15 @@ fn event_seq(msg: &wire::WorkerToCp) -> Option<u64> {
         | wire::WorkerToCp::JobKilled { seq, .. }
         | wire::WorkerToCp::ServiceReady { seq, .. }
         | wire::WorkerToCp::Log { seq, .. }
-        | wire::WorkerToCp::Metric { seq, .. }
         | wire::WorkerToCp::Artifact { seq, .. } => Some(*seq),
+        // A job's own metric is part of the replayable stream; a host `sys/*`
+        // sample (no job_id) is out-of-band telemetry — never outboxed or
+        // deduped, so it must not participate in the seq high-water.
+        wire::WorkerToCp::Metric {
+            seq,
+            job_id: Some(_),
+            ..
+        } => Some(*seq),
         _ => None,
     }
 }
@@ -738,7 +757,7 @@ mod tests {
     #[tokio::test]
     async fn stop_queued_run_cancels_immediately() {
         let hub = test_hub().await;
-        let run = hub.submit("q", &shell_run(), None).await.unwrap();
+        let run = hub.submit("q", &shell_run(), None, None).await.unwrap();
         // No worker connected — the run is queued; stop finalises it here.
         hub.stop_run(&run).await.unwrap();
         let rec = hub.store.run(&run).await.unwrap().unwrap();
@@ -749,7 +768,7 @@ mod tests {
     #[tokio::test]
     async fn stop_rejects_an_already_terminal_run() {
         let hub = test_hub().await;
-        let run = hub.submit("q", &shell_run(), None).await.unwrap();
+        let run = hub.submit("q", &shell_run(), None, None).await.unwrap();
         hub.stop_run(&run).await.unwrap();
         assert!(hub.stop_run(&run).await.is_err());
     }
@@ -757,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn resume_requeues_a_terminal_run_but_not_a_live_one() {
         let hub = test_hub().await;
-        let run = hub.submit("q", &shell_run(), None).await.unwrap();
+        let run = hub.submit("q", &shell_run(), None, None).await.unwrap();
         hub.stop_run(&run).await.unwrap(); // → Cancelled
         hub.resume_run(&run).await.unwrap();
         let rec = hub.store.run(&run).await.unwrap().unwrap();
@@ -769,7 +788,7 @@ mod tests {
     #[tokio::test]
     async fn stop_running_run_signals_worker_then_jobkilled_finalises() {
         let hub = test_hub().await;
-        let run = hub.submit("r", &shell_run(), None).await.unwrap();
+        let run = hub.submit("r", &shell_run(), None, None).await.unwrap();
         // Attach a worker; the pump assigns the queued run to it.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let worker = WorkerId("w-test".into());
@@ -848,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn reaper_leaves_a_freshly_seen_worker_alone() {
         let hub = test_hub().await;
-        let run = hub.submit("r", &shell_run(), None).await.unwrap();
+        let run = hub.submit("r", &shell_run(), None, None).await.unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let worker = WorkerId("w-fresh".into());
         hub.attach(&worker, tx, &[], &Hardware::default()).await.unwrap();
@@ -872,7 +891,7 @@ mod tests {
     async fn detach_requeues_leased_but_keeps_persistent() {
         // Leased: a lost worker's run is requeued (bounded loss).
         let hub = test_hub().await;
-        let run = hub.submit("leased", &shell_run(), None).await.unwrap();
+        let run = hub.submit("leased", &shell_run(), None, None).await.unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let worker = WorkerId("w-leased".into());
         hub.attach(&worker, tx, &[], &Hardware::default()).await.unwrap();
@@ -884,7 +903,7 @@ mod tests {
 
         // Persistent: the run stays assigned for the worker to reconnect (M3.2).
         let hub = test_hub().await;
-        let run = hub.submit("persist", &shell_run(), None).await.unwrap();
+        let run = hub.submit("persist", &shell_run(), None, None).await.unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let worker = WorkerId("w-persist".into());
         hub.attach(&worker, tx, &[], &Hardware::default()).await.unwrap();

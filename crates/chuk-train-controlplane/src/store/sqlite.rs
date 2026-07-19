@@ -6,9 +6,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
     ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
-    CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
-    MetricPoint, MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec, RunState,
-    RunSummary, UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTokenInfo,
+    CodeUnitManifest, DEFAULT_TEAM_ID, EventKind, Hardware, Lease, LeaseExtension, LeaseState,
+    LedgerEntry, MetricPoint, MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec,
+    RunState, RunSummary, UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTelemetry,
+    WorkerTokenInfo,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -32,6 +33,11 @@ CREATE TABLE IF NOT EXISTS workers (
   joined_at    REAL NOT NULL,
   last_seen    REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS worker_telemetry (
+  worker_id    TEXT PRIMARY KEY,
+  sampled_at   REAL NOT NULL,
+  payload      TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
   id             TEXT PRIMARY KEY,
   name           TEXT NOT NULL,
@@ -41,6 +47,7 @@ CREATE TABLE IF NOT EXISTS runs (
   worker_id      TEXT,
   exit_code      INTEGER,
   experiment_ref TEXT,
+  created_by     TEXT,
   created_at     REAL NOT NULL,
   updated_at     REAL NOT NULL
 );
@@ -114,10 +121,11 @@ CREATE TABLE IF NOT EXISTS teams (
   created_at   REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS users (
-  email        TEXT PRIMARY KEY,
-  team_id      TEXT NOT NULL,
-  role         TEXT NOT NULL,
-  created_at   REAL NOT NULL
+  email                          TEXT PRIMARY KEY,
+  team_id                        TEXT NOT NULL,
+  role                           TEXT NOT NULL,
+  created_at                     REAL NOT NULL,
+  experiments_api_key_encrypted  TEXT
 );
 CREATE TABLE IF NOT EXISTS api_keys (
   id           TEXT PRIMARY KEY,
@@ -192,6 +200,8 @@ impl SqliteStore {
             "ALTER TABLE checkpoints ADD COLUMN archived_at REAL",
             "ALTER TABLE runs ADD COLUMN experiments_run_id TEXT",
             "ALTER TABLE runs ADD COLUMN experiment_ref TEXT",
+            "ALTER TABLE runs ADD COLUMN created_by TEXT",
+            "ALTER TABLE users ADD COLUMN experiments_api_key_encrypted TEXT",
         ] {
             let _ = sqlx::query(stmt).execute(&pool).await;
         }
@@ -259,6 +269,40 @@ impl Store for SqliteStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.is_some())
+    }
+
+    async fn record_worker_samples(
+        &self,
+        worker_id: &WorkerId,
+        values: &BTreeMap<String, f64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO worker_telemetry (worker_id, sampled_at, payload) VALUES (?1, ?2, ?3)
+             ON CONFLICT(worker_id) DO UPDATE SET sampled_at = excluded.sampled_at,
+                                                  payload = excluded.payload",
+        )
+        .bind(&worker_id.0)
+        .bind(now())
+        .bind(serde_json::to_string(values)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn worker_telemetry(&self, worker_id: &WorkerId) -> Result<Option<WorkerTelemetry>> {
+        let row =
+            sqlx::query("SELECT sampled_at, payload FROM worker_telemetry WHERE worker_id = ?1")
+                .bind(&worker_id.0)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|r| {
+            Ok(WorkerTelemetry {
+                worker_id: worker_id.clone(),
+                sampled_at: r.get("sampled_at"),
+                values: serde_json::from_str(&r.get::<String, _>("payload"))?,
+            })
+        })
+        .transpose()
     }
 
     async fn worker(&self, id: &WorkerId) -> Result<Option<WorkerInfo>> {
@@ -398,11 +442,12 @@ impl Store for SqliteStore {
         name: &str,
         spec: &RunSpec,
         experiment_ref: Option<&str>,
+        created_by: Option<&str>,
     ) -> Result<RunId> {
         let run_id = RunId(new_run_id(now(), self.next_run_seq().await?));
         sqlx::query(
-            "INSERT INTO runs (id, name, kind, spec, state, experiment_ref, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            "INSERT INTO runs (id, name, kind, spec, state, experiment_ref, created_by, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
         )
         .bind(&run_id.0)
         .bind(name)
@@ -410,6 +455,7 @@ impl Store for SqliteStore {
         .bind(serde_json::to_string(spec)?)
         .bind(RunState::Queued.as_str())
         .bind(experiment_ref)
+        .bind(created_by)
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -932,6 +978,34 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn set_user_experiments_key(&self, email: &str, encrypted: Option<&str>) -> Result<()> {
+        // Upsert: a caller linking their own key may not have a `users` row yet
+        // (e.g. a first-time session sign-in defaults to Role::Read without
+        // one — see `resolve_auth`) — an UPDATE-only query would silently
+        // no-op for them while still reporting success.
+        sqlx::query(
+            "INSERT INTO users (email, team_id, role, created_at, experiments_api_key_encrypted)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(email) DO UPDATE SET experiments_api_key_encrypted = excluded.experiments_api_key_encrypted",
+        )
+        .bind(email)
+        .bind(DEFAULT_TEAM_ID)
+        .bind(Role::Read.as_str())
+        .bind(now())
+        .bind(encrypted)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn user_experiments_key(&self, email: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT experiments_api_key_encrypted FROM users WHERE email = ?1")
+            .bind(email)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("experiments_api_key_encrypted")))
+    }
+
     async fn create_api_key(
         &self,
         id: &str,
@@ -1162,6 +1236,7 @@ fn run_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RunRecord> {
             worker_id: row.get::<Option<String>, _>("worker_id").map(WorkerId),
             exit_code: row.get("exit_code"),
             experiment_ref: row.get("experiment_ref"),
+            created_by: row.get("created_by"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
         },
@@ -1187,7 +1262,7 @@ mod tests {
     #[tokio::test]
     async fn our_ids_use_the_exec_prefix() {
         let store = mem_store().await;
-        let id = store.create_run("r", &shell_spec(), None).await.expect("create");
+        let id = store.create_run("r", &shell_spec(), None, None).await.expect("create");
         assert!(id.0.starts_with("EXEC-"), "{}", id.0);
     }
 
@@ -1195,11 +1270,11 @@ mod tests {
     async fn experiment_ref_round_trips_the_external_parent() {
         let store = mem_store().await;
         let attached = store
-            .create_run("attached", &shell_spec(), Some("RUN-20260718-160217-00042"))
+            .create_run("attached", &shell_spec(), Some("RUN-20260718-160217-00042"), None)
             .await
             .expect("create attached");
         let scratch = store
-            .create_run("scratch", &shell_spec(), None)
+            .create_run("scratch", &shell_spec(), None, None)
             .await
             .expect("create scratch");
 
@@ -1234,9 +1309,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_telemetry_upserts_the_latest_sample() {
+        let store = mem_store().await;
+        let w = WorkerId("gpu-1".into());
+        // Nothing reported yet.
+        assert!(store.worker_telemetry(&w).await.expect("query").is_none());
+
+        let first = BTreeMap::from([("sys/gpu_util".to_owned(), 0.5)]);
+        store.record_worker_samples(&w, &first).await.expect("record");
+        let t = store.worker_telemetry(&w).await.expect("query").expect("some");
+        assert_eq!(t.worker_id, w);
+        assert_eq!(t.values["sys/gpu_util"], 0.5);
+
+        // A later sample overwrites — one row per worker, always the newest.
+        let second = BTreeMap::from([
+            ("sys/gpu_util".to_owned(), 0.9),
+            ("sys/cpu_util".to_owned(), 0.2),
+        ]);
+        store.record_worker_samples(&w, &second).await.expect("record");
+        let t = store.worker_telemetry(&w).await.expect("query").expect("some");
+        assert_eq!(t.values["sys/gpu_util"], 0.9);
+        assert_eq!(t.values["sys/cpu_util"], 0.2);
+        // The overwrite dropped no keys the newest sample carried.
+        assert_eq!(t.values.len(), 2);
+    }
+
+    #[tokio::test]
     async fn outbox_event_becomes_due_then_done() {
         let store = mem_store().await;
-        let run_id = store.create_run("r", &shell_spec(), None).await.expect("create");
+        let run_id = store.create_run("r", &shell_spec(), None, None).await.expect("create");
         let at = now();
         let id = store
             .enqueue_outbox_event(&run_id, "state", "{}", at)
@@ -1258,7 +1359,7 @@ mod tests {
     #[tokio::test]
     async fn failed_outbox_event_waits_for_its_scheduled_retry_time() {
         let store = mem_store().await;
-        let run_id = store.create_run("r", &shell_spec(), None).await.expect("create");
+        let run_id = store.create_run("r", &shell_spec(), None, None).await.expect("create");
         let at = now();
         let id = store
             .enqueue_outbox_event(&run_id, "state", "{}", at)
@@ -1279,5 +1380,88 @@ mod tests {
             .expect("due once backoff elapses");
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].attempts, 1, "a failed attempt must be recorded");
+    }
+
+    #[tokio::test]
+    async fn create_run_persists_the_submitting_user() {
+        let store = mem_store().await;
+        let run_id = store
+            .create_run("r", &shell_spec(), None, Some("chris@example.com"))
+            .await
+            .expect("create");
+        let run = store.run(&run_id).await.expect("run").expect("some");
+        assert_eq!(run.summary.created_by.as_deref(), Some("chris@example.com"));
+    }
+
+    #[tokio::test]
+    async fn create_run_without_a_submitter_leaves_created_by_unset() {
+        let store = mem_store().await;
+        let run_id = store.create_run("r", &shell_spec(), None, None).await.expect("create");
+        let run = store.run(&run_id).await.expect("run").expect("some");
+        assert_eq!(run.summary.created_by, None);
+    }
+
+    #[tokio::test]
+    async fn user_experiments_key_round_trips_and_clears() {
+        let store = mem_store().await;
+        store
+            .upsert_user("chris@example.com", "default", Role::Write)
+            .await
+            .expect("upsert");
+
+        assert_eq!(
+            store.user_experiments_key("chris@example.com").await.expect("get"),
+            None,
+            "unset by default"
+        );
+
+        store
+            .set_user_experiments_key("chris@example.com", Some("encrypted-blob"))
+            .await
+            .expect("set");
+        assert_eq!(
+            store.user_experiments_key("chris@example.com").await.expect("get"),
+            Some("encrypted-blob".to_owned()),
+        );
+
+        store
+            .set_user_experiments_key("chris@example.com", None)
+            .await
+            .expect("clear");
+        assert_eq!(store.user_experiments_key("chris@example.com").await.expect("get"), None);
+    }
+
+    #[tokio::test]
+    async fn set_user_experiments_key_works_for_a_user_with_no_prior_row() {
+        // A first-time session sign-in resolves to Role::Read without ever
+        // being `upsert_user`'d (see `resolve_auth`) — linking a key must
+        // still work rather than silently no-op against a missing row.
+        let store = mem_store().await;
+        store
+            .set_user_experiments_key("new@example.com", Some("encrypted-blob"))
+            .await
+            .expect("set");
+        assert_eq!(
+            store.user_experiments_key("new@example.com").await.expect("get"),
+            Some("encrypted-blob".to_owned()),
+        );
+        let user = store.get_user("new@example.com").await.expect("get_user").expect("some");
+        assert_eq!(user.role, Role::Read);
+        assert_eq!(user.team_id, "default");
+    }
+
+    #[tokio::test]
+    async fn set_user_experiments_key_does_not_clobber_an_existing_users_role() {
+        let store = mem_store().await;
+        store
+            .upsert_user("admin@example.com", "default", Role::Admin)
+            .await
+            .expect("upsert");
+        store
+            .set_user_experiments_key("admin@example.com", Some("encrypted-blob"))
+            .await
+            .expect("set");
+        let user = store.get_user("admin@example.com").await.expect("get_user").expect("some");
+        assert_eq!(user.role, Role::Admin, "linking a key must not downgrade an existing role");
     }
 }

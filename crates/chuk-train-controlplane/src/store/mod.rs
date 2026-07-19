@@ -18,7 +18,7 @@ use chuk_train_proto::{
     ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
     CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
     MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary,
-    UnixSeconds, User, WorkerId, WorkerInfo, WorkerTokenInfo,
+    UnixSeconds, User, WorkerId, WorkerInfo, WorkerTelemetry, WorkerTokenInfo,
 };
 
 pub use postgres::PgStore;
@@ -48,15 +48,27 @@ pub trait Store: Send + Sync {
     /// (chuk-compute M3.1) — i.e. its class is `Persistent`. Used by the
     /// heartbeat reaper to leave a persistent worker's run assigned.
     async fn worker_is_persistent(&self, id: &WorkerId) -> Result<bool>;
+    /// Upsert a worker's latest host-telemetry sample (chuk-compute M4 `sys/*`),
+    /// stamped now — one row per worker, overwriting the previous sample.
+    async fn record_worker_samples(
+        &self,
+        worker_id: &WorkerId,
+        values: &std::collections::BTreeMap<String, f64>,
+    ) -> Result<()>;
+    /// A worker's latest telemetry sample, or `None` if it never reported one.
+    async fn worker_telemetry(&self, worker_id: &WorkerId) -> Result<Option<WorkerTelemetry>>;
 
     // runs
     /// Create a queued run. `experiment_ref` is the optional external parent —
     /// the experiments-server logical run (`RUN-…`) this execution realises.
+    /// `created_by` is the submitting user's email (`AuthContext.owner_email`),
+    /// or `None` for pre-attribution callers.
     async fn create_run(
         &self,
         name: &str,
         spec: &RunSpec,
         experiment_ref: Option<&str>,
+        created_by: Option<&str>,
     ) -> Result<RunId>;
     /// Next value of the monotonic execution sequence (the 5-digit id tail).
     async fn next_run_seq(&self) -> Result<i64>;
@@ -202,6 +214,15 @@ pub trait Store: Send + Sync {
     async fn get_user(&self, email: &str) -> Result<Option<User>>;
     async fn list_users(&self, team_id: &str) -> Result<Vec<User>>;
     async fn remove_user(&self, email: &str) -> Result<()>;
+
+    /// Link (or clear, with `None`) this user's own chuk-experiments-server API
+    /// key so their mirrored runs report under their own identity instead of the
+    /// shared default. Stored as an opaque encrypted blob — this layer never
+    /// sees or needs the plaintext key.
+    async fn set_user_experiments_key(&self, email: &str, encrypted: Option<&str>) -> Result<()>;
+    /// The linked key (still encrypted), or `None` if this user hasn't linked
+    /// one.
+    async fn user_experiments_key(&self, email: &str) -> Result<Option<String>>;
 
     // api keys (RBAC) — only the sha256 hash is stored, never the plaintext.
     #[allow(clippy::too_many_arguments)]
