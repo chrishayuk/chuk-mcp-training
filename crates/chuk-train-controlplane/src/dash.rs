@@ -141,10 +141,25 @@ td .name{font-weight:600} .empty{color:var(--muted);padding:.9rem;font-size:.86r
 .tabpanel{display:none}
 .tabpanel.active{display:block}
 .logs-tall{height:min(64vh,660px)}
-.sys-lg{padding:.5rem .3rem}
-.sys-lg .sysrow{grid-template-columns:4rem 1fr 170px;padding:.35rem 0}
-.sys-lg .spark{width:170px;height:24px}
-.sys-lg .bar{height:9px}
+.logs-mini{height:180px}
+.drill{background:transparent;border:0;color:var(--accent);font:inherit;font-size:.76rem;cursor:pointer;padding:.1rem .3rem}
+.drill:hover{text-decoration:underline}
+.sysmini{display:flex;flex-direction:column;gap:.55rem}
+.sysrow2{display:grid;grid-template-columns:3rem 1fr;align-items:center;gap:.6rem}
+.sysrow2 .sk{font-size:.7rem;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+.sysrow2 .sv{display:flex;align-items:center;gap:.5rem;font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:.85rem;color:var(--ink)}
+.sysrow2 .bar{flex:1;height:7px;background:var(--ring);border-radius:4px;overflow:hidden}
+.sysrow2 .bar .fill{height:100%;background:var(--accent);border-radius:4px}
+.sysrow2 .pv{min-width:2.6rem;text-align:right}
+.sysgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:.9rem;padding:.4rem}
+.syscard{background:var(--surface);border:1px solid var(--ring);border-radius:10px;padding:.7rem .8rem}
+.sysch{display:flex;align-items:baseline;gap:.5rem;margin-bottom:.55rem}
+.syscl{font-size:.72rem;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);flex:1}
+.syscv{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:1.05rem;color:var(--ink)}
+.subv{color:var(--muted);font-size:.72rem;font-family:var(--mono)}
+.syschart{width:100%;height:88px;display:block}
+.sysfill{fill:var(--accent);opacity:.15}
+.sysline{fill:none;stroke:var(--accent);stroke-width:1.5;vector-effect:non-scaling-stroke}
 @media (max-width:920px){.grid2{grid-template-columns:1fr}}
 .stack{display:flex;flex-direction:column;gap:1rem}
 .bar{height:.5rem;background:var(--surface2);border-radius:999px;overflow:hidden;border:1px solid var(--ring)}
@@ -337,18 +352,29 @@ function renderRunShell(run){
       <div class="runacts">${runActions(run)}</div>
     </div>`;
   const configCard=`<div class="card"><div class="hd"><h3>Config</h3></div>${configBody(run)}</div>`;
-  const eventsCard=`<div class="card"><div class="hd"><h3>Events</h3></div><div class="tl" id="events"></div></div>`;
   const ckptCard=`<div class="card"><div class="hd"><h3>Checkpoints</h3><span class="sp"></span><span class="tag" id="ckcount"></span></div><div id="cks"><div class="empty">—</div></div></div>`;
-  // Run detail is tabbed: a light Overview plus dedicated Training (train only),
-  // Logs, and System screens. Every panel is rendered so the refresh loop keeps
-  // filling them; showTab() just toggles which one is visible.
+  const drill=(t,l)=>`<button class="drill" onclick="showTab('${t}')">${l} →</button>`;
+  // Run detail is tabbed. Overview is a *summary* — system at-a-glance, the last
+  // few events, a recent-log tail — each drilling into its own detailed screen:
+  // Training (train only), a full Logs tab, a full Events tab, and a System tab
+  // with a per-metric graph (GPU/VRAM/temp/power/CPU/RAM). Every panel renders so
+  // the refresh loop keeps filling them; showTab just toggles which is visible.
   const tabs=[["overview","Overview"]]
     .concat(isTrain?[["training","Training"]]:[])
-    .concat([["logs","Logs"],["system","System"]]);
+    .concat([["logs","Logs"],["events","Events"],["system","System"]]);
   const tabbar=`<div class="tabs">${tabs.map(([k,l],i)=>`<button class="tab${i?"":" active"}" data-tab="${k}" onclick="showTab('${k}')">${esc(l)}</button>`).join("")}</div>`;
   const pOverview=`<div class="tabpanel active" data-panel="overview">
       <div class="telem" id="telem"></div>
-      <div class="grid2"><div class="stack">${configCard}</div><div class="stack">${eventsCard}</div></div>
+      <div class="grid2">
+        <div class="stack">
+          <div class="card"><div class="hd"><h3>System</h3><span class="sp"></span>${drill("system","details")}</div><div class="sysmini" id="sysMini"><div class="empty">—</div></div></div>
+          ${configCard}
+        </div>
+        <div class="stack">
+          <div class="card"><div class="hd"><h3>Recent events</h3><span class="sp"></span>${drill("events","all")}</div><div class="tl" id="eventsMini"></div></div>
+          <div class="card"><div class="hd"><h3>Recent logs</h3><span class="sp"></span>${drill("logs","full")}</div><div class="logs logs-mini" id="logsMini"><div class="empty">—</div></div></div>
+        </div>
+      </div>
     </div>`;
   const pTraining=isTrain?`<div class="tabpanel" data-panel="training">
       <div class="grid2"><div class="stack">
@@ -360,10 +386,14 @@ function renderRunShell(run){
       <div class="card"><div class="hd"><h3>Logs</h3><span class="sp"></span><span class="st ${run.state==='running'?'run':'mut'}" id="logstat">${run.state==='running'?'streaming':run.state}</span></div>
         <div class="logs logs-tall" id="logs"><div class="empty">loading…</div></div></div>
     </div>`;
-  const pSystem=`<div class="tabpanel" data-panel="system">
-      <div class="card"><div class="hd"><h3>System</h3><span class="sp"></span><span class="tag" id="sysage"></span></div><div class="sys sys-lg" id="sys"><div class="empty">—</div></div></div>
+  const pEvents=`<div class="tabpanel" data-panel="events">
+      <div class="card"><div class="hd"><h3>Events</h3></div><div class="tl" id="events"></div></div>
     </div>`;
-  $("#app").innerHTML=head+tabbar+pOverview+pTraining+pLogs+pSystem;
+  const pSystem=`<div class="tabpanel" data-panel="system">
+      <div class="card"><div class="hd"><h3>System · host telemetry</h3><span class="sp"></span><span class="tag" id="sysage"></span></div>
+        <div class="sysgrid" id="sys"><div class="empty">—</div></div></div>
+    </div>`;
+  $("#app").innerHTML=head+tabbar+pOverview+pTraining+pLogs+pEvents+pSystem;
   window.scrollTo(0,0);
 }
 window.showTab=function(name){
@@ -399,38 +429,69 @@ async function refreshRun(id,first){
   renderMetricSel();
   drawChart();
   renderLogs(logs.lines||logs);
+  renderLogs(logs.lines||logs,"#logsMini",14);
   renderCks(cks,id);
   renderEvents(events);
+  renderEvents(events,"#eventsMini",6);
   const ls=$("#logstat");if(ls){ls.className="st "+(run.state==="running"?"run":"mut");ls.textContent=run.state==="running"?"streaming":run.state;}
   const rw=$("#rs-worker");if(rw)rw.textContent=run.worker_id?"· "+run.worker_id:"";
-  // Live host telemetry (GPU/CPU/mem) for the worker running this run.
+  // Live host telemetry (GPU/CPU/mem) for the worker running this run: detailed
+  // per-metric graphs on the System tab, compact gauges on the Overview.
   if(run.worker_id){
     const t=await api("/api/workers/"+encodeURIComponent(run.worker_id)+"/telemetry").catch(()=>null);
-    if(seq===viewSeq)renderSys(t);
-  }else renderSys(null);
+    if(seq===viewSeq){renderSys(t);renderSysMini(t);}
+  }else{renderSys(null);renderSysMini(null);}
 }
 function gbytes(b){return (b/1073741824).toFixed(1);}
 function sysBar(frac){const p=Math.round(Math.max(0,Math.min(1,frac||0))*100);return `<div class="bar"><div class="fill" style="width:${p}%"></div></div><span class="pv">${p}%</span>`;}
-function spark(pts){
-  if(!pts||pts.length<2)return"";
-  const W=88,H=16,n=pts.length;
-  const d=pts.map((p,i)=>`${(i/(n-1)*W).toFixed(1)},${(H-Math.max(0,Math.min(1,p.value))*(H-2)-1).toFixed(1)}`).join(" ");
-  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polyline points="${d}"/></svg>`;
+// Metric specs for the detailed System tab + the compact Overview gauges.
+// `max:1` pins utilisation charts to 0–100%; the rest auto-scale to their range.
+const SYS_METRICS=[
+  {k:"sys/gpu_util",label:"GPU utilisation",max:1,fmt:v=>Math.round(v*100)+"%"},
+  {k:"sys/gpu_mem_util",label:"VRAM",max:1,fmt:v=>Math.round(v*100)+"%",sub:t=>gbytes(t.values["sys/gpu_mem_used_bytes"])+" / "+gbytes(t.values["sys/gpu_mem_total_bytes"])+" GB"},
+  {k:"sys/gpu_temp_c",label:"GPU temperature",fmt:v=>Math.round(v)+" °C"},
+  {k:"sys/gpu_power_w",label:"GPU power",fmt:v=>Math.round(v)+" W"},
+  {k:"sys/cpu_util",label:"CPU utilisation",max:1,fmt:v=>Math.round(v*100)+"%"},
+  {k:"sys/mem_util",label:"Memory",max:1,fmt:v=>Math.round(v*100)+"%",sub:t=>gbytes(t.values["sys/mem_used_bytes"])+" / "+gbytes(t.values["sys/mem_total_bytes"])+" GB"},
+];
+// A per-metric time-series line chart over the retained window (the System tab).
+function sysChart(pts,max){
+  if(!pts||pts.length<2)return `<div class="empty" style="height:88px">no history yet</div>`;
+  const W=340,H=88,pt=10,pb=8,px=6,n=pts.length;
+  const ys=pts.map(p=>p.value);let lo=0,hi=(max||Math.max(...ys)||1);
+  if(!max){lo=Math.min(...ys);const pad=(hi-lo)*0.15||Math.abs(hi)*0.1||1;lo-=pad;hi+=pad;}
+  const sx=i=>px+(i/(n-1))*(W-2*px);
+  const sy=v=>pt+(1-(v-lo)/((hi-lo)||1))*(H-pt-pb);
+  const line=pts.map((p,i)=>`${sx(i).toFixed(1)},${sy(p.value).toFixed(1)}`).join(" ");
+  const area=`${px.toFixed(1)},${(H-pb).toFixed(1)} ${line} ${(W-px).toFixed(1)},${(H-pb).toFixed(1)}`;
+  return `<svg class="syschart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polygon class="sysfill" points="${area}"/><polyline class="sysline" points="${line}"/></svg>`;
 }
+// Detailed System tab: one graph per available metric.
 function renderSys(t){
   const el=$("#sys");if(!el)return;
   const age=$("#sysage");
-  const v=t&&t.values,s=(t&&t.series)||{};
-  if(!v){el.innerHTML=`<div class="empty">no telemetry yet</div>`;if(age)age.textContent="";return;}
-  const rows=[],row=(k,inner,sk)=>rows.push(`<div class="sysrow"><div class="sk">${k}</div><div class="sv">${inner}</div><div class="spk">${sk?spark(s[sk]):""}</div></div>`);
-  if(v["sys/gpu_util"]!=null)row("GPU",sysBar(v["sys/gpu_util"]),"sys/gpu_util");
-  if(v["sys/gpu_mem_total_bytes"])row("VRAM",sysBar(v["sys/gpu_mem_used_bytes"]/v["sys/gpu_mem_total_bytes"])+` <small>${gbytes(v["sys/gpu_mem_used_bytes"])}/${gbytes(v["sys/gpu_mem_total_bytes"])} GB</small>`,"sys/gpu_mem_util");
-  if(v["sys/gpu_temp_c"]!=null)row("Temp",`<b>${Math.round(v["sys/gpu_temp_c"])}</b>°C`);
-  if(v["sys/gpu_power_w"]!=null)row("Power",`<b>${Math.round(v["sys/gpu_power_w"])}</b> W`);
-  if(v["sys/cpu_util"]!=null)row("CPU",sysBar(v["sys/cpu_util"]),"sys/cpu_util");
-  if(v["sys/mem_util"]!=null)row("RAM",sysBar(v["sys/mem_util"])+(v["sys/mem_total_bytes"]?` <small>${gbytes(v["sys/mem_used_bytes"])}/${gbytes(v["sys/mem_total_bytes"])} GB</small>`:""),"sys/mem_util");
-  el.innerHTML=rows.length?rows.join(""):`<div class="empty">no telemetry yet</div>`;
+  const v=t&&t.values;
+  if(!v){el.innerHTML=`<div class="empty">no telemetry yet — is a worker running this?</div>`;if(age)age.textContent="";return;}
+  const s=t.series||{};
+  const cards=SYS_METRICS.filter(m=>v[m.k]!=null).map(m=>{
+    const sub=m.sub?`<span class="subv">${esc(m.sub(t))}</span>`:"";
+    return `<div class="syscard"><div class="sysch"><span class="syscl">${m.label}</span><span class="syscv">${m.fmt(v[m.k])}</span>${sub}</div>${sysChart(s[m.k],m.max)}</div>`;
+  }).join("");
+  el.innerHTML=cards||`<div class="empty">no telemetry yet</div>`;
   if(age)age.textContent=t.sampled_at?ago(nows()-t.sampled_at)+" ago":"";
+}
+// Compact gauges for the Overview summary card.
+function renderSysMini(t){
+  const el=$("#sysMini");if(!el)return;
+  const v=t&&t.values;
+  if(!v){el.innerHTML=`<div class="empty">no telemetry</div>`;return;}
+  const rows=[],row=(k,inner)=>rows.push(`<div class="sysrow2"><div class="sk">${k}</div><div class="sv">${inner}</div></div>`);
+  if(v["sys/gpu_util"]!=null)row("GPU",sysBar(v["sys/gpu_util"]));
+  if(v["sys/gpu_mem_total_bytes"])row("VRAM",sysBar(v["sys/gpu_mem_used_bytes"]/v["sys/gpu_mem_total_bytes"]));
+  if(v["sys/gpu_temp_c"]!=null)row("Temp",`<b>${Math.round(v["sys/gpu_temp_c"])}</b>°C`);
+  if(v["sys/cpu_util"]!=null)row("CPU",sysBar(v["sys/cpu_util"]));
+  if(v["sys/mem_util"]!=null)row("RAM",sysBar(v["sys/mem_util"]));
+  el.innerHTML=rows.length?rows.join(""):`<div class="empty">no telemetry</div>`;
 }
 function lastVal(k){const a=cur.series[k];return a&&a.length?a[a.length-1].value:null;}
 function maxStep(){let m=0;for(const k in cur.series){const a=cur.series[k];if(a&&a.length)m=Math.max(m,a[a.length-1].step);}return m;}
@@ -480,11 +541,13 @@ function drawChart(){
     ${lab}<text x="${W-pr}" y="${(sy(last.value)-8).toFixed(1)}" text-anchor="end" class="axis" style="fill:var(--ink);font-size:11px">${exp?last.value.toExponential(1):last.value.toFixed(3)}</text>`;
 }
 function classifyLog(t){if(/checkpoint|ckpt|upload/i.test(t))return"ck";if(/\bstep\b|loss/i.test(t))return"step";if(/error|nan|fail|warn/i.test(t))return"warnln";return"";}
-function renderLogs(lines){
-  const box=$("#logs");if(!box)return;
+function renderLogs(lines,sel="#logs",tail=0){
+  const box=$(sel);if(!box)return;
   if(!lines||!lines.length){box.innerHTML=`<div class="empty">no logs yet</div>`;return;}
-  box.innerHTML=lines.map((l,i)=>`<div class="ln ${classifyLog(l)}"><span class="t">${String(i+1).padStart(4," ")}  </span>${esc(l)}</div>`).join("");
-  if(cur.pinBottom)box.scrollTop=box.scrollHeight;
+  const show=tail>0?lines.slice(-tail):lines;
+  const base=tail>0?lines.length-show.length:0;
+  box.innerHTML=show.map((l,i)=>`<div class="ln ${classifyLog(l)}"><span class="t">${String(base+i+1).padStart(4," ")}  </span>${esc(l)}</div>`).join("");
+  if(!tail&&cur.pinBottom)box.scrollTop=box.scrollHeight;
 }
 function ckLoc(uri){if(/\/ckpt-final\//.test(uri))return"final";if(/\/ckpt-hot\//.test(uri))return"hot";if(/^drive:/.test(uri))return"drive";return"hot";}
 function ckKey(uri){return String(uri).replace(/^[a-z0-9]+:\/\/[^/]+\//i,"");}
@@ -522,10 +585,11 @@ window.dl=async (rid,step,file)=>{
   }catch(e){alert("download failed: "+e.message);}
 };
 const EV_CLS={running:"run",completed:"good",failed:"bad",cancelled:"bad",checkpoint:"ck"};
-function renderEvents(events){
-  const box=$("#events");if(!box)return;
+function renderEvents(events,sel="#events",limit=0){
+  const box=$(sel);if(!box)return;
   if(!events||!events.length){box.innerHTML=`<div class="empty" style="padding:.4rem 0">no events</div>`;return;}
-  box.innerHTML=events.map(e=>{
+  const show=limit>0?events.slice(-limit).reverse():events;
+  box.innerHTML=show.map(e=>{
     const cls=EV_CLS[e.event]||"mut";
     let lbl=esc(e.event);const d=e.detail||{};
     if(d.worker)lbl+=` · <b>${esc(d.worker)}</b>`;
