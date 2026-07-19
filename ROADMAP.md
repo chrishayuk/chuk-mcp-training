@@ -89,6 +89,41 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 A gap analysis of the built system, ranked within each group by value-to-effort. The
 highest-value quick wins are already promoted into *Immediate next steps* above.
 
+**Portable "join anywhere" agent harness + run telemetry (direction, 2026-07-19)**
+
+The agent should be a standard harness that runs identically on Colab, Vast, a Mac, or any
+box, and should capture rich system telemetry per run — not just the trainer's app metrics.
+
+- **Multi-target agent builds + target-aware download** (M) — the download path is a single
+  hardcoded `/agent/linux-x86_64` (`crates/chuk-train-proto/src/constants.rs:15`). Build and
+  serve `/agent/{os}-{arch}` for `linux-x86_64`, `linux-aarch64`, `darwin-arm64`,
+  `darwin-x86_64` so a Mac (or ARM box) can join. Prereq for "run on my Mac."
+- **One detect-and-install bootstrap** (S–M) — a single `curl … | sh` installer that detects
+  OS+arch, pulls the matching binary, and runs `agent --join <token>`. Unify today's
+  per-environment paths: the Colab cell (`bootstrap/colab_cell.py`) and the Vast-specific
+  onstart string templating (`crates/chuk-train-cp/src/provider/vast.rs:21`) both become thin
+  wrappers over it; Mac + any Linux box use it directly. (Composes with "generalized provider
+  bootstrap" below.)
+- **BYO / persistent worker class** (M) — the lease model assumes provider-provisioned,
+  wall-enforced, **destroyable** instances (`crates/chuk-train-cp/src/lease.rs`). A Mac or a
+  box you own is different: a long-lived join, **no lease wall, no teardown**, marked
+  non-preemptible. Add a persistent worker class the CP never tries to destroy (and a
+  long-lived join-token class for it — pairs with the single-use-token item, which stays for
+  leased workers). This is the real "run on my Mac, whenever" capability.
+- **Richer capability registration** (S–M) — `Hardware` is thin today (host/os/gpu/vram_mb/
+  driver, `crates/chuk-train-proto/src/domain.rs`). Add cpu_cores, ram_gb, arch, accelerator
+  kind (`cuda`/`mps`/`cpu`), and preemptible/persistent flags, so the scheduler can match jobs
+  (feeds *Requirements-aware assignment* and packing).
+- **Per-run system telemetry** (M, high value) — the agent detects the GPU once at register
+  via `nvidia-smi` (`crates/chuk-train-agent/src/hardware.rs`) but never samples during a run.
+  Add a periodic sampler streaming a `sys/*` metric namespace over the existing `Metric` wire
+  channel: GPU util % / mem used+total / temp / power / SM clock (nvidia-smi→NVML), CPU util /
+  RAM / disk+net I/O (sysinfo/procfs), and per-process (trainer PID) CPU+RAM. Flows into the
+  existing metrics store → dashboard utilization curves → experiments-server. Feeds the
+  packing utilization metric, watchdog gates (GPU-mem OOM, thermal throttle), and MFU/efficiency
+  (tokens_per_s vs GPU util). Turns a training dashboard into an ops dashboard. *(Apple-Silicon
+  GPU telemetry is best-effort — `powermetrics` needs sudo; treat MPS util as a known gap.)*
+
 **Spec gaps beyond the milestone headers**
 - **Requirements-aware assignment** (S–M) — `pump()` assigns the oldest queued run to any
   idle worker with no fit check; add `requirements {min_vram_gb, labels}` + priority so a
