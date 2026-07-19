@@ -117,9 +117,13 @@ agent/MCP-deployment platform never colonizes the rig. Sequencing (spec §11):
   three targets (zigbuild + macOS). **Proven: the Mac joins via `curl <CP>/install.sh | sh`.**
   Follow-up: bake the aarch64-musl + darwin CI artifacts into the deployed image (serves x86_64
   today; the Mac builds locally / from CI).
-- **M3 — persistent worker class** — long-lived revocable tokens, reconnect-with-resume, metric
-  spool/replay against a high-water mark, hand-rolled self-update; **the Mac joins** (no wall,
-  no teardown — `WorkerClass` an enum so destroying a persistent worker is unrepresentable).
+- **M3 — persistent worker class** (in progress). **M3.1 ✅ done** — long-lived revocable
+  worker tokens (`cw_`, hashed at rest) bound to a stable id; a persistent token → `Persistent`
+  class + that id in HelloAck, so a Mac keeps one identity across reconnects/restarts; no lease
+  ⇒ never torn down. Proven (mint → join → job → restart-same-id → bogus-rejected). **Remaining:**
+  M3.2 survive-disconnect (job keeps running across a drop; event spool/replay against a
+  high-water mark; CP doesn't requeue a persistent worker's live job), M3.3 self-update from a
+  version `HelloReject`. `WorkerClass` is an enum so destroying a persistent worker is unrepresentable.
 - **M4 — `sys/*` telemetry sampler** — one sampler task over the existing Metric channel: NVML
   (`nvml-wrapper`, runtime-loaded) + `sysinfo` first; macmon/IOReport MPS once the Mac is on
   (tier-2 best-effort, gaps as absent metrics not zeros). Feeds packing-util, OOM/thermal gates, MFU.
