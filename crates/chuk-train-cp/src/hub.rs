@@ -58,6 +58,10 @@ pub struct Hub {
     grants: GrantTable,
     links: Mutex<HashMap<WorkerId, AgentTx>>,
     resume_state: StdMutex<HashMap<RunId, ResumeState>>,
+    /// Highest streamed-event `seq` processed per worker (chuk-compute M3.2). A
+    /// reconnecting worker replays its outbox; anything at or below its
+    /// high-water here has already been applied and is dropped (spec §8).
+    high_water: StdMutex<HashMap<WorkerId, u64>>,
 }
 
 impl Hub {
@@ -73,7 +77,19 @@ impl Hub {
             grants: GrantTable::default(),
             links: Mutex::new(HashMap::new()),
             resume_state: StdMutex::new(HashMap::new()),
+            high_water: StdMutex::new(HashMap::new()),
         })
+    }
+
+    /// The highest streamed-event seq processed for a worker — echoed in HelloAck
+    /// so a reconnecting worker replays only what follows.
+    pub fn resume_high_water(&self, worker_id: &WorkerId) -> u64 {
+        self.high_water
+            .lock()
+            .expect("high_water lock")
+            .get(worker_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn grants(&self) -> &GrantTable {
@@ -131,9 +147,17 @@ impl Hub {
     /// A job on a vanished worker is requeued. For a train run that means the
     /// next assignment resumes from its latest uploaded checkpoint (spec §14 M1:
     /// close the tab → re-queues and resumes); for a shell run it restarts.
-    pub async fn detach(&self, worker_id: &WorkerId) -> Result<()> {
+    ///
+    /// A **persistent** worker (M3.2) is exempt: its dropped connection is a
+    /// blip, not a loss — the job keeps running on the worker and it reconnects
+    /// and replays, so the run stays assigned rather than being requeued.
+    pub async fn detach(&self, worker_id: &WorkerId, class: wire::WorkerClass) -> Result<()> {
         self.links.lock().await.remove(worker_id);
         self.store.worker_left(worker_id).await?;
+        if class == wire::WorkerClass::Persistent {
+            info!(worker = %worker_id, "persistent worker disconnected; keeping its run assigned");
+            return self.pump().await;
+        }
         if let Some(worker) = self.store.worker(worker_id).await? {
             if let Some(run_id) = worker.current_run {
                 warn!(worker = %worker_id, run = %run_id, "worker vanished mid-run; requeueing");
@@ -286,6 +310,17 @@ impl Hub {
 
     pub async fn on_message(&self, worker_id: &WorkerId, msg: wire::WorkerToCp) -> Result<()> {
         self.store.worker_seen(worker_id).await?;
+        // Deduplicate replayed streamed events (M3.2): a reconnecting worker
+        // re-sends its outbox; anything at or below the high-water is already
+        // applied. Non-streamed messages (Hello/Heartbeat/Drained) have no seq.
+        if let Some(seq) = event_seq(&msg) {
+            let mut hw = self.high_water.lock().expect("high_water lock");
+            if hw.get(worker_id).is_some_and(|&cur| seq <= cur) {
+                debug!(worker = %worker_id, seq, "duplicate streamed event (replay); dropping");
+                return Ok(());
+            }
+            hw.insert(worker_id.clone(), seq);
+        }
         match msg {
             wire::WorkerToCp::Hello { .. } => {
                 debug!(worker = %worker_id, "duplicate hello ignored");
@@ -479,6 +514,21 @@ impl Hub {
 /// A [`wire::JobId`] is a run's id verbatim on the fabric.
 fn run_id(job_id: &wire::JobId) -> RunId {
     RunId(job_id.0.clone())
+}
+
+/// The `seq` of a streamed worker→CP event, or `None` for the non-streamed
+/// messages (Hello / Heartbeat / Drained) that are never replayed.
+fn event_seq(msg: &wire::WorkerToCp) -> Option<u64> {
+    match msg {
+        wire::WorkerToCp::JobStarted { seq, .. }
+        | wire::WorkerToCp::JobExited { seq, .. }
+        | wire::WorkerToCp::JobKilled { seq, .. }
+        | wire::WorkerToCp::ServiceReady { seq, .. }
+        | wire::WorkerToCp::Log { seq, .. }
+        | wire::WorkerToCp::Metric { seq, .. }
+        | wire::WorkerToCp::Artifact { seq, .. } => Some(*seq),
+        _ => None,
+    }
 }
 
 /// Parse the trailing `step_<n>` segment of a checkpoint uri, e.g.

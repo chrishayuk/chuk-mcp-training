@@ -6,20 +6,26 @@
 //!
 //! Dials OUT to the control plane, advertises its capabilities, heartbeats,
 //! executes assigned jobs (stage inputs, run one command, stream logs/metrics,
-//! collect outputs), and reconnects with exponential backoff. The worker knows
-//! nothing about what a job computes — every workload specific arrives inside
-//! the [`chuk_compute_wire::Job`].
+//! collect outputs), and reconnects with jittered exponential backoff. The worker
+//! knows nothing about what a job computes — every workload specific arrives
+//! inside the [`chuk_compute_wire::Job`].
 //!
-//! One job in flight; streamed data is dropped while the control plane is
-//! unreachable (a disk spool + replay is a later milestone). If the session
-//! drops mid-job the child is killed and the control plane requeues.
+//! One job in flight. Durable state (the sequence counter, the executor's event
+//! sink, the running job, and the replay outbox) lives for the worker's whole
+//! lifetime in [`main`], so a dropped websocket does not have to end a job: a
+//! **persistent** worker keeps the child running while disconnected and, on
+//! reconnect, drains and replays the events the control plane has not yet seen
+//! (chuk-compute M3.2). A **leased** worker still abandons its job on disconnect
+//! and lets the control plane requeue it.
 
+mod backoff;
 mod capabilities;
 mod constants;
 mod executor;
 mod httpclient;
 mod inputs;
 mod metrics;
+mod outbox;
 mod outputs;
 mod procio;
 mod sandbox;
@@ -28,7 +34,9 @@ mod seq;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chuk_compute_wire::{CpToWorker, KillReason, Resume, WorkerId, WorkerToCp, PROTOCOL_VERSION};
+use chuk_compute_wire::{
+    CpToWorker, KillReason, Resume, WorkerClass, WorkerId, WorkerToCp, PROTOCOL_VERSION,
+};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
@@ -36,10 +44,12 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
+use crate::backoff::with_jitter;
 use crate::constants::{
     DEFAULT_DRAIN_WINDOW_MIN, HEARTBEAT_INTERVAL, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
 };
 use crate::executor::RunningJob;
+use crate::outbox::{event_seq, trim_to_high_water, SEQ_ORIGIN};
 use crate::seq::Seq;
 
 /// Separator between labels passed on the `--labels` flag.
@@ -78,6 +88,16 @@ fn target_triple() -> String {
     format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
 }
 
+/// Cheap entropy for reconnect jitter: the sub-second slice of the wall clock.
+/// Enough to de-correlate a fleet without pulling in an RNG dependency.
+fn jitter_entropy() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| u64::from(since.subsec_nanos()))
+        .unwrap_or(0)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -88,14 +108,6 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let labels: Vec<String> = args
-        .labels
-        .split(LABEL_SEPARATOR)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
-    // A leased/spot host may be reclaimed under the worker at any time.
-    let preemptible = args.lease_min.is_some();
 
     // The self-drain deadline (belt): computed once from process start so it
     // survives reconnects. The control plane's Drain at T-drain and destroy at
@@ -106,80 +118,143 @@ async fn main() -> Result<()> {
         tokio::time::Instant::now() + Duration::from_secs_f64(secs)
     });
 
-    let mut worker_id = args.worker_id.map(WorkerId::from);
+    // Durable worker-lifetime state, held across every session so a persistent
+    // worker's job survives a dropped socket (chuk-compute M3.2):
+    //   - `seq`: one monotonic counter, created once, cloned into every job, so
+    //     replayed events keep unique, monotonic sequence numbers across
+    //     reconnects (the control plane dedups by seq);
+    //   - `job_tx`/`job_rx`: the executor's event sink, which keeps filling while
+    //     disconnected — the next session drains and replays it;
+    //   - `current`: the running job (a leased worker aborts it on disconnect, a
+    //     persistent one leaves it running);
+    //   - `outbox`: every streamed event produced for the current job, cleared
+    //     when a new job is assigned, so replay memory is bounded;
+    //   - `class`/`worker_id`: learned from `HelloAck` and retained across
+    //     reconnects.
+    let seq = Seq::new();
+    let (job_tx, mut job_rx) = mpsc::unbounded_channel::<WorkerToCp>();
+    let mut current: Option<RunningJob> = None;
+    let mut outbox: Vec<(u64, WorkerToCp)> = Vec::new();
+    let mut class = WorkerClass::Leased;
+    let mut worker_id = args.worker_id.as_deref().map(WorkerId::from);
+
     let mut backoff = RECONNECT_BACKOFF_MIN;
     loop {
-        match session(
-            &args.url,
-            &args.token,
-            worker_id.clone(),
-            &labels,
-            preemptible,
+        match run_session(
+            &args,
+            &mut worker_id,
+            &mut class,
+            &mut current,
+            &mut outbox,
+            &seq,
+            &job_tx,
+            &mut job_rx,
             self_drain_at,
         )
         .await
         {
-            Ok(assigned_id) => {
-                // Keep the id the control plane confirmed so reconnects present
-                // the same worker.
-                worker_id = Some(assigned_id);
-                backoff = RECONNECT_BACKOFF_MIN;
-            }
-            Err(error) => {
-                warn!(%error, "session error");
+            Ok(()) => backoff = RECONNECT_BACKOFF_MIN,
+            Err(error) => warn!(%error, "session error"),
+        }
+
+        // Class-gated disconnect handling. A leased worker abandons its job (as
+        // before): killing the child matches the control plane, which requeues.
+        // A persistent worker leaves `current` running — its events keep flowing
+        // into `job_rx`, and the next session drains and replays them.
+        if class == WorkerClass::Leased {
+            if let Some(job) = current.take() {
+                if !job.is_finished() {
+                    warn!("leased worker lost its session mid-job; killing child (control plane requeues)");
+                }
+                job.abort();
             }
         }
-        info!(delay_s = backoff.as_secs(), "reconnecting after backoff");
-        tokio::time::sleep(backoff).await;
+
+        let delay = with_jitter(backoff, jitter_entropy());
+        info!(delay_ms = delay.as_millis() as u64, "reconnecting after backoff");
+        tokio::time::sleep(delay).await;
         backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
 }
 
-/// One websocket session: handshake, then message loop until the socket dies.
-/// Returns the worker id the control plane confirmed.
-async fn session(
-    url: &str,
-    token: &str,
-    worker_id: Option<WorkerId>,
-    labels: &[String],
-    preemptible: bool,
+/// One websocket session over the durable worker state: connect, handshake
+/// (carrying a resume once we have an identity), drain-trim-replay the outbox,
+/// then pump messages until the socket dies. Because the job, outbox, class, and
+/// worker id outlive the session in [`main`], returning here is just a
+/// disconnect, not a job loss — the caller reconnects and the next session
+/// replays. Returns `Ok(())` on a clean disconnect, `Err` on a handshake failure
+/// worth logging.
+#[allow(clippy::too_many_arguments)]
+async fn run_session(
+    args: &Args,
+    worker_id: &mut Option<WorkerId>,
+    class: &mut WorkerClass,
+    current: &mut Option<RunningJob>,
+    outbox: &mut Vec<(u64, WorkerToCp)>,
+    seq: &Seq,
+    job_tx: &mpsc::UnboundedSender<WorkerToCp>,
+    job_rx: &mut mpsc::UnboundedReceiver<WorkerToCp>,
     self_drain_at: Option<tokio::time::Instant>,
-) -> Result<WorkerId> {
+) -> Result<()> {
     // REST origin for input fetch and output upload, derived from the same host
     // we dial the websocket on.
-    let origin = httpclient::origin_from_ws_url(url)?;
-    let (socket, _response) = connect_async(url).await.context("connecting")?;
+    let origin = httpclient::origin_from_ws_url(&args.url)?;
+    let (socket, _response) = connect_async(args.url.as_str()).await.context("connecting")?;
     let (mut sink, mut stream) = socket.split();
 
-    // On reconnect we present the retained id (with nothing to replay: M1 has no
-    // spool, and the prior child was killed on disconnect); first join sends no
-    // resume at all.
-    let resume = worker_id.map(|id| Resume {
-        worker_id: id,
-        running_jobs: Vec::new(),
-        high_water: 0,
+    // Present the retained identity on reconnect: the job still running and the
+    // highest seq we have produced, so the control plane resynchronises instead
+    // of requeuing or double-assigning. A first join has no identity yet and
+    // sends no resume at all.
+    let resume = worker_id.as_ref().map(|id| Resume {
+        worker_id: id.clone(),
+        running_jobs: current
+            .as_ref()
+            .filter(|running| !running.is_finished())
+            .map(|running| running.job_id().clone())
+            .into_iter()
+            .collect(),
+        high_water: outbox.last().map(|(s, _)| *s).unwrap_or(SEQ_ORIGIN),
     });
+
+    let labels: Vec<String> = args
+        .labels
+        .split(LABEL_SEPARATOR)
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // A leased/spot host may be reclaimed under the worker at any time.
+    let preemptible = args.lease_min.is_some();
     let hello = WorkerToCp::Hello {
         protocol_version: PROTOCOL_VERSION,
         worker_semver: env!("CARGO_PKG_VERSION").into(),
         target_triple: target_triple(),
-        token: token.to_owned(),
-        capabilities: capabilities::detect(labels, preemptible).await,
+        token: args.token.clone(),
+        capabilities: capabilities::detect(&labels, preemptible).await,
         resume,
     };
     sink.send(to_frame(&hello)?).await.context("sending hello")?;
 
-    let worker_id = match next_message(&mut stream).await {
+    let resumed_high_water = match next_message(&mut stream).await {
         Some(CpToWorker::HelloAck {
-            worker_id,
-            class,
+            worker_id: assigned,
+            class: assigned_class,
             telemetry,
             wall_deadline,
+            resumed_high_water,
+            ..
         }) => {
-            // Telemetry sampling and the wall clock are accepted here; wiring
-            // the system-telemetry sampler is a later milestone.
-            info!(worker = %worker_id, ?class, ?telemetry, ?wall_deadline, "hello acknowledged");
-            worker_id
+            // Telemetry sampling and the wall clock are accepted here; wiring the
+            // system-telemetry sampler is a later milestone. The class decides
+            // whether a future disconnect abandons the job; the high water tells
+            // us where to resume the replay.
+            info!(
+                worker = %assigned, ?assigned_class, ?telemetry, ?wall_deadline,
+                resumed_high_water, "hello acknowledged"
+            );
+            *worker_id = Some(assigned);
+            *class = assigned_class;
+            resumed_high_water
         }
         Some(CpToWorker::HelloReject {
             reason,
@@ -189,22 +264,33 @@ async fn session(
         other => anyhow::bail!("unexpected handshake response: {other:?}"),
     };
 
-    // One sequence counter per session; every streamed WorkerToCp draws from it.
-    let seq = Seq::new();
-    // Job tasks talk back through this channel; the select loop owns the sink.
-    let (tx, mut outbound) = mpsc::unbounded_channel::<WorkerToCp>();
+    // Drain, trim, and replay before the loop so the control plane sees every
+    // event exactly once (chuk-compute M3.2):
+    //   1. sweep up events the executor produced while we were disconnected,
+    //   2. drop those the control plane has already applied,
+    //   3. resend the rest; a failed send means the fresh socket is already gone,
+    //      so bail and let the next session retry.
+    while let Ok(event) = job_rx.try_recv() {
+        outbox.push((event_seq(&event), event));
+    }
+    trim_to_high_water(outbox, resumed_high_water);
+    for (_, event) in outbox.iter() {
+        if sink.send(to_frame(event)?).await.is_err() {
+            return Ok(());
+        }
+    }
+
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Current job slot; aborting the handle kills the child (kill_on_drop).
-    let mut current: Option<RunningJob> = None;
     // Once draining, take no new work and report Drained.
     let mut draining = false;
 
-    let session_result = loop {
+    loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                // Liveness carries no seq and is never outboxed or replayed.
                 if sink.send(to_frame(&WorkerToCp::Heartbeat)?).await.is_err() {
-                    break Ok(());
+                    return Ok(());
                 }
             }
             // Self-drain belt: fire once at T-drain even if the control plane is
@@ -217,12 +303,19 @@ async fn session(
             }, if !draining => {
                 warn!("lease T-drain reached; self-draining");
                 draining = true;
-                let _ = tx.send(WorkerToCp::Drained);
+                // Drained is a lifecycle signal (no seq); send it straight to the
+                // socket, not through the outbox.
+                if sink.send(to_frame(&WorkerToCp::Drained)?).await.is_err() {
+                    return Ok(());
+                }
             }
-            msg = outbound.recv() => {
-                let msg = msg.expect("tx lives in this scope");
-                if sink.send(to_frame(&msg)?).await.is_err() {
-                    break Ok(());
+            // An event the executor produced: record it for replay, then stream
+            // it. On a send error it stays in the outbox for the next session.
+            event = job_rx.recv() => {
+                let event = event.expect("job_tx is held by main for the worker's lifetime");
+                outbox.push((event_seq(&event), event.clone()));
+                if sink.send(to_frame(&event)?).await.is_err() {
+                    return Ok(());
                 }
             }
             inbound = next_message(&mut stream) => match inbound {
@@ -231,54 +324,50 @@ async fn session(
                         warn!(job = %job.id, "assign received while draining; ignoring");
                         continue;
                     }
-                    if current.as_ref().is_some_and(|j| !j.is_finished()) {
+                    if current.as_ref().is_some_and(|running| !running.is_finished()) {
                         // The control plane never double-assigns; if it does,
                         // refuse loudly rather than corrupt the slot.
                         warn!(job = %job.id, "assign received while busy; ignoring");
                         continue;
                     }
                     info!(job = %job.id, "assigned");
-                    current = Some(executor::spawn(job, tx.clone(), seq.clone(), origin.clone()));
+                    // A new job starts a fresh outbox; the previous job's events
+                    // are done and must never replay against this one.
+                    outbox.clear();
+                    *current = Some(executor::spawn(job, job_tx.clone(), seq.clone(), origin.clone()));
                 }
                 Some(CpToWorker::Cancel { job_id }) => {
                     if let Some(job) = current.take() {
                         info!(job = %job_id, "cancelling");
                         let killed = job.job_id().clone();
                         job.abort();
-                        let msg = WorkerToCp::JobKilled {
+                        // Aborting drops the executor future silently, so we emit
+                        // the terminal event ourselves — routed through the
+                        // executor channel so it is outboxed and replayable like
+                        // any streamed event, and stamped from the shared counter.
+                        let _ = job_tx.send(WorkerToCp::JobKilled {
                             seq: seq.next(),
                             job_id: killed,
                             reason: KillReason::Cancel,
-                        };
-                        if sink.send(to_frame(&msg)?).await.is_err() {
-                            break Ok(());
-                        }
+                        });
                     }
                 }
                 Some(CpToWorker::Drain { deadline }) => {
                     info!(deadline, "drain requested by control plane");
                     draining = true;
-                    let _ = tx.send(WorkerToCp::Drained);
+                    if sink.send(to_frame(&WorkerToCp::Drained)?).await.is_err() {
+                        return Ok(());
+                    }
                 }
                 Some(other) => {
                     // HelloAck/HelloReject mid-session, or a variant a newer
                     // control plane introduced: tolerate and ignore.
                     warn!(?other, "unexpected control message mid-session; ignoring");
                 }
-                None => break Ok(()),
+                None => return Ok(()),
             },
         }
-    };
-
-    // Session over: kill any in-flight job so our state matches the control
-    // plane's (it requeues the job on disconnect).
-    if let Some(job) = current.take() {
-        if !job.is_finished() {
-            warn!("session dropped mid-job; killing child (control plane requeues)");
-        }
-        job.abort();
     }
-    session_result.map(|_| worker_id)
 }
 
 async fn next_message(

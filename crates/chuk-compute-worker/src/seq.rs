@@ -1,13 +1,16 @@
-//! The per-session sequence counter. Every streamed `WorkerToCp` that carries a
-//! `seq` field draws the next value from one shared counter, so the control
-//! plane can order and deduplicate a worker's stream against a high-water mark.
+//! The worker-lifetime sequence counter. Created once and cloned into every job,
+//! so every streamed `WorkerToCp` that carries a `seq` field draws the next value
+//! from one shared counter that stays monotonic across reconnects — letting the
+//! control plane order and deduplicate a worker's stream against a high-water
+//! mark, even when a reconnecting session replays it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// A cheaply-cloneable handle to one session's monotonic sequence counter. Each
+/// A cheaply-cloneable handle to the worker's monotonic sequence counter. Each
 /// clone shares the same underlying atomic, so sequence numbers stay unique and
-/// monotonic across every task that streams on behalf of the session.
+/// monotonic across every task that streams on behalf of the worker, across
+/// every job, and across reconnects.
 #[derive(Clone, Default)]
 pub struct Seq(Arc<AtomicU64>);
 

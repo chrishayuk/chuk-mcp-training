@@ -65,6 +65,7 @@ async fn session(state: Arc<AppState>, socket: WebSocket) {
         class,
         telemetry: wire::TelemetryConfig::default(),
         wall_deadline: None,
+        resumed_high_water: state.hub.resume_high_water(&worker_id),
     };
     if send(&mut sink, &ack).await.is_err() {
         return;
@@ -96,7 +97,7 @@ async fn session(state: Arc<AppState>, socket: WebSocket) {
     }
 
     info!(worker = %worker_id, "session ended");
-    if let Err(error) = state.hub.detach(&worker_id).await {
+    if let Err(error) = state.hub.detach(&worker_id, class).await {
         warn!(worker = %worker_id, %error, "detach failed");
     }
 }

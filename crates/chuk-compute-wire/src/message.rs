@@ -101,6 +101,12 @@ pub enum CpToWorker {
         /// Wall deadline for a leased worker; absent for a persistent one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wall_deadline: Option<UnixSeconds>,
+        /// The highest streamed-event `seq` the control plane has already
+        /// processed for this worker. On a reconnect the worker replays only its
+        /// outbox events *after* this, so nothing is double-processed; `0` on a
+        /// fresh join (spec §3, §8).
+        #[serde(default)]
+        resumed_high_water: u64,
     },
     /// Handshake refused. `min_protocol` plus the binary `url`/`sha256` let a
     /// self-updating worker fetch a compatible build.
@@ -281,6 +287,7 @@ mod tests {
                 class: WorkerClass::Leased,
                 telemetry: TelemetryConfig::default(),
                 wall_deadline: Some(1_700_000_000.0),
+                resumed_high_water: 42,
             },
             CpToWorker::HelloReject {
                 reason: "protocol too old".into(),
@@ -324,11 +331,15 @@ mod tests {
     fn hello_ack_defaults_telemetry_when_absent() {
         let json = r#"{"type":"hello_ack","worker_id":"w1","class":"persistent"}"#;
         let msg: CpToWorker = serde_json::from_str(json).unwrap();
-        let CpToWorker::HelloAck { class, telemetry, wall_deadline, .. } = msg else {
+        let CpToWorker::HelloAck {
+            class, telemetry, wall_deadline, resumed_high_water, ..
+        } = msg
+        else {
             panic!("expected hello_ack");
         };
         assert_eq!(class, WorkerClass::Persistent);
         assert_eq!(telemetry, TelemetryConfig::default());
         assert!(wall_deadline.is_none()); // persistent workers have no wall
+        assert_eq!(resumed_high_water, 0); // absent → fresh join
     }
 }
