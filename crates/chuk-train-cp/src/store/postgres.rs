@@ -20,7 +20,7 @@ use chuk_train_proto::{
     ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
     CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
     MetricPoint, MetricSeries, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary,
-    UnixSeconds, User, WorkerId, WorkerInfo, WorkerState,
+    UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTokenInfo,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -151,7 +151,18 @@ CREATE TABLE IF NOT EXISTS api_keys (
   last_used_at double precision,
   revoked_at   double precision
 );
+CREATE TABLE IF NOT EXISTS worker_tokens (
+  id           text PRIMARY KEY,
+  worker_id    text NOT NULL,
+  name         text NOT NULL,
+  prefix       text NOT NULL,
+  token_hash   text NOT NULL,
+  created_at   double precision NOT NULL,
+  last_used_at double precision,
+  revoked_at   double precision
+);
 CREATE INDEX IF NOT EXISTS idx_apikeys_hash ON api_keys (key_hash);
+CREATE INDEX IF NOT EXISTS idx_worker_tokens_hash ON worker_tokens (token_hash);
 CREATE INDEX IF NOT EXISTS idx_runs_state   ON runs (state, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_run   ON run_events (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_metrics_run  ON metrics (run_id, key, step);
@@ -904,6 +915,72 @@ impl Store for PgStore {
             .await?;
         Ok(())
     }
+
+    // ---- worker tokens ----------------------------------------------------
+
+    async fn create_worker_token(
+        &self,
+        id: &str,
+        worker_id: &WorkerId,
+        name: &str,
+        prefix: &str,
+        token_hash: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO worker_tokens (id, worker_id, name, prefix, token_hash, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(&worker_id.0)
+        .bind(name)
+        .bind(prefix)
+        .bind(token_hash)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn resolve_worker_token(&self, token_hash: &str) -> Result<Option<WorkerTokenInfo>> {
+        let row = sqlx::query(
+            "SELECT id, worker_id, name, prefix, created_at, last_used_at, revoked_at
+             FROM worker_tokens WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| worker_token_from_row(&r)).transpose()
+    }
+
+    async fn list_worker_tokens(&self) -> Result<Vec<WorkerTokenInfo>> {
+        let rows = sqlx::query(
+            "SELECT id, worker_id, name, prefix, created_at, last_used_at, revoked_at
+             FROM worker_tokens ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(worker_token_from_row).collect()
+    }
+
+    async fn revoke_worker_token(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE worker_tokens SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn touch_worker_token(&self, id: &str, at: UnixSeconds) -> Result<()> {
+        sqlx::query("UPDATE worker_tokens SET last_used_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 fn api_key_from_row(row: &PgRow) -> Result<ApiKeyInfo> {
@@ -914,6 +991,18 @@ fn api_key_from_row(row: &PgRow) -> Result<ApiKeyInfo> {
         name: row.get("name"),
         prefix: row.get("prefix"),
         role: enum_from_string(row.get::<String, _>("role"))?,
+        created_at: row.get("created_at"),
+        last_used_at: row.get("last_used_at"),
+        revoked_at: row.get("revoked_at"),
+    })
+}
+
+fn worker_token_from_row(row: &PgRow) -> Result<WorkerTokenInfo> {
+    Ok(WorkerTokenInfo {
+        id: row.get("id"),
+        worker_id: WorkerId(row.get("worker_id")),
+        name: row.get("name"),
+        prefix: row.get("prefix"),
         created_at: row.get("created_at"),
         last_used_at: row.get("last_used_at"),
         revoked_at: row.get("revoked_at"),

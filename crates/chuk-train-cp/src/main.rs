@@ -195,6 +195,11 @@ async fn main() -> Result<()> {
         .route("/users/{email}", delete(api::remove_user))
         .route("/apikeys", get(api::list_api_keys).post(api::create_api_key))
         .route("/apikeys/{id}", delete(api::revoke_api_key))
+        .route(
+            "/worker_tokens",
+            get(api::list_worker_tokens).post(api::create_worker_token),
+        )
+        .route("/worker_tokens/{id}", delete(api::revoke_worker_token))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             api::require_bearer,

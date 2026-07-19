@@ -5,24 +5,34 @@
 //! A bearer token is resolved to an [`AuthContext`] (role + team) by hashing it
 //! and looking the hash up in `api_keys` (or matching the legacy master token).
 
-use chuk_train_proto::{Role, API_KEY_PREFIX};
+use chuk_train_proto::{Role, API_KEY_PREFIX, WORKER_TOKEN_PREFIX};
 use sha2::{Digest, Sha256};
 
-/// Chars of the plaintext kept as the human-readable display prefix
-/// (`ck_` + 8), enough to recognise a key but not to use it.
-const DISPLAY_PREFIX_LEN: usize = 3 + 8;
-
-/// Generate a new key: `(plaintext, display_prefix, sha256_hex_hash)`.
-pub fn generate() -> (String, String, String) {
+/// Generate a token of `<prefix><random>`, returning
+/// `(plaintext, display_prefix, sha256_hex_hash)`. The display prefix keeps the
+/// scheme prefix plus 8 chars of the random tail — enough to recognise a token
+/// but not to use it.
+fn generate_with_prefix(prefix: &str) -> (String, String, String) {
     let random = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    let plaintext = format!("{API_KEY_PREFIX}{random}");
-    let prefix = plaintext[..DISPLAY_PREFIX_LEN].to_owned();
+    let plaintext = format!("{prefix}{random}");
+    let display_prefix = plaintext[..prefix.len() + 8].to_owned();
     let hash = hash_token(&plaintext);
-    (plaintext, prefix, hash)
+    (plaintext, display_prefix, hash)
+}
+
+/// Generate a new MCP API key: `(plaintext, display_prefix, sha256_hex_hash)`.
+pub fn generate() -> (String, String, String) {
+    generate_with_prefix(API_KEY_PREFIX)
+}
+
+/// Generate a new persistent worker token (chuk-compute M3.1):
+/// `(plaintext, display_prefix, sha256_hex_hash)`.
+pub fn generate_worker_token() -> (String, String, String) {
+    generate_with_prefix(WORKER_TOKEN_PREFIX)
 }
 
 /// The sha256 hex of a bearer token — what's stored and looked up.
@@ -46,5 +56,28 @@ impl AuthContext {
     /// True if this context meets a minimum role.
     pub fn may(&self, min: Role) -> bool {
         self.role >= min
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_carries_its_prefix_and_round_trips() {
+        let (plaintext, prefix, hash) = generate();
+        assert!(plaintext.starts_with(API_KEY_PREFIX));
+        assert_eq!(prefix, plaintext[..API_KEY_PREFIX.len() + 8]);
+        assert_eq!(hash, hash_token(&plaintext));
+    }
+
+    #[test]
+    fn worker_token_carries_its_prefix_and_round_trips() {
+        let (plaintext, prefix, hash) = generate_worker_token();
+        assert!(plaintext.starts_with(WORKER_TOKEN_PREFIX));
+        assert!(prefix.starts_with(WORKER_TOKEN_PREFIX));
+        assert_eq!(prefix.len(), WORKER_TOKEN_PREFIX.len() + 8);
+        // The stored hash is the sha256 of the plaintext shown once at creation.
+        assert_eq!(hash, hash_token(&plaintext));
     }
 }

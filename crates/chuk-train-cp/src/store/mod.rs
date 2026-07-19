@@ -18,7 +18,7 @@ use chuk_train_proto::{
     ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
     CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
     MetricSeries, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary, UnixSeconds,
-    User, WorkerId, WorkerInfo,
+    User, WorkerId, WorkerInfo, WorkerTokenInfo,
 };
 
 pub use postgres::PgStore;
@@ -184,6 +184,25 @@ pub trait Store: Send + Sync {
     /// Resolve a bearer key by its sha256 hash to its (non-revoked) info.
     async fn resolve_api_key(&self, key_hash: &str) -> Result<Option<ApiKeyInfo>>;
     async fn touch_api_key(&self, id: &str, at: UnixSeconds) -> Result<()>;
+
+    // persistent worker tokens (chuk-compute M3.1) — infrastructure tokens that
+    // bind a self-enrolling persistent worker to a stable worker id. Only the
+    // sha256 hash is stored, never the plaintext. Separate from api_keys.
+    async fn create_worker_token(
+        &self,
+        id: &str,
+        worker_id: &WorkerId,
+        name: &str,
+        prefix: &str,
+        token_hash: &str,
+    ) -> Result<()>;
+    /// Resolve a worker token by its sha256 hash to its (non-revoked) info.
+    async fn resolve_worker_token(&self, token_hash: &str) -> Result<Option<WorkerTokenInfo>>;
+    /// All worker tokens, newest first.
+    async fn list_worker_tokens(&self) -> Result<Vec<WorkerTokenInfo>>;
+    /// Revoke a token by id; returns false if there was no such live token.
+    async fn revoke_worker_token(&self, id: &str) -> Result<bool>;
+    async fn touch_worker_token(&self, id: &str, at: UnixSeconds) -> Result<()>;
 }
 
 /// Open a store from a URL-ish spec: `postgres:`/`postgresql:` → Postgres

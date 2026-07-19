@@ -5,7 +5,10 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chuk_train_proto::{ApiKeyInfo, CreateApiKeyRequest, CreatedApiKey, Role};
+use chuk_train_proto::{
+    ApiKeyInfo, CreateApiKeyRequest, CreateWorkerTokenRequest, CreatedApiKey, CreatedWorkerToken,
+    Role, WorkerId, WorkerTokenInfo,
+};
 use serde::Deserialize;
 
 use super::{bad_request, forbidden, internal, not_found, now, require_role};
@@ -158,6 +161,84 @@ pub async fn revoke_api_key(
         return forbidden("you can only revoke keys you created");
     }
     match state.hub.store.revoke_api_key(&id).await {
+        Ok(true) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => not_found(),
+        Err(error) => internal(error),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent worker tokens (chuk-compute M3.1) — admin-scoped infrastructure.
+// Unlike api_keys (self-service user/MCP keys), these enrol a persistent worker
+// and bind it to a stable worker id, so minting/listing/revoking is Admin-only.
+// ---------------------------------------------------------------------------
+
+pub async fn list_worker_tokens(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Admin) {
+        return resp;
+    }
+    match state.hub.store.list_worker_tokens().await {
+        Ok(tokens) => Json(tokens).into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+pub async fn create_worker_token(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Json(request): Json<CreateWorkerTokenRequest>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Admin) {
+        return resp;
+    }
+    let name = request.name.trim().to_owned();
+    if name.is_empty() {
+        return bad_request("worker token name required");
+    }
+    let (plaintext, prefix, hash) = apikey::generate_worker_token();
+    // Stable worker id minted at creation time; the persistent worker resolves
+    // it at websocket join (handled separately in ws.rs).
+    let worker_id = WorkerId(format!(
+        "w-{}",
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
+    ));
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    if let Err(error) = state
+        .hub
+        .store
+        .create_worker_token(&id, &worker_id, &name, &prefix, &hash)
+        .await
+    {
+        return internal(error);
+    }
+    let info = WorkerTokenInfo {
+        id,
+        worker_id,
+        name,
+        prefix,
+        created_at: now(),
+        last_used_at: None,
+        revoked_at: None,
+    };
+    Json(CreatedWorkerToken {
+        token: plaintext,
+        info,
+    })
+    .into_response()
+}
+
+pub async fn revoke_worker_token(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Admin) {
+        return resp;
+    }
+    match state.hub.store.revoke_worker_token(&id).await {
         Ok(true) => Json(serde_json::json!({ "ok": true })).into_response(),
         Ok(false) => not_found(),
         Err(error) => internal(error),

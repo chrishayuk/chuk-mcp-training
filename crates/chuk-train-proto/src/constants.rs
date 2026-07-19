@@ -98,6 +98,9 @@ pub const DEFAULT_TEAM_ID: &str = "default";
 pub const DEFAULT_TEAM_NAME: &str = "Default";
 /// Prefix on generated MCP API keys, so they're recognisable.
 pub const API_KEY_PREFIX: &str = "ck_";
+/// Prefix on generated persistent worker tokens (chuk-compute M3.1), so they're
+/// recognisable and distinct from `ck_` user/MCP keys.
+pub const WORKER_TOKEN_PREFIX: &str = "cw_";
 
 /// chuk-experiments-server reporting mirror (spec §11.6) — the default
 /// programme/experiment harness runs report into. Optional and gated: the whole

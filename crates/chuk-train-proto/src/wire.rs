@@ -171,6 +171,37 @@ pub struct CreatedApiKey {
     pub info: ApiKeyInfo,
 }
 
+/// A persistent worker token's metadata for display (chuk-compute M3.1) —
+/// **never** the hash or plaintext (the plaintext is shown once at creation via
+/// [`CreatedWorkerToken`]). Bound to a stable `worker_id` minted at creation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkerTokenInfo {
+    pub id: String,
+    pub worker_id: WorkerId,
+    pub name: String,
+    /// Short display prefix (e.g. `cw_a1b2c3d4`); enough to recognise, not use.
+    pub prefix: String,
+    pub created_at: UnixSeconds,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<UnixSeconds>,
+}
+
+/// Request to mint a new persistent worker token (admin-scoped infrastructure).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateWorkerTokenRequest {
+    pub name: String,
+}
+
+/// The one-time response with the plaintext worker token — shown once, never
+/// stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreatedWorkerToken {
+    pub token: String,
+    pub info: WorkerTokenInfo,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MetricPoint {
     pub step: u64,

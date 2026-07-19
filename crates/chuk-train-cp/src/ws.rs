@@ -14,13 +14,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::apikey;
 use crate::AppState;
 
 const WORKER_ID_PREFIX: &str = "w-";
 const REJECT_BAD_TOKEN: &str = "bad join token";
 const REJECT_NOT_HELLO: &str = "first message must be hello";
-/// M1 serves a single worker class; the persistent class arrives at M3.
-const M1_WORKER_CLASS: wire::WorkerClass = wire::WorkerClass::Leased;
 const BYTES_PER_MB: u64 = 1_048_576;
 
 pub async fn agent_ws(State(state): State<Arc<AppState>>, upgrade: WebSocketUpgrade) -> Response {
@@ -32,26 +31,21 @@ async fn session(state: Arc<AppState>, socket: WebSocket) {
 
     // Phase 1: handshake, bounded by REGISTER_TIMEOUT.
     let handshake = tokio::time::timeout(REGISTER_TIMEOUT, next_worker_message(&mut stream)).await;
-    let (worker_id, labels, hardware) = match handshake {
+    let (worker_id, class, labels, hardware) = match handshake {
         Ok(Some(wire::WorkerToCp::Hello {
             token,
             capabilities,
             resume,
             ..
         })) => {
-            if token != state.config.join_token {
+            let Some((worker_id, class)) = resolve_join(&state, &token, resume).await else {
                 warn!("worker presented a bad join token");
                 let _ = send(&mut sink, &reject(REJECT_BAD_TOKEN)).await;
                 return;
-            }
-            // The wire and control-plane WorkerId are distinct types (different
-            // crates); convert across the boundary.
-            let worker_id = resume
-                .map(|r| WorkerId(r.worker_id.0))
-                .unwrap_or_else(|| WorkerId(format!("{WORKER_ID_PREFIX}{}", short_id())));
+            };
             let labels = labels_of(&capabilities);
             let hardware = hardware_of(&capabilities);
-            (worker_id, labels, hardware)
+            (worker_id, class, labels, hardware)
         }
         Ok(Some(_)) => {
             let _ = send(&mut sink, &reject(REJECT_NOT_HELLO)).await;
@@ -68,7 +62,7 @@ async fn session(state: Arc<AppState>, socket: WebSocket) {
     let (tx, mut rx) = mpsc::unbounded_channel::<wire::CpToWorker>();
     let ack = wire::CpToWorker::HelloAck {
         worker_id: wire::WorkerId::from(worker_id.0.clone()),
-        class: M1_WORKER_CLASS,
+        class,
         telemetry: wire::TelemetryConfig::default(),
         wall_deadline: None,
     };
@@ -114,6 +108,41 @@ fn reject(reason: &str) -> wire::CpToWorker {
         url: None,
         sha256: None,
     }
+}
+
+/// Resolve a `Hello` token to `(worker id, class)`, or `None` for a bad token.
+/// The shared join token enrols a fresh **leased** worker; a **persistent**
+/// worker token (spec §5, M3) resolves to its bound, stable id — so the machine
+/// keeps the same identity across reconnects and restarts.
+async fn resolve_join(
+    state: &AppState,
+    token: &str,
+    resume: Option<wire::Resume>,
+) -> Option<(WorkerId, wire::WorkerClass)> {
+    if token == state.config.join_token {
+        // The wire and control-plane WorkerId are distinct types; convert across.
+        let worker_id = resume
+            .map(|r| WorkerId(r.worker_id.0))
+            .unwrap_or_else(|| WorkerId(format!("{WORKER_ID_PREFIX}{}", short_id())));
+        return Some((worker_id, wire::WorkerClass::Leased));
+    }
+    if let Ok(Some(info)) = state
+        .hub
+        .store
+        .resolve_worker_token(&apikey::hash_token(token))
+        .await
+    {
+        let _ = state.hub.store.touch_worker_token(&info.id, now()).await;
+        return Some((info.worker_id, wire::WorkerClass::Persistent));
+    }
+    None
+}
+
+fn now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs_f64()
 }
 
 /// Flatten the worker's label map into the control plane's `k=v` / bare-`k` list.
