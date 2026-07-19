@@ -374,6 +374,14 @@ Watchdogs are gates with `action="stop_run"`: `isnan(last(loss))`,
 
 ## 7. Agent protocol
 
+> **Being reworked → `chuk-compute-spec.md`.** The worker daemon + wire protocol are being
+> extracted into a compute-generic substrate (crates `chuk-compute-wire` + `chuk-compute-worker`):
+> the daemon is a **worker** (not "agent"), the workload model generalizes to batch-vs-service,
+> and per-run `sys/*` telemetry + a persistent (BYO/Mac) worker class are folded in. This section
+> describes today's implementation; the target design and its M1–M7 sequencing live in
+> `chuk-compute-spec.md`, with §12 there fixing the experiment-vs-service boundary against the
+> agent/MCP deployment platform.
+
 Single outbound WSS; JSON messages; per-worker monotonic sequence numbers; reconnect
 replays from last acked seq. **The agent must tolerate a dark control plane**: if the
 websocket drops, it keeps executing the current job, keeps checkpointing on schedule,

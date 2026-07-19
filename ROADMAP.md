@@ -89,40 +89,45 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 A gap analysis of the built system, ranked within each group by value-to-effort. The
 highest-value quick wins are already promoted into *Immediate next steps* above.
 
-**Portable "join anywhere" agent harness + run telemetry (direction, 2026-07-19)**
+**chuk-compute: worker & wire substrate (direction, 2026-07-19) — see
+`docs/specs/chuk-compute-spec.md`**
 
-The agent should be a standard harness that runs identically on Colab, Vast, a Mac, or any
-box, and should capture rich system telemetry per run — not just the trainer's app metrics.
+The join-anywhere worker + per-run telemetry directions are folded into a larger reframe: the
+rig is a **compute fabric**, not a training system. Two new crates form a permanently
+compute-generic substrate under the training-first control plane — `chuk-compute-wire`
+(serde-only protocol) + `chuk-compute-worker` (join-anywhere daemon). Naming discipline: the
+daemon is a **worker**, never an "agent" (reserved for LLM/agentic workloads that run *on* the
+fabric); the word "train" must never appear in the wire or worker crate (a lexical CI grep can
+enforce it). The workload model is batch-vs-service — one `service: Option<ServiceSpec>` +
+`needs`/campaigns admits evals, benches, cells, agents, and RL loops with **zero new wire
+messages**; training stays the product, every other workload earns its place by serving the
+training loop. §12 fixes the experiment-vs-service rule and the CP-fork tripwires so the
+agent/MCP-deployment platform never colonizes the rig. Sequencing (spec §11):
 
-- **Multi-target agent builds + target-aware download** (M) — the download path is a single
-  hardcoded `/agent/linux-x86_64` (`crates/chuk-train-proto/src/constants.rs:15`). Build and
-  serve `/agent/{os}-{arch}` for `linux-x86_64`, `linux-aarch64`, `darwin-arm64`,
-  `darwin-x86_64` so a Mac (or ARM box) can join. Prereq for "run on my Mac."
-- **One detect-and-install bootstrap** (S–M) — a single `curl … | sh` installer that detects
-  OS+arch, pulls the matching binary, and runs `agent --join <token>`. Unify today's
-  per-environment paths: the Colab cell (`bootstrap/colab_cell.py`) and the Vast-specific
-  onstart string templating (`crates/chuk-train-cp/src/provider/vast.rs:21`) both become thin
-  wrappers over it; Mac + any Linux box use it directly. (Composes with "generalized provider
-  bootstrap" below.)
-- **BYO / persistent worker class** (M) — the lease model assumes provider-provisioned,
-  wall-enforced, **destroyable** instances (`crates/chuk-train-cp/src/lease.rs`). A Mac or a
-  box you own is different: a long-lived join, **no lease wall, no teardown**, marked
-  non-preemptible. Add a persistent worker class the CP never tries to destroy (and a
-  long-lived join-token class for it — pairs with the single-use-token item, which stays for
-  leased workers). This is the real "run on my Mac, whenever" capability.
-- **Richer capability registration** (S–M) — `Hardware` is thin today (host/os/gpu/vram_mb/
-  driver, `crates/chuk-train-proto/src/domain.rs`). Add cpu_cores, ram_gb, arch, accelerator
-  kind (`cuda`/`mps`/`cpu`), and preemptible/persistent flags, so the scheduler can match jobs
-  (feeds *Requirements-aware assignment* and packing).
-- **Per-run system telemetry** (M, high value) — the agent detects the GPU once at register
-  via `nvidia-smi` (`crates/chuk-train-agent/src/hardware.rs`) but never samples during a run.
-  Add a periodic sampler streaming a `sys/*` metric namespace over the existing `Metric` wire
-  channel: GPU util % / mem used+total / temp / power / SM clock (nvidia-smi→NVML), CPU util /
-  RAM / disk+net I/O (sysinfo/procfs), and per-process (trainer PID) CPU+RAM. Flows into the
-  existing metrics store → dashboard utilization curves → experiments-server. Feeds the
-  packing utilization metric, watchdog gates (GPU-mem OOM, thermal throttle), and MFU/efficiency
-  (tokens_per_s vs GPU util). Turns a training dashboard into an ops dashboard. *(Apple-Silicon
-  GPU telemetry is best-effort — `powermetrics` needs sudo; treat MPS util as a known gap.)*
+- **M1 — extract the substrate** — `chuk-compute-wire` + `chuk-compute-worker` with the `Hello`
+  handshake + batch jobs, single-target build, **behaviour parity with today**. (Renames the
+  worker; retires the `train`-named paths in the wire/worker layer.)
+- **M2 — target matrix + bootstrap** — build `x86_64`/`aarch64` musl + `aarch64-apple-darwin`;
+  serve `/agent/{os}-{arch}` + `.sha256` + `/agent/version`; one `install.sh` (rustup-style)
+  the Colab cell and Vast onstart wrap. Retires the hardcoded `/agent/linux-x86_64`.
+- **M3 — persistent worker class** — long-lived revocable tokens, reconnect-with-resume, metric
+  spool/replay against a high-water mark, hand-rolled self-update; **the Mac joins** (no wall,
+  no teardown — `WorkerClass` an enum so destroying a persistent worker is unrepresentable).
+- **M4 — `sys/*` telemetry sampler** — one sampler task over the existing Metric channel: NVML
+  (`nvml-wrapper`, runtime-loaded) + `sysinfo` first; macmon/IOReport MPS once the Mac is on
+  (tier-2 best-effort, gaps as absent metrics not zeros). Feeds packing-util, OOM/thermal gates, MFU.
+- **M5 — service jobs** — `ServiceSpec` + registry + `needs` wiring + `Secret` env refs;
+  LARQL-on-Mac as the first service, cell-runtime second.
+- **M6 — campaigns + budgets** — `submit_campaign(template, matrix)` fan-out with CP-side spend
+  budgets enforced at submit; the bench template's pinning gate (digest/seed in-spec).
+- **M7 — first RL composition** — controller job + rollout campaign + cell-signed scoring
+  against an existing train template. No new wire; RL is a composition.
+
+Local enforcement stays worker-side (setsid process groups, SIGTERM→grace→SIGKILL, `kill_on_drop`,
+wall enforced even with the control link down). Each milestone independently shippable, each proven
+by a real workload (v11-scale run, tokenizer_bench campaign, broker eval). This **supersedes** the
+individual "portable agent / telemetry" bullets; the related quick-win *Single-use join tokens* and
+candidate *Requirements-aware assignment* / *generalized bootstrap* items feed into M2/M3.
 
 **Spec gaps beyond the milestone headers**
 - **Requirements-aware assignment** (S–M) — `pump()` assigns the oldest queued run to any
