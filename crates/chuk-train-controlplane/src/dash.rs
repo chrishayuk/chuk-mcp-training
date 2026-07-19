@@ -134,6 +134,17 @@ td .name{font-weight:600} .empty{color:var(--muted);padding:.9rem;font-size:.86r
 .sysrow .bar .fill{height:100%;background:var(--accent);border-radius:4px;transition:width .4s ease}
 .sysrow .pv{min-width:2.6rem;text-align:right}
 .grid2{display:grid;grid-template-columns:1.35fr 1fr;gap:1rem;align-items:start}
+.tabs{display:flex;gap:.15rem;margin:1.1rem 0;border-bottom:1px solid var(--ring)}
+.tab{background:transparent;border:0;border-bottom:2px solid transparent;color:var(--muted);padding:.55rem .9rem;font:inherit;font-size:.85rem;cursor:pointer;margin-bottom:-1px}
+.tab:hover{color:var(--ink)}
+.tab.active{color:var(--ink);border-bottom-color:var(--accent)}
+.tabpanel{display:none}
+.tabpanel.active{display:block}
+.logs-tall{height:min(64vh,660px)}
+.sys-lg{padding:.5rem .3rem}
+.sys-lg .sysrow{grid-template-columns:4rem 1fr 170px;padding:.35rem 0}
+.sys-lg .spark{width:170px;height:24px}
+.sys-lg .bar{height:9px}
 @media (max-width:920px){.grid2{grid-template-columns:1fr}}
 .stack{display:flex;flex-direction:column;gap:1rem}
 .bar{height:.5rem;background:var(--surface2);border-radius:999px;overflow:hidden;border:1px solid var(--ring)}
@@ -324,29 +335,42 @@ function renderRunShell(run){
       </div>
       <div class="links">${links}</div>
       <div class="runacts">${runActions(run)}</div>
-    </div>
-    <div class="telem" id="telem"></div>`;
+    </div>`;
   const configCard=`<div class="card"><div class="hd"><h3>Config</h3></div>${configBody(run)}</div>`;
-  const body=isTrain?`
-    <div class="grid2">
-      <div class="stack">
+  const eventsCard=`<div class="card"><div class="hd"><h3>Events</h3></div><div class="tl" id="events"></div></div>`;
+  const ckptCard=`<div class="card"><div class="hd"><h3>Checkpoints</h3><span class="sp"></span><span class="tag" id="ckcount"></span></div><div id="cks"><div class="empty">—</div></div></div>`;
+  // Run detail is tabbed: a light Overview plus dedicated Training (train only),
+  // Logs, and System screens. Every panel is rendered so the refresh loop keeps
+  // filling them; showTab() just toggles which one is visible.
+  const tabs=[["overview","Overview"]]
+    .concat(isTrain?[["training","Training"]]:[])
+    .concat([["logs","Logs"],["system","System"]]);
+  const tabbar=`<div class="tabs">${tabs.map(([k,l],i)=>`<button class="tab${i?"":" active"}" data-tab="${k}" onclick="showTab('${k}')">${esc(l)}</button>`).join("")}</div>`;
+  const pOverview=`<div class="tabpanel active" data-panel="overview">
+      <div class="telem" id="telem"></div>
+      <div class="grid2"><div class="stack">${configCard}</div><div class="stack">${eventsCard}</div></div>
+    </div>`;
+  const pTraining=isTrain?`<div class="tabpanel" data-panel="training">
+      <div class="grid2"><div class="stack">
         <div class="card chartcard"><div class="hd"><h3>Metrics</h3><span class="sp"></span><div class="metricsel" id="msel"></div></div>
           <div class="body"><svg class="chart" id="chart" viewBox="0 0 720 210" preserveAspectRatio="none" role="img" aria-label="metric curve"></svg></div></div>
-        <div class="card"><div class="hd"><h3>Logs</h3><span class="sp"></span><span class="st ${run.state==='running'?'run':'mut'}" id="logstat">${run.state==='running'?'streaming':run.state}</span></div>
-          <div class="logs" id="logs"><div class="empty">loading…</div></div></div>
-      </div>
-      <div class="stack">
-        <div class="card"><div class="hd"><h3>System</h3><span class="sp"></span><span class="tag" id="sysage"></span></div><div class="sys" id="sys"><div class="empty">—</div></div></div>
-        ${configCard}
-        <div class="card"><div class="hd"><h3>Checkpoints</h3><span class="sp"></span><span class="tag" id="ckcount"></span></div><div id="cks"><div class="empty">—</div></div></div>
-        <div class="card"><div class="hd"><h3>Events</h3></div><div class="tl" id="events"></div></div>
-      </div>
-    </div>`:`
-    <div class="grid2"><div class="stack"><div class="card"><div class="hd"><h3>Logs</h3><span class="sp"></span><span class="st mut" id="logstat">${run.state}</span></div><div class="logs" id="logs"><div class="empty">loading…</div></div></div></div>
-      <div class="stack"><div class="card"><div class="hd"><h3>System</h3><span class="sp"></span><span class="tag" id="sysage"></span></div><div class="sys" id="sys"><div class="empty">—</div></div></div>${configCard}<div class="card"><div class="hd"><h3>Events</h3></div><div class="tl" id="events"></div></div></div></div>`;
-  $("#app").innerHTML=head+body;
+      </div><div class="stack">${ckptCard}</div></div>
+    </div>`:"";
+  const pLogs=`<div class="tabpanel" data-panel="logs">
+      <div class="card"><div class="hd"><h3>Logs</h3><span class="sp"></span><span class="st ${run.state==='running'?'run':'mut'}" id="logstat">${run.state==='running'?'streaming':run.state}</span></div>
+        <div class="logs logs-tall" id="logs"><div class="empty">loading…</div></div></div>
+    </div>`;
+  const pSystem=`<div class="tabpanel" data-panel="system">
+      <div class="card"><div class="hd"><h3>System</h3><span class="sp"></span><span class="tag" id="sysage"></span></div><div class="sys sys-lg" id="sys"><div class="empty">—</div></div></div>
+    </div>`;
+  $("#app").innerHTML=head+tabbar+pOverview+pTraining+pLogs+pSystem;
   window.scrollTo(0,0);
 }
+window.showTab=function(name){
+  document.querySelectorAll(".tabpanel").forEach(p=>p.classList.toggle("active",p.dataset.panel===name));
+  document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("active",b.dataset.tab===name));
+  if(name==="training")drawChart();
+};
 function configBody(run){
   const s=run.spec||{};
   if(s.kind==="train"){
