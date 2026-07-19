@@ -22,7 +22,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chuk_compute_wire::API_PREFIX;
@@ -41,6 +41,11 @@ use crate::store::Store;
 const LINK_KIND_WANDB: &str = "wandb";
 /// Artifact URI schemes the experiments-server accepts (else it 400s).
 const ACCEPTED_URI_SCHEMES: [&str; 4] = ["s3://", "gdrive://", "https://", "http://"];
+/// Max outbox rows retried per sweep tick.
+const OUTBOX_SWEEP_BATCH: i64 = 20;
+/// Retry backoff for a failed outbox event: `BASE * 2^attempts`, capped at MAX.
+const OUTBOX_BASE_BACKOFF_SECS: u64 = 30;
+const OUTBOX_MAX_BACKOFF_SECS: u64 = 3_600;
 
 /// Reporting client for one experiments-server + default programme/experiment.
 pub struct Experiments {
@@ -94,34 +99,163 @@ impl Experiments {
     }
 
     // ---- best-effort entrypoints (the hub spawns these) -------------------
+    //
+    // Each of these persists an outbox row before making the first delivery
+    // attempt, so a transient failure (network blip, experiments-server 5xx)
+    // is retried by `run_outbox_loop` instead of silently dropping the
+    // observation — the guarantee this module never blocks or fails a real
+    // run stays exactly as before; only "log a warning and forget" changes.
 
     /// Mirror a freshly-submitted run. Only **train** runs are reported; shell
     /// probes are skipped (and their later transitions no-op, having no id).
     /// With an `experiment_ref` we attach to that existing logical run; without
     /// one we create a fresh run on the experiments-server.
     pub async fn report_created(&self, run_id: RunId, spec: RunSpec, experiment_ref: Option<String>) {
-        let RunSpec::Train(train) = spec else { return };
-        let result = match experiment_ref {
-            Some(ext) => self.try_attach(&run_id, &train, &ext).await,
-            None => self.try_create(&run_id, &train).await,
-        };
-        if let Err(e) = result {
-            warn!(run = %run_id.0, error = %e, "experiments: report-created failed (mirror only)");
+        if !matches!(spec, RunSpec::Train(_)) {
+            return;
         }
+        self.enqueue_and_attempt(&run_id, OutboxEvent::Created { spec, experiment_ref })
+            .await;
     }
 
     /// Mirror a run state transition (running / terminal). No-op for a run that
-    /// was never mirrored (shell run, or the create is still in flight).
+    /// was never mirrored (shell run, or the create is still in flight — the
+    /// state event just waits in the outbox until the created event lands).
+    /// On `Completed`, also enqueues one durable `Result` event per final metric.
     pub async fn report_state(&self, run_id: RunId, state: RunState) {
-        if let Err(e) = self.try_state(&run_id, state).await {
-            warn!(run = %run_id.0, ?state, error = %e, "experiments: status report failed");
+        self.enqueue_and_attempt(&run_id, OutboxEvent::State { state }).await;
+        if matches!(state, RunState::Completed) {
+            match self.store.metric_series(&run_id, None, 0, 0).await {
+                Ok(series) => {
+                    for (name, points) in series.series {
+                        if let Some(last) = points.last() {
+                            self.enqueue_and_attempt(&run_id, OutboxEvent::Result { name, value: last.value })
+                                .await;
+                        }
+                    }
+                }
+                Err(e) => warn!(run = %run_id.0, error = %e, "experiments: reading final metrics failed"),
+            }
         }
     }
 
     /// Register an uploaded checkpoint as a `checkpoint` artifact.
     pub async fn report_checkpoint(&self, run_id: RunId, step: u64, uri: String, meta: CheckpointMeta) {
-        if let Err(e) = self.try_checkpoint(&run_id, step, &uri, &meta).await {
-            warn!(run = %run_id.0, step, error = %e, "experiments: checkpoint artifact failed");
+        self.enqueue_and_attempt(
+            &run_id,
+            OutboxEvent::Checkpoint { step, uri, meta: Box::new(meta) },
+        )
+        .await;
+    }
+
+    /// Persist an outbox row for `event`, then make one immediate delivery
+    /// attempt (keeps today's low-latency common case; a failure just leaves
+    /// the row for `run_outbox_loop` to retry).
+    async fn enqueue_and_attempt(&self, run_id: &RunId, event: OutboxEvent) {
+        let payload = match serde_json::to_string(&event) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(run = %run_id.0, error = %e, "experiments-outbox: serializing event failed");
+                return;
+            }
+        };
+        let id = match self
+            .store
+            .enqueue_outbox_event(run_id, event.kind_label(), &payload, now_secs())
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(run = %run_id.0, error = %e, "experiments-outbox: enqueue failed (event not durable)");
+                return;
+            }
+        };
+        self.attempt(id, run_id, event, 0).await;
+    }
+
+    /// Try delivering one outbox event. On success, marks it done; on failure,
+    /// records the error and reschedules it with backoff. `attempts_so_far` is
+    /// how many prior attempts already failed (0 for a fresh event), used to
+    /// compute how long to wait before the *next* attempt.
+    async fn attempt(&self, id: i64, run_id: &RunId, event: OutboxEvent, attempts_so_far: i64) -> bool {
+        let kind = event.kind_label();
+        let result = match event {
+            OutboxEvent::Created { spec, experiment_ref } => match spec {
+                RunSpec::Train(train) => match experiment_ref {
+                    Some(ext) => self.try_attach(run_id, &train, &ext).await,
+                    None => self.try_create(run_id, &train).await,
+                },
+                // Only Train specs are ever enqueued (see report_created); a
+                // stray non-Train row has nothing to deliver.
+                _ => Ok(()),
+            },
+            OutboxEvent::State { state } => self.try_state(run_id, state).await,
+            OutboxEvent::Checkpoint { step, uri, meta } => {
+                self.try_checkpoint(run_id, step, &uri, &meta).await
+            }
+            OutboxEvent::Result { name, value } => self.try_result(run_id, &name, value).await,
+        };
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.store.mark_outbox_event_done(id).await {
+                    warn!(id, error = %e, "experiments-outbox: marking event done failed");
+                }
+                true
+            }
+            Err(e) => {
+                let next_attempt_at = now_secs() + backoff_for(attempts_so_far).as_secs_f64();
+                warn!(
+                    run = %run_id.0, kind, attempts = attempts_so_far, error = %e,
+                    "experiments-outbox: attempt failed, will retry"
+                );
+                if let Err(store_err) = self
+                    .store
+                    .mark_outbox_event_failed(id, &e.to_string(), next_attempt_at)
+                    .await
+                {
+                    warn!(id, error = %store_err, "experiments-outbox: recording failure failed");
+                }
+                false
+            }
+        }
+    }
+
+    /// One pass over due outbox events, oldest first. Sequential (not
+    /// concurrent) so a run's later events never get retried ahead of its own
+    /// not-yet-delivered `created` event.
+    async fn sweep_outbox_once(&self) -> Result<usize> {
+        let due = self.store.due_outbox_events(now_secs(), OUTBOX_SWEEP_BATCH).await?;
+        let mut delivered = 0;
+        for row in due {
+            let event: OutboxEvent = match serde_json::from_str(&row.payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    // Can never be replayed successfully — drop it rather than
+                    // retry a parse error forever every sweep.
+                    warn!(id = row.id, error = %e, "experiments-outbox: corrupt payload, dropping");
+                    if let Err(e) = self.store.mark_outbox_event_done(row.id).await {
+                        warn!(id = row.id, error = %e, "experiments-outbox: dropping corrupt row failed");
+                    }
+                    continue;
+                }
+            };
+            if self.attempt(row.id, &row.run_id, event, row.attempts).await {
+                delivered += 1;
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// Runs for the life of the process, retrying undelivered outbox events.
+    pub async fn run_outbox_loop(self: Arc<Self>, interval: Duration) {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            match self.sweep_outbox_once().await {
+                Ok(n) if n > 0 => info!(delivered = n, "experiments-outbox sweep"),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "experiments-outbox sweep failed"),
+            }
         }
     }
 
@@ -207,9 +341,13 @@ impl Experiments {
         Ok(())
     }
 
+    /// `run_id` not yet mirrored (its `Created` event is still pending in the
+    /// outbox) is a **retryable failure** here, not a silent no-op — this event
+    /// will succeed on a later sweep once `Created` lands, so it must stay
+    /// pending rather than being marked delivered without ever being sent.
     async fn try_state(&self, run_id: &RunId, state: RunState) -> Result<()> {
         let Some(ext) = self.store.experiments_run_id(run_id).await? else {
-            return Ok(());
+            anyhow::bail!("run not yet mirrored (created event still pending)");
         };
         let Some(status) = map_status(state) else {
             return Ok(());
@@ -221,14 +359,7 @@ impl Experiments {
         } else if state.is_terminal() {
             body["ended_at"] = json!(stamp);
         }
-        self.patch_run(&ext, body).await?;
-        // Final metrics → results, on success only. Extra, so failures are swallowed.
-        if matches!(state, RunState::Completed) {
-            if let Err(e) = self.report_final_metrics(run_id, &ext).await {
-                warn!(run = %run_id.0, error = %e, "experiments: final metrics report failed");
-            }
-        }
-        Ok(())
+        self.patch_run(&ext, body).await
     }
 
     async fn try_checkpoint(
@@ -239,7 +370,7 @@ impl Experiments {
         meta: &CheckpointMeta,
     ) -> Result<()> {
         let Some(ext) = self.store.experiments_run_id(run_id).await? else {
-            return Ok(());
+            anyhow::bail!("run not yet mirrored (created event still pending)");
         };
         let Some(uri) = self.artifact_uri(run_id, step, recorded_uri) else {
             anyhow::bail!("no experiments-server-accepted uri for checkpoint (uri={recorded_uri})");
@@ -271,19 +402,21 @@ impl Experiments {
         Ok(())
     }
 
-    async fn report_final_metrics(&self, run_id: &RunId, ext: &str) -> Result<()> {
-        let series = self.store.metric_series(run_id, None, 0, 0).await?;
-        for (name, points) in series.series {
-            if let Some(last) = points.last() {
-                // Best-effort per metric; a failed result never blocks the rest.
-                let _ = self
-                    .http
-                    .post(format!("{}/v1/runs/{}/results", self.base, ext))
-                    .bearer_auth(&self.key)
-                    .json(&json!({ "name": name, "value": last.value }))
-                    .send()
-                    .await;
-            }
+    async fn try_result(&self, run_id: &RunId, name: &str, value: f64) -> Result<()> {
+        let Some(ext) = self.store.experiments_run_id(run_id).await? else {
+            anyhow::bail!("run not yet mirrored (created event still pending)");
+        };
+        let resp = self
+            .http
+            .post(format!("{}/v1/runs/{}/results", self.base, ext))
+            .bearer_auth(&self.key)
+            .json(&json!({ "name": name, "value": value }))
+            .send()
+            .await
+            .context("POST result")?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("submit result: {status} {}", body_of(resp).await);
         }
         Ok(())
     }
@@ -329,6 +462,43 @@ struct CreatedRun {
     id: String,
 }
 
+/// A durable, replayable mirror event. Stored as opaque serialized JSON in the
+/// outbox (the store layer never inspects it, same as `runs.spec`); deserialized
+/// back by `sweep_outbox_once` to retry a failed delivery.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OutboxEvent {
+    Created {
+        spec: RunSpec,
+        experiment_ref: Option<String>,
+    },
+    State {
+        state: RunState,
+    },
+    Checkpoint {
+        step: u64,
+        uri: String,
+        meta: Box<CheckpointMeta>,
+    },
+    Result {
+        name: String,
+        value: f64,
+    },
+}
+
+impl OutboxEvent {
+    /// Human-readable label stored alongside the payload (logging/debugging
+    /// only — dispatch always matches on the deserialized enum itself).
+    fn kind_label(&self) -> &'static str {
+        match self {
+            OutboxEvent::Created { .. } => "created",
+            OutboxEvent::State { .. } => "state",
+            OutboxEvent::Checkpoint { .. } => "checkpoint",
+            OutboxEvent::Result { .. } => "result",
+        }
+    }
+}
+
 /// The linkback body applied to the experiments-server run (whether freshly
 /// created or attached): our execution id as the correlation field, plus any
 /// Weights & Biases out-link declared on the run.
@@ -360,6 +530,16 @@ fn map_status(state: RunState) -> Option<&'static str> {
         RunState::Cancelled => Some("cancelled"),
         RunState::Queued | RunState::Assigned => None,
     }
+}
+
+/// Capped exponential backoff for the `attempts_so_far`-th retry: `30s * 2^n`,
+/// clamped to a 1h ceiling. No give-up cutoff — a permanently-misconfigured
+/// mirror just retries quietly at the ceiling forever, consistent with never
+/// silently losing an observation.
+fn backoff_for(attempts_so_far: i64) -> Duration {
+    let shift = attempts_so_far.clamp(0, 10) as u32; // 2^10 * 30s already exceeds the cap
+    let secs = OUTBOX_BASE_BACKOFF_SECS.saturating_mul(1u64 << shift);
+    Duration::from_secs(secs.min(OUTBOX_MAX_BACKOFF_SECS))
 }
 
 fn now_secs() -> f64 {
@@ -420,6 +600,16 @@ mod tests {
         assert_eq!(map_status(RunState::Assigned), None);
     }
 
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(backoff_for(0), Duration::from_secs(30));
+        assert_eq!(backoff_for(1), Duration::from_secs(60));
+        assert_eq!(backoff_for(2), Duration::from_secs(120));
+        // Caps at 1h well before the shift could overflow.
+        assert_eq!(backoff_for(20), Duration::from_secs(3_600));
+        assert_eq!(backoff_for(-1), Duration::from_secs(30)); // clamps negative to 0
+    }
+
     fn train_with_links(links: Value) -> TrainSpec {
         serde_json::from_value(json!({
             "code": { "name": "gpt-nano", "sha": "abc123" },
@@ -450,5 +640,75 @@ mod tests {
         let patch = linkback_patch(&run, &train);
         assert_eq!(patch["harness_session_id"], json!(run.0));
         assert!(patch.get("wandb_url").is_none());
+    }
+}
+
+/// Live proof that the outbox actually recovers from a real failure, not just
+/// a simulated one. Ignored by default; run in isolation (it mutates the
+/// process-wide `CHUK_EXPERIMENTS_URL` env var) against a real local
+/// chuk-experiments-server:
+///   CHUK_EXPERIMENTS_URL=http://localhost:8123 CHUK_EXPERIMENTS_API_KEY=<a real write key> \
+///   cargo test -p chuk-train-controlplane experiments::live::outbox_recovers_after_experiments_server_was_unreachable -- --ignored --nocapture
+#[cfg(test)]
+mod live {
+    use super::*;
+    use crate::store::SqliteStore;
+
+    #[ignore]
+    #[tokio::test]
+    async fn outbox_recovers_after_experiments_server_was_unreachable() {
+        let base = std::env::var(env::EXPERIMENTS_URL).unwrap_or_default();
+        let key = std::env::var(env::EXPERIMENTS_API_KEY).unwrap_or_default();
+        if base.is_empty() || key.is_empty() {
+            eprintln!(
+                "skip: need {} + {} pointed at a real local chuk-experiments-server",
+                env::EXPERIMENTS_URL,
+                env::EXPERIMENTS_API_KEY
+            );
+            return;
+        }
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open(":memory:").await.expect("store"));
+        let train: TrainSpec = serde_json::from_value(json!({
+            "code": { "name": "outbox-smoke-test", "sha": "0000000000000000000000000000000000000000" },
+            "entrypoint": "true",
+        }))
+        .expect("valid TrainSpec");
+        let spec = RunSpec::Train(Box::new(train));
+        // A real `runs` row, exactly as Hub::submit creates before mirroring —
+        // set_experiments_run_id later needs a matching row to update.
+        let run_id = store.create_run("outbox-smoke-test", &spec, None).await.expect("create_run");
+
+        // Phase 1: nothing listens here -- the create must fail and land
+        // durably in the outbox rather than being silently dropped.
+        std::env::set_var(env::EXPERIMENTS_URL, "http://127.0.0.1:1");
+        let down = Experiments::from_env(store.clone(), "http://localhost:9").expect("down client");
+        down.report_created(run_id.clone(), spec, None).await;
+
+        assert!(
+            store.experiments_run_id(&run_id).await.unwrap().is_none(),
+            "must not be marked mirrored -- the create never actually landed"
+        );
+        let pending = store
+            .due_outbox_events(now_secs() + 3_700.0, 10) // past the max backoff, just to introspect the row
+            .await
+            .expect("due");
+        assert_eq!(pending.len(), 1, "the failed create must be sitting in the outbox, not lost");
+        assert_eq!(pending[0].attempts, 1);
+
+        // Phase 2: replay it against a client pointed at the real, healthy
+        // server -- proves the *outbox row*, not the client, is what makes
+        // this durable (a fresh client + the same store recovers it).
+        std::env::set_var(env::EXPERIMENTS_URL, &base);
+        let up = Experiments::from_env(store.clone(), "http://localhost:9").expect("up client");
+        let event: OutboxEvent = serde_json::from_str(&pending[0].payload).expect("payload");
+        let delivered = up.attempt(pending[0].id, &run_id, event, pending[0].attempts).await;
+        assert!(delivered, "retry against the real, now-healthy server must succeed");
+        assert!(
+            store.experiments_run_id(&run_id).await.unwrap().is_some(),
+            "now genuinely mirrored on the real server"
+        );
+
+        std::env::remove_var(env::EXPERIMENTS_URL); // don't leak into other tests
     }
 }

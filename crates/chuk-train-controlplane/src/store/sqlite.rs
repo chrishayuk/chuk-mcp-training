@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use chuk_train_proto::{
     ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
     CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
-    MetricPoint, MetricSeries, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary,
-    UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTokenInfo,
+    MetricPoint, MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec, RunState,
+    RunSummary, UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTokenInfo,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -145,6 +145,17 @@ CREATE TABLE IF NOT EXISTS counters (
   name         TEXT PRIMARY KEY,
   value        INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS experiments_outbox (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id           TEXT NOT NULL,
+  kind             TEXT NOT NULL,
+  payload          TEXT NOT NULL,
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  last_error       TEXT,
+  created_at       REAL NOT NULL,
+  next_attempt_at  REAL NOT NULL,
+  completed_at     REAL
+);
 CREATE INDEX IF NOT EXISTS idx_apikeys_hash ON api_keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_worker_tokens_hash ON worker_tokens (token_hash);
 CREATE INDEX IF NOT EXISTS idx_runs_state   ON runs (state, created_at);
@@ -152,6 +163,7 @@ CREATE INDEX IF NOT EXISTS idx_events_run   ON run_events (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_metrics_run  ON metrics (run_id, key, step);
 CREATE INDEX IF NOT EXISTS idx_ckpt_run     ON checkpoints (run_id, step);
 CREATE INDEX IF NOT EXISTS idx_leases_state ON leases (state);
+CREATE INDEX IF NOT EXISTS idx_outbox_due   ON experiments_outbox (next_attempt_at) WHERE completed_at IS NULL;
 "#;
 
 pub struct SqliteStore {
@@ -297,6 +309,78 @@ impl Store for SqliteStore {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("experiments_run_id")))
+    }
+
+    async fn enqueue_outbox_event(
+        &self,
+        run_id: &RunId,
+        kind: &str,
+        payload: &str,
+        at: UnixSeconds,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            "INSERT INTO experiments_outbox (run_id, kind, payload, created_at, next_attempt_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             RETURNING id",
+        )
+        .bind(&run_id.0)
+        .bind(kind)
+        .bind(payload)
+        .bind(at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("id"))
+    }
+
+    async fn due_outbox_events(&self, at: UnixSeconds, limit: i64) -> Result<Vec<OutboxRow>> {
+        let rows = sqlx::query(
+            "SELECT id, run_id, kind, payload, attempts FROM experiments_outbox
+             WHERE completed_at IS NULL AND next_attempt_at <= ?1
+             ORDER BY created_at ASC
+             LIMIT ?2",
+        )
+        .bind(at)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| OutboxRow {
+                id: r.get::<i64, _>("id"),
+                run_id: RunId(r.get::<String, _>("run_id")),
+                kind: r.get::<String, _>("kind"),
+                payload: r.get::<String, _>("payload"),
+                attempts: r.get::<i64, _>("attempts"),
+            })
+            .collect())
+    }
+
+    async fn mark_outbox_event_done(&self, id: i64) -> Result<()> {
+        sqlx::query("UPDATE experiments_outbox SET completed_at = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_outbox_event_failed(
+        &self,
+        id: i64,
+        error: &str,
+        next_attempt_at: UnixSeconds,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE experiments_outbox
+             SET attempts = attempts + 1, last_error = ?2, next_attempt_at = ?3
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(error)
+        .bind(next_attempt_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn create_run(
@@ -1116,5 +1200,53 @@ mod tests {
         );
         let scratch = store.run(&scratch).await.expect("run").expect("some");
         assert_eq!(scratch.summary.experiment_ref, None);
+    }
+
+    #[tokio::test]
+    async fn outbox_event_becomes_due_then_done() {
+        let store = mem_store().await;
+        let run_id = store.create_run("r", &shell_spec(), None).await.expect("create");
+        let at = now();
+        let id = store
+            .enqueue_outbox_event(&run_id, "state", "{}", at)
+            .await
+            .expect("enqueue");
+
+        let due = store.due_outbox_events(at, 10).await.expect("due");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id);
+        assert_eq!(due[0].run_id, run_id);
+        assert_eq!(due[0].kind, "state");
+        assert_eq!(due[0].attempts, 0);
+
+        store.mark_outbox_event_done(id).await.expect("mark done");
+        let due = store.due_outbox_events(at, 10).await.expect("due after done");
+        assert!(due.is_empty(), "a completed event must not be retried");
+    }
+
+    #[tokio::test]
+    async fn failed_outbox_event_waits_for_its_scheduled_retry_time() {
+        let store = mem_store().await;
+        let run_id = store.create_run("r", &shell_spec(), None).await.expect("create");
+        let at = now();
+        let id = store
+            .enqueue_outbox_event(&run_id, "state", "{}", at)
+            .await
+            .expect("enqueue");
+
+        store
+            .mark_outbox_event_failed(id, "boom", at + 3_600.0)
+            .await
+            .expect("mark failed");
+
+        let due = store.due_outbox_events(at, 10).await.expect("due before backoff elapses");
+        assert!(due.is_empty(), "must not retry before next_attempt_at");
+
+        let due = store
+            .due_outbox_events(at + 3_600.0, 10)
+            .await
+            .expect("due once backoff elapses");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].attempts, 1, "a failed attempt must be recorded");
     }
 }

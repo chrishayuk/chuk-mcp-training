@@ -125,12 +125,17 @@ async fn main() -> Result<()> {
         "experiments-server reporting mirror"
     );
     if let Some(exp) = experiments.clone() {
+        let ensure_exp = exp.clone();
         tokio::spawn(async move {
-            match exp.ensure().await {
+            match ensure_exp.ensure().await {
                 Ok(()) => info!("experiments-server: default experiment ready"),
                 Err(e) => warn!(error = %e, "experiments-server ensure failed (mirror retries lazily)"),
             }
         });
+        // Retries any mirror event (created/state/checkpoint/result) that
+        // failed on first attempt, so a transient failure never silently
+        // drops an observation.
+        tokio::spawn(exp.run_outbox_loop(chuk_train_proto::DEFAULT_EXPERIMENTS_OUTBOX_INTERVAL));
     }
     let hub = Hub::new(store, artifacts.clone(), experiments);
     // Archive/retention: when Drive is configured, a background loop tiers each

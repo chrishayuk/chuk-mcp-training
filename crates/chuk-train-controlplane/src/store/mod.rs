@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use chuk_train_proto::{
     ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
     CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
-    MetricSeries, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary, UnixSeconds,
-    User, WorkerId, WorkerInfo, WorkerTokenInfo,
+    MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary,
+    UnixSeconds, User, WorkerId, WorkerInfo, WorkerTokenInfo,
 };
 
 pub use postgres::PgStore;
@@ -61,6 +61,32 @@ pub trait Store: Send + Sync {
     async fn set_experiments_run_id(&self, run_id: &RunId, ext_run_id: &str) -> Result<()>;
     /// The mirrored experiments-server run id, or `None` if not mirrored.
     async fn experiments_run_id(&self, run_id: &RunId) -> Result<Option<String>>;
+
+    // experiments-server reporting outbox — durable retry of mirror events
+    // (report_created/report_state/report_checkpoint/final-metric reports)
+    // that failed on first attempt.
+    /// Persist a pending mirror event, due immediately. Returns its row id.
+    async fn enqueue_outbox_event(
+        &self,
+        run_id: &RunId,
+        kind: &str,
+        payload: &str,
+        at: UnixSeconds,
+    ) -> Result<i64>;
+    /// Undelivered events whose `next_attempt_at` has passed, oldest first —
+    /// processing order matters: a run's later events (state/checkpoint/result)
+    /// must not be retried ahead of its own not-yet-delivered `created` event.
+    async fn due_outbox_events(&self, at: UnixSeconds, limit: i64) -> Result<Vec<OutboxRow>>;
+    /// Mark an event delivered; it's excluded from future sweeps.
+    async fn mark_outbox_event_done(&self, id: i64) -> Result<()>;
+    /// Record a failed attempt and reschedule it (caller computes backoff).
+    async fn mark_outbox_event_failed(
+        &self,
+        id: i64,
+        error: &str,
+        next_attempt_at: UnixSeconds,
+    ) -> Result<()>;
+
     async fn transition(
         &self,
         run_id: &RunId,

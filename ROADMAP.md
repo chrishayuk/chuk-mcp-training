@@ -206,9 +206,18 @@ unmistakable — the harness reports **observations, never conclusions**.*
   instead of minting a second run. `submit_run` (REST + MCP) takes `experiment_ref`; a shell probe
   is always unattached. *Still open (rec #3):* making the reference **required** on formal training
   jobs (vs the current opt-in), with an explicit scratch-run mode.
-- **Durable reporting outbox** (S–M) — see the item above under *operational hardening*; the review
-  independently flags the fire-and-forget mirror as the thing to fix so completed metrics/artifacts
-  eventually land instead of being lost on a transient error. Do this one.
+- **Durable reporting outbox** ✅ *done (2026-07-19).* Every mirror event (create/state/checkpoint/
+  final-metric) is now persisted to a new `experiments_outbox` table (both SQLite and Postgres)
+  before the first delivery attempt, instead of the old `tokio::spawn`-and-forget-on-failure shape.
+  A failed attempt is recorded (`attempts`, `last_error`) and rescheduled with capped exponential
+  backoff (30s → 1h ceiling, no give-up cutoff); `run_outbox_loop` sweeps due events every 30s.
+  Real correctness fix along the way: a `state`/`checkpoint`/`result` event for a run whose `created`
+  event hadn't landed yet used to silently no-op (`Ok(())`) — now it's a retryable failure, so it
+  waits for `created` to land instead of being marked delivered without ever being sent. Verified
+  live against a real local chuk-experiments-server (`experiments::live::
+  outbox_recovers_after_experiments_server_was_unreachable`, `--ignored`): points a client at an
+  unreachable address, confirms the event lands in the outbox instead of being lost, then replays it
+  against a client pointed at the real server and confirms it's genuinely delivered.
 - **Required experiment reference on formal jobs** (S) — a `submit_run` for a formal experiment
   must carry an experiments-server experiment/run reference; keep an explicit *unattached scratch
   run* mode for quick probes.

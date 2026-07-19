@@ -79,6 +79,19 @@ pub struct RunEvent {
     pub detail: serde_json::Value,
 }
 
+/// A pending or previously-failed experiments-server mirror event, as read back
+/// from the outbox for retry. `payload` is opaque serialized JSON (an
+/// `experiments::OutboxEvent`) — the store never needs to know its shape, only
+/// `kind` (a human-readable label for logging) and `run_id` (which run it's for).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutboxRow {
+    pub id: i64,
+    pub run_id: RunId,
+    pub kind: String,
+    pub payload: String,
+    pub attempts: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogsResponse {
     pub run_id: RunId,

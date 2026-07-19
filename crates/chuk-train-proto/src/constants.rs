@@ -86,6 +86,9 @@ pub const DESTROY_VERIFY_POLL: Duration = Duration::from_secs(2);
 /// How often the archive/retention sweep runs — it promptly tiers newly
 /// completed runs to Drive and backstops any a prior pass missed (spec §11.5).
 pub const DEFAULT_ARCHIVE_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the experiments-server reporting outbox retries undelivered
+/// events (created/state/checkpoint/result reports that failed on first try).
+pub const DEFAULT_EXPERIMENTS_OUTBOX_INTERVAL: Duration = Duration::from_secs(30);
 /// Days after which R2 lifecycle expires hot (ckpt-hot) checkpoints, and the
 /// promoted final (ckpt-final) copies. The hot window is the error-recovery
 /// grace; the final window is a warm cache since Drive holds the canonical copy.
