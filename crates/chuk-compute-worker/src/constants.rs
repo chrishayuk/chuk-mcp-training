@@ -19,6 +19,11 @@ pub const DEFAULT_DRAIN_WINDOW_MIN: f64 = 5.0;
 /// upload while a job runs.
 pub const OUTPUT_SCAN_INTERVAL: Duration = Duration::from_secs(3);
 
+/// How often the worker samples host telemetry (GPU/CPU/memory) and streams it
+/// as a `sys/*` metric. Fast enough to feel live on a dashboard, slow enough to
+/// stay negligible against the heartbeat and job event traffic.
+pub const SYS_SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
+
 /// Synthetic exit code recorded when the worker failed to spawn or supervise
 /// the process at all.
 pub const EXIT_CODE_AGENT_ERROR: i64 = -1;

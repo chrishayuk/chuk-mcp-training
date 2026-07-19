@@ -31,6 +31,7 @@ mod procio;
 mod sandbox;
 mod selfupdate;
 mod seq;
+mod telemetry;
 
 use std::time::Duration;
 
@@ -48,7 +49,7 @@ use tracing::{error, info, warn};
 use crate::backoff::with_jitter;
 use crate::constants::{
     DEFAULT_DRAIN_WINDOW_MIN, EXIT_CODE_REJECTED, HEARTBEAT_INTERVAL, RECONNECT_BACKOFF_MAX,
-    RECONNECT_BACKOFF_MIN,
+    RECONNECT_BACKOFF_MIN, SYS_SAMPLE_INTERVAL,
 };
 use crate::executor::RunningJob;
 use crate::outbox::{event_seq, trim_to_high_water, SEQ_ORIGIN};
@@ -333,6 +334,12 @@ async fn run_session(
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Host telemetry (chuk-compute M4): sample GPU/CPU/memory and stream it as a
+    // `sys/*` metric. Like the heartbeat it is latest-value data, so it is sent
+    // straight to the socket, never outboxed or replayed.
+    let mut sampler = telemetry::Sampler::new();
+    let mut sample = tokio::time::interval(SYS_SAMPLE_INTERVAL);
+    sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Once draining, take no new work and report Drained.
     let mut draining = false;
 
@@ -342,6 +349,25 @@ async fn run_session(
                 // Liveness carries no seq and is never outboxed or replayed.
                 if sink.send(to_frame(&WorkerToCp::Heartbeat)?).await.is_err() {
                     return Ok(());
+                }
+            }
+            _ = sample.tick() => {
+                let values = sampler.sample().await;
+                if !values.is_empty() {
+                    // Host telemetry is out-of-band from the job event stream: no
+                    // job_id/step, seq 0, sent straight to the socket (never
+                    // outboxed). It must NOT share the job seq counter — a sample
+                    // racing a job event to the socket could otherwise bump the
+                    // control plane's high-water and make it drop that event.
+                    let msg = WorkerToCp::Metric {
+                        seq: 0,
+                        job_id: None,
+                        step: None,
+                        values,
+                    };
+                    if sink.send(to_frame(&msg)?).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
             // Self-drain belt: fire once at T-drain even if the control plane is
