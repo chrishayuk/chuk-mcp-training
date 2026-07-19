@@ -200,6 +200,36 @@ pub async fn stop_run(
     }
 }
 
+#[derive(Deserialize)]
+pub struct SubmitFromExperimentParams {
+    name: Option<String>,
+}
+
+/// `POST /runs/from-experiment/{run_id}` — submit a train run built entirely
+/// from an existing chuk-experiments-server run's own `config`/`workspec`
+/// (spec §11.6 push mode): `run_id` is that run's `RUN-…` id, fetched over
+/// REST and mapped straight to a `TrainSpec`, then submitted attached to it —
+/// no client-side re-specification of the training job. Optional `?name=`
+/// overrides the harness run's display name (defaults to `run_id`).
+pub async fn submit_run_from_experiment(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Path(run_id): Path<String>,
+    Query(params): Query<SubmitFromExperimentParams>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Write) {
+        return resp;
+    }
+    match state
+        .hub
+        .submit_from_experiment(&run_id, params.name.as_deref(), Some(&ctx.owner_email))
+        .await
+    {
+        Ok(run_id) => Json(SubmitRunResponse { run_id }).into_response(),
+        Err(error) => bad_request(&error.to_string()),
+    }
+}
+
 /// `POST /runs/{id}/resume` — re-queue a terminal run; a train run resumes from
 /// its latest checkpoint on reassignment.
 pub async fn resume_run(

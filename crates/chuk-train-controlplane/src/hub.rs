@@ -552,6 +552,40 @@ impl Hub {
         Ok(run_id)
     }
 
+    /// Submit a train run built entirely from an existing chuk-experiments-server
+    /// run's own `config`/`workspec` — the "push" half of the experiments-server
+    /// integration (spec §11.6): create an experiment + run there, then point it
+    /// here instead of re-specifying the same `TrainSpec` by hand. Delegates to
+    /// [`Self::submit`] with `experiment_ref` already set, so it attaches to
+    /// `experiment_run_id` rather than minting a duplicate (same guarantee as a
+    /// manual `submit(..., experiment_ref: Some(_))` call).
+    pub async fn submit_from_experiment(
+        &self,
+        experiment_run_id: &str,
+        name: Option<&str>,
+        created_by: Option<&str>,
+    ) -> Result<RunId> {
+        let exp = self
+            .experiments
+            .as_ref()
+            .context("chuk-experiments-server mirror not configured")?;
+        let snapshot = exp.fetch_run(experiment_run_id, created_by).await?;
+        anyhow::ensure!(
+            snapshot.harness_session_id.is_none(),
+            "run {experiment_run_id} is already attached to a harness execution ({})",
+            snapshot.harness_session_id.as_deref().unwrap_or_default()
+        );
+        anyhow::ensure!(
+            snapshot.status == "queued",
+            "run {experiment_run_id} is not queued (status={})",
+            snapshot.status
+        );
+        let spec = crate::experiments::train_spec_from_experiments_run(&snapshot)?;
+        let name = name.unwrap_or(experiment_run_id);
+        self.submit(name, &RunSpec::Train(Box::new(spec)), Some(experiment_run_id), created_by)
+            .await
+    }
+
     /// Cancel a run. A running/assigned run with a still-connected worker is
     /// signalled (`Cancel` → the worker stops the process and reports
     /// `JobKilled{Cancel}`, which lands the run in `Cancelled`); a queued run, or
@@ -752,6 +786,18 @@ mod tests {
 
     fn shell_run() -> RunSpec {
         RunSpec::Shell(ShellSpec { command: "sleep 1".into(), timeout_s: 60 })
+    }
+
+    #[tokio::test]
+    async fn submit_from_experiment_errors_when_mirror_not_configured() {
+        // test_hub() builds with experiments: None — the only guard testable
+        // without a real chuk-experiments-server to fetch a run from.
+        let hub = test_hub().await;
+        let err = hub
+            .submit_from_experiment("RUN-20260718-160217-00397", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not configured"), "unexpected error: {err}");
     }
 
     #[tokio::test]

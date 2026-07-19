@@ -103,26 +103,37 @@ impl Experiments {
         }))
     }
 
-    /// Resolve which bearer token to use for this run's mirror calls: the
-    /// submitting user's own linked chuk-experiments-server key if they have
-    /// one (and it decrypts cleanly), else the shared default. Never fails —
-    /// any missing link in the chain (per-user-key feature off, no owner, no
+    /// Resolve which bearer token to use for chuk-experiments-server calls
+    /// made on `email`'s behalf: their own linked key if they have one (and
+    /// it decrypts cleanly), else the shared default. Never fails — any
+    /// missing link in the chain (per-user-key feature off, no email, no
     /// linked key, bad ciphertext) falls back silently, same principle as the
     /// rest of this module: the mirror never blocks or fails a run over this.
-    async fn bearer_for(&self, run_id: &RunId) -> String {
+    async fn bearer_for_email(&self, email: Option<&str>) -> String {
         let Some(key_encryption_key) = &self.key_encryption_key else {
             return self.key.clone();
         };
-        let Ok(Some(run)) = self.store.run(run_id).await else {
+        let Some(email) = email else {
             return self.key.clone();
         };
-        let Some(email) = run.summary.created_by else {
-            return self.key.clone();
-        };
-        let Ok(Some(encrypted)) = self.store.user_experiments_key(&email).await else {
+        let Ok(Some(encrypted)) = self.store.user_experiments_key(email).await else {
             return self.key.clone();
         };
         crate::crypto::decrypt(key_encryption_key, &encrypted).unwrap_or_else(|_| self.key.clone())
+    }
+
+    /// Resolve the bearer token for a run already known to our store, by
+    /// looking up its `created_by` email first. See [`Self::bearer_for_email`],
+    /// which also covers the personal-key-feature-off short circuit; this
+    /// wrapper additionally skips the store lookup in that same case.
+    async fn bearer_for(&self, run_id: &RunId) -> String {
+        if self.key_encryption_key.is_none() {
+            return self.key.clone();
+        }
+        let Ok(Some(run)) = self.store.run(run_id).await else {
+            return self.key.clone();
+        };
+        self.bearer_for_email(run.summary.created_by.as_deref()).await
     }
 
     // ---- best-effort entrypoints (the hub spawns these) -------------------
@@ -316,6 +327,28 @@ impl Experiments {
         }
     }
 
+    /// Fetch a chuk-experiments-server run's own record — used by
+    /// `Hub::submit_from_experiment` to build a `TrainSpec` straight from its
+    /// `config`/`workspec` rather than requiring the caller to re-specify the
+    /// training job by hand. `created_by` resolves the bearer token the same
+    /// way the outbound reports do (the submitting user's own linked key,
+    /// falling back to the shared default) — see [`Self::bearer_for_email`].
+    pub async fn fetch_run(&self, ext_id: &str, created_by: Option<&str>) -> Result<ExperimentsRunSnapshot> {
+        let token = self.bearer_for_email(created_by).await;
+        let resp = self
+            .http
+            .get(format!("{}/v1/runs/{}", self.base, ext_id))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("GET run")?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("fetch run: {status} {}", body_of(resp).await);
+        }
+        resp.json().await.context("parse run")
+    }
+
     // ---- the actual reports ------------------------------------------------
 
     async fn try_create(&self, run_id: &RunId, train: &TrainSpec) -> Result<()> {
@@ -497,6 +530,22 @@ struct CreatedRun {
     id: String,
 }
 
+/// The subset of a chuk-experiments-server run record needed to submit it as
+/// a harness execution (`Hub::submit_from_experiment`). Deliberately narrow —
+/// not the server's full `Run` shape — and tolerant of unknown fields.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ExperimentsRunSnapshot {
+    pub status: String,
+    #[serde(default)]
+    pub config: Value,
+    #[serde(default)]
+    pub workspec: Value,
+    #[serde(default)]
+    pub budget_seconds: Option<u64>,
+    #[serde(default)]
+    pub harness_session_id: Option<String>,
+}
+
 /// A durable, replayable mirror event. Stored as opaque serialized JSON in the
 /// outbox (the store layer never inspects it, same as `runs.spec`); deserialized
 /// back by `sweep_outbox_once` to retry a failed delivery.
@@ -548,6 +597,59 @@ fn linkback_patch(run_id: &RunId, train: &TrainSpec) -> Value {
         patch["wandb_url"] = json!(url);
     }
     patch
+}
+
+/// Build a `TrainSpec` from a chuk-experiments-server run, for
+/// `Hub::submit_from_experiment`. Prefers `config` — the richer shape
+/// `try_create` itself writes (`entrypoint`, `config_path`, `overrides`,
+/// `seed`, `arch`, `code.{name,sha}`) — falling back to `workspec` (which only
+/// ever carries `entrypoint`/`code`, per `RunCreate`'s "everything a harness
+/// worker needs, no other context" contract) when `config` doesn't have them.
+/// Errors clearly rather than submitting a half-built spec.
+pub(crate) fn train_spec_from_experiments_run(run: &ExperimentsRunSnapshot) -> Result<TrainSpec> {
+    let entrypoint = run
+        .config
+        .get("entrypoint")
+        .and_then(Value::as_str)
+        .or_else(|| run.workspec.get("entrypoint").and_then(Value::as_str))
+        .context("run has no entrypoint in config or workspec")?;
+
+    let code = run
+        .config
+        .get("code")
+        .filter(|c| !c.is_null())
+        .or_else(|| run.workspec.get("code"))
+        .context("run has no code reference in config or workspec")?;
+    let code_name = code
+        .get("name")
+        .and_then(Value::as_str)
+        .context("run's code reference has no name")?;
+    let code_sha = code
+        .get("sha")
+        .and_then(Value::as_str)
+        .context("run's code reference has no sha")?;
+
+    let mut spec = json!({
+        "code": { "name": code_name, "sha": code_sha },
+        "entrypoint": entrypoint,
+    });
+    if let Some(v) = run.config.get("config_path").filter(|v| !v.is_null()) {
+        spec["config"] = v.clone();
+    }
+    if let Some(v) = run.config.get("overrides").filter(|v| !v.is_null()) {
+        spec["overrides"] = v.clone();
+    }
+    if let Some(v) = run.config.get("seed").filter(|v| !v.is_null()) {
+        spec["seed"] = v.clone();
+    }
+    if let Some(v) = run.config.get("arch").filter(|v| !v.is_null()) {
+        spec["arch"] = v.clone();
+    }
+    if let Some(secs) = run.budget_seconds {
+        spec["timeout_s"] = json!(secs);
+    }
+
+    serde_json::from_value(spec).context("building TrainSpec from experiments-server run")
 }
 
 /// Read a response body for an error message, tolerating a read failure.
@@ -675,6 +777,71 @@ mod tests {
         let patch = linkback_patch(&run, &train);
         assert_eq!(patch["harness_session_id"], json!(run.0));
         assert!(patch.get("wandb_url").is_none());
+    }
+
+    fn snapshot(config: Value, workspec: Value, budget_seconds: Option<u64>) -> ExperimentsRunSnapshot {
+        ExperimentsRunSnapshot {
+            status: "queued".into(),
+            config,
+            workspec,
+            budget_seconds,
+            harness_session_id: None,
+        }
+    }
+
+    #[test]
+    fn train_spec_builds_from_the_richer_config_shape() {
+        let run = snapshot(
+            json!({
+                "entrypoint": "train",
+                "config_path": "configs/base.yaml",
+                "overrides": { "lr": 0.001 },
+                "seed": 42,
+                "arch": "gpt-nano",
+                "code": { "name": "tok-v12", "sha": "abc123" },
+            }),
+            json!({}),
+            Some(3600),
+        );
+        let spec = train_spec_from_experiments_run(&run).expect("valid spec");
+        assert_eq!(spec.entrypoint, "train");
+        assert_eq!(spec.config.as_deref(), Some("configs/base.yaml"));
+        assert_eq!(spec.overrides, json!({ "lr": 0.001 }));
+        assert_eq!(spec.seed, Some(42));
+        assert_eq!(spec.arch.as_deref(), Some("gpt-nano"));
+        assert_eq!(spec.code.name, "tok-v12");
+        assert_eq!(spec.code.sha, "abc123");
+        assert_eq!(spec.timeout_s, 3600);
+    }
+
+    #[test]
+    fn train_spec_falls_back_to_workspec_entrypoint_and_code() {
+        // config empty ({}), like a run enqueued by hand with only workspec set.
+        let run = snapshot(
+            json!({}),
+            json!({ "entrypoint": "train", "code": { "name": "tok-v12", "sha": "abc123" } }),
+            None,
+        );
+        let spec = train_spec_from_experiments_run(&run).expect("valid spec");
+        assert_eq!(spec.entrypoint, "train");
+        assert_eq!(spec.code.name, "tok-v12");
+        assert_eq!(spec.code.sha, "abc123");
+        assert!(spec.config.is_none());
+        assert!(spec.seed.is_none());
+    }
+
+    #[test]
+    fn train_spec_errors_when_entrypoint_missing_everywhere() {
+        let run = snapshot(json!({}), json!({}), None);
+        let err = train_spec_from_experiments_run(&run).unwrap_err();
+        assert!(err.to_string().contains("entrypoint"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn train_spec_errors_when_code_reference_missing() {
+        let run = snapshot(json!({ "entrypoint": "train" }), json!({}), None);
+        let err = train_spec_from_experiments_run(&run).unwrap_err();
+        assert!(err.to_string().contains("code reference"), "unexpected error: {err}");
     }
 }
 
@@ -819,5 +986,78 @@ mod live {
         assert_eq!(pending.len(), 1, "the failed create must be sitting in the outbox");
 
         std::env::remove_var(env::EXPERIMENTS_KEY_ENCRYPTION_KEY);
+    }
+
+    /// Live proof of the actual feature: seed a queued run directly on a real
+    /// chuk-experiments-server (exactly as `enqueue_run` would), submit it via
+    /// `Hub::submit_from_experiment`, and confirm the harness execution
+    /// *attaches* to that seeded run (via the store's local
+    /// `experiments_run_id` mapping, the same thing `try_attach` sets) rather
+    /// than a second, unrelated run being minted.
+    ///   CHUK_EXPERIMENTS_URL=http://localhost:8123 CHUK_EXPERIMENTS_API_KEY=<a real write key> \
+    ///   cargo test -p chuk-train-controlplane experiments::live::submit_from_experiment_attaches_to_an_existing_queued_run -- --ignored --nocapture
+    #[ignore]
+    #[tokio::test]
+    async fn submit_from_experiment_attaches_to_an_existing_queued_run() {
+        let base = std::env::var(env::EXPERIMENTS_URL).unwrap_or_default();
+        let key = std::env::var(env::EXPERIMENTS_API_KEY).unwrap_or_default();
+        if base.is_empty() || key.is_empty() {
+            eprintln!(
+                "skip: need {} + {} pointed at a real local chuk-experiments-server",
+                env::EXPERIMENTS_URL,
+                env::EXPERIMENTS_API_KEY
+            );
+            return;
+        }
+
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open(":memory:").await.expect("store"));
+        let exp = Experiments::from_env(store.clone(), "http://localhost:9").expect("client");
+        exp.ensure().await.expect("ensure default experiment");
+
+        // Seed a queued run directly via REST, exactly as an external caller
+        // (e.g. chuk-experiments-server's own `enqueue_run`) would.
+        let http = reqwest::Client::new();
+        let resp = http
+            .post(format!("{base}/v1/experiments/{DEFAULT_EXPERIMENTS_EXPERIMENT}/runs"))
+            .bearer_auth(&key)
+            .json(&json!({
+                "slug": format!("submit-from-experiment-smoke-{}", now_secs() as i64),
+                "config": {
+                    "entrypoint": "true",
+                    "code": { "name": "submit-from-experiment-smoke", "sha": "0000000000000000000000000000000000000000" },
+                },
+                "status": "queued",
+            }))
+            .send()
+            .await
+            .expect("seed run");
+        assert!(resp.status().is_success(), "seed run: {}", resp.status());
+        let created: Value = resp.json().await.expect("parse seeded run");
+        let ext_id = created["id"].as_str().expect("id").to_owned();
+
+        let artifacts: Arc<dyn crate::artifacts::ArtifactStore> =
+            Arc::new(crate::artifacts::FsArtifactStore::new(std::env::temp_dir()));
+        let hub = crate::hub::Hub::new(store.clone(), artifacts, Some(exp));
+
+        let run_id = hub
+            .submit_from_experiment(&ext_id, None, None)
+            .await
+            .expect("submit_from_experiment");
+
+        // mirror_created spawns the attach call rather than awaiting it
+        // inline, so poll the store's local mapping instead of a blind sleep.
+        let mut attached = None;
+        for _ in 0..50 {
+            if let Ok(Some(got)) = store.experiments_run_id(&run_id).await {
+                attached = Some(got);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            attached.as_deref(),
+            Some(ext_id.as_str()),
+            "must attach to the seeded run, not mint or point at a different one"
+        );
     }
 }

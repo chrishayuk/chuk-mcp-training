@@ -186,6 +186,7 @@ async fn main() -> Result<()> {
         .route("/fleet", get(api::fleet))
         .route("/runs/shell", post(api::submit_shell))
         .route("/runs", get(api::list_runs).post(api::submit_run))
+        .route("/runs/from-experiment/{run_id}", post(api::submit_run_from_experiment))
         .route("/runs/{run_id}", get(api::run_status))
         .route("/runs/{run_id}/stop", post(api::stop_run))
         .route("/runs/{run_id}/resume", post(api::resume_run))

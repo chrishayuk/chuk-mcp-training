@@ -29,6 +29,7 @@ from .constants import (
     api_run_checkpoint_pin,
     api_run_checkpoints,
     api_run_events,
+    api_run_from_experiment,
     api_run_logs,
     api_run_metrics,
     api_run_resume,
@@ -197,6 +198,32 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         )
         request = SubmitRunRequest(name=name, spec=spec, experiment_ref=experiment_ref)
         return await _envelope(cp.post_model(API_RUNS, request, SubmitRunResponse))
+
+    @mcp.tool
+    async def submit_run_from_experiment(
+        run_id: str,
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """Submit a train run built from an existing experiments-server run.
+
+        `run_id` is a chuk-experiments-server logical run (its `RUN-…` id,
+        e.g. from that server's `enqueue_run`). Its own `config`/`workspec`
+        is fetched and used to build the TrainSpec directly — you don't
+        re-specify code/entrypoint/overrides/etc. here. Equivalent to calling
+        submit_run(..., experiment_ref=run_id) with the spec filled in for
+        you. Fails if the run has no entrypoint/code reference recorded, is
+        not `queued`, or is already attached to another execution.
+
+        `name` overrides the harness run's own display name (defaults to
+        `run_id`) — this is separate from the experiments-server run's own
+        slug/title, which is untouched.
+        """
+        params: dict[str, Any] = {}
+        if name:
+            params["name"] = name
+        return await _envelope(
+            cp.post_params(api_run_from_experiment(run_id), params or None)
+        )
 
     @mcp.tool
     async def run_metrics(

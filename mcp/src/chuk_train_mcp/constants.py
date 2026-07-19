@@ -39,6 +39,10 @@ def api_run(run_id: str) -> str:
     return f"{API_RUNS}/{run_id}"
 
 
+def api_run_from_experiment(run_id: str) -> str:
+    return f"{API_RUNS}/from-experiment/{run_id}"
+
+
 def api_run_stop(run_id: str) -> str:
     return f"{API_RUNS}/{run_id}/stop"
 

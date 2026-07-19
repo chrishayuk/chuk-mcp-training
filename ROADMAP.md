@@ -47,6 +47,16 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   first delivery attempt and retries with capped backoff on failure, never silently dropped
   (see *Integration depth* below). Unset ⇒ no-op; the harness always runs standalone.
   Verified end-to-end.
+- **`submit_run_from_experiment`** (2026-07-20, closes the push half of the "pull/queue
+  executor mode" item below) — `POST /runs/from-experiment/{run_id}` / the matching MCP
+  tool takes an existing chuk-experiments-server `RUN-…` id, fetches that run's own
+  `config`/`workspec` (`Experiments::fetch_run` + `train_spec_from_experiments_run`,
+  `experiments.rs`), builds the `TrainSpec` from it, and submits attached
+  (`experiment_ref` already set) — so "create an experiment, get it running here" is one
+  call instead of re-specifying the same training job by hand at `submit_run` time. Guards
+  against resubmitting an already-attached or non-`queued` run. The **pull** direction
+  (this harness polling `/v1/queue` and self-selecting work, rather than being told which
+  run to run) is still open — see below.
 - **Dogfooding demo** — `scripts/demo.sh` spins up a local CP + mock workers running the
   (enriched) stub-trainer, so the dashboard fills with live data; isolated from prod.
 - **Fly deploy**: `chuk-mcp-training.fly.dev`; the CP serves the agent binary and
@@ -258,9 +268,11 @@ unmistakable — the harness reports **observations, never conclusions**.*
   opt-in pull mode below), but the direct pairing has one scheduler.
 - **Native W&B logging** (M) — W&B is only a forwarded out-link today; the CP already ingests
   every metric batch, so creating a W&B run + streaming metrics is a natural add.
-- **experiments-server pull/queue executor mode** (L) — the deepest integration: a gated adapter
-  that turns harness workers into executors for externally-queued experiments (§11.6), an add-on
-  that never replaces our own queue.
+- **experiments-server pull mode** (M, narrowed 2026-07-20 — push is done, see
+  `submit_run_from_experiment` above) — the harness itself polling `/v1/queue` and
+  self-selecting eligible work, rather than being explicitly told (via
+  `submit_run_from_experiment`) which experiments-server run to execute. An add-on that
+  never replaces our own queue.
 - **lazarus `load_checkpoint` + tokenizer-hash verify** (M, mostly lazarus-side) — the harness
   side is ready (stable resolver URLs + `tokenizer_hash` in meta); produces E5's first dynamics curve.
 - **Lambda driver + generalized bootstrap** (M) — the `Provider` trait is clean; a Lambda driver
