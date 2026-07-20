@@ -21,14 +21,15 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::budget;
 use crate::config::Config;
 use crate::hub::Hub;
 use crate::provider::{Provider, Providers, ProvisionContext};
 
 /// Ledger event names (spec §8).
-const EV_LEASE_START: &str = "lease_start";
-const EV_EXTEND: &str = "extend";
-const EV_LEASE_END: &str = "lease_end";
+const EV_LEASE_START: &str = chuk_train_proto::LEDGER_EVENT_LEASE_START;
+const EV_EXTEND: &str = chuk_train_proto::LEDGER_EVENT_EXTEND;
+const EV_LEASE_END: &str = chuk_train_proto::LEDGER_EVENT_LEASE_END;
 
 fn now() -> f64 {
     std::time::SystemTime::now()
@@ -66,8 +67,27 @@ impl LeaseManager {
         self.provider(provider)?.offers(gpu, max_price_hr).await
     }
 
+    /// Refuse if spending `candidate_cost` more on `provider` would breach a
+    /// budget (spec §8: live leases count as committed, ledger is spent).
+    async fn budget_check(&self, provider: &str, candidate_cost: f64) -> Result<()> {
+        let (budgets, ledger, live) = tokio::try_join!(
+            self.hub.store.budgets(),
+            self.hub.store.ledger_entries(),
+            self.hub.store.live_leases(),
+        )?;
+        if let Some(breach) =
+            budget::evaluate(&budgets, &ledger, &live, provider, candidate_cost, now())
+        {
+            anyhow::bail!("{breach}");
+        }
+        Ok(())
+    }
+
     pub async fn provision(&self, req: &ProvisionRequest) -> Result<ProvisionResult> {
         let provider = self.provider(&req.provider)?;
+        // Cheap pre-flight before renting anything: refuse when headroom is
+        // already gone even with a zero-cost candidate.
+        self.budget_check(&req.provider, 0.0).await?;
         let worker_id = WorkerId(format!(
             "{}-{}",
             req.provider,
@@ -83,6 +103,21 @@ impl LeaseManager {
             .provision(req, &ctx)
             .await
             .context("provider provision")?;
+
+        // Exact check now the real price is known. On breach (or a store
+        // failure that leaves the budget unverifiable) destroy immediately so
+        // a refused provision never leaves a billing instance behind.
+        let candidate_cost = instance.price_hr * req.lease_min / 60.0;
+        if let Err(refused) = self.budget_check(&req.provider, candidate_cost).await {
+            warn!(
+                provider = %req.provider, instance = %instance.id, %refused,
+                "provision refused post-price; destroying instance"
+            );
+            if let Err(error) = provider.destroy(&instance.id).await {
+                warn!(instance = %instance.id, %error, "destroy of refused instance failed; reconcile will retry");
+            }
+            return Err(refused);
+        }
 
         let lease = Lease {
             worker_id: worker_id.clone(),
@@ -117,6 +152,11 @@ impl LeaseManager {
         minutes: f64,
         reason: &str,
     ) -> Result<Option<Lease>> {
+        // The extension's cost is known up front — check before moving the wall.
+        if let Some(lease) = self.hub.store.lease(worker_id).await? {
+            self.budget_check(&lease.provider, lease.price_hr * minutes / 60.0)
+                .await?;
+        }
         let ext = LeaseExtension {
             minutes,
             at: now(),

@@ -15,7 +15,7 @@ mod sqlite;
 use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
-    ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
+    ApiKeyInfo, Budget, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
     CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
     MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary,
     UnixSeconds, User, WorkerId, WorkerInfo, WorkerTelemetry, WorkerTokenInfo,
@@ -267,12 +267,21 @@ pub trait LeaseStore: Send + Sync {
     ) -> Result<Option<Lease>>;
 }
 
-/// The spend ledger — the source of truth for realised cost (§8).
+/// The spend ledger — the source of truth for realised cost (§8) — plus the
+/// budget caps provision/extend refuse against.
 #[async_trait]
 pub trait LedgerStore: Send + Sync {
     async fn ledger_append(&self, entry: &LedgerEntry) -> Result<()>;
 
     async fn ledger_entries(&self) -> Result<Vec<LedgerEntry>>;
+
+    /// Upsert a budget by scope (`global` / `provider:<name>`).
+    async fn set_budget(&self, budget: &Budget) -> Result<()>;
+
+    /// Remove a budget; returns false if no such scope was set.
+    async fn delete_budget(&self, scope: &str) -> Result<bool>;
+
+    async fn budgets(&self) -> Result<Vec<Budget>>;
 }
 
 /// RBAC: teams, users (+ their linked experiments key), and hashed API keys.

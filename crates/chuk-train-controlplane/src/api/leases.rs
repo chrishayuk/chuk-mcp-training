@@ -159,42 +159,106 @@ subprocess.run(cmd, shell=True, check=False)
     Json(chuk_train_proto::ColabCell { cell }).into_response()
 }
 
-pub async fn spend_status(State(state): State<Arc<AppState>>) -> Response {
-    use std::collections::{BTreeMap, BTreeSet};
-    let (live, ledger) = match tokio::try_join!(
-        state.hub.store.live_leases(),
+#[derive(serde::Deserialize)]
+pub struct SpendParams {
+    period: Option<String>,
+}
+
+/// Spend per provider over a period (spec §8): committed = projected cost of
+/// live leases, spent = realised lease_end cost from the ledger, with
+/// cap/headroom attached where a matching-period budget exists.
+pub async fn spend_status(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SpendParams>,
+) -> Response {
+    let period = params
+        .period
+        .unwrap_or_else(|| chuk_train_proto::DEFAULT_BUDGET_PERIOD.to_owned());
+    if let Err(reason) = crate::budget::validate_period(&period) {
+        return bad_request(&reason);
+    }
+    let (budgets, ledger, live) = match tokio::try_join!(
+        state.hub.store.budgets(),
         state.hub.store.ledger_entries(),
+        state.hub.store.live_leases(),
     ) {
-        Ok(pair) => pair,
+        Ok(all) => all,
         Err(error) => return internal(error),
     };
-    // committed = projected cost of leases still running; spent = realised
-    // lease_end costs from the ledger (spec §8: ledger is the source of truth).
-    let mut committed: BTreeMap<String, f64> = BTreeMap::new();
-    for lease in &live {
-        *committed.entry(lease.provider.clone()).or_default() += lease.projected_cost();
+    Json(crate::budget::report(&budgets, &ledger, &live, &period, unix_now())).into_response()
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs_f64()
+}
+
+pub async fn list_budgets(State(state): State<Arc<AppState>>) -> Response {
+    match state.hub.store.budgets().await {
+        Ok(budgets) => Json::<Vec<chuk_train_proto::Budget>>(budgets).into_response(),
+        Err(error) => internal(error),
     }
-    let mut spent: BTreeMap<String, f64> = BTreeMap::new();
-    for entry in &ledger {
-        if entry.event == "lease_end" {
-            *spent.entry(entry.provider.clone()).or_default() += entry.cost;
-        }
+}
+
+/// Upsert a budget cap (spec §6 `set_budget`). Admin-scoped: a cap is a
+/// governance decision, not a per-run knob.
+pub async fn set_budget(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Json(request): Json<chuk_train_proto::SetBudgetRequest>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Admin) {
+        return resp;
     }
-    let mut providers: BTreeSet<String> = BTreeSet::new();
-    providers.extend(committed.keys().cloned());
-    providers.extend(spent.keys().cloned());
-    let lines: Vec<chuk_train_proto::SpendLine> = providers
-        .into_iter()
-        .map(|provider| chuk_train_proto::SpendLine {
-            committed: *committed.get(&provider).unwrap_or(&0.0),
-            spent: *spent.get(&provider).unwrap_or(&0.0),
-            provider,
-        })
-        .collect();
-    let report = chuk_train_proto::SpendReport {
-        total_committed: lines.iter().map(|l| l.committed).sum(),
-        total_spent: lines.iter().map(|l| l.spent).sum(),
-        lines,
+    let period = request
+        .period
+        .unwrap_or_else(|| chuk_train_proto::DEFAULT_BUDGET_PERIOD.to_owned());
+    if let Err(reason) = crate::budget::validate_scope(&request.scope) {
+        return bad_request(&reason);
+    }
+    if let Err(reason) = crate::budget::validate_period(&period) {
+        return bad_request(&reason);
+    }
+    if !request.cap.is_finite() || request.cap < 0.0 {
+        return bad_request("cap must be a non-negative number");
+    }
+    let budget = chuk_train_proto::Budget {
+        scope: request.scope,
+        cap: request.cap,
+        period,
+        updated_at: unix_now(),
     };
-    Json(report).into_response()
+    match state.hub.store.set_budget(&budget).await {
+        Ok(()) => Json(budget).into_response(),
+        Err(error) => internal(error),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct DeleteBudgetParams {
+    scope: String,
+}
+
+/// Remove a budget cap by scope (query param — scopes contain `:`). Admin-scoped.
+pub async fn delete_budget(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Query(params): Query<DeleteBudgetParams>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Admin) {
+        return resp;
+    }
+    match state.hub.store.delete_budget(&params.scope).await {
+        Ok(true) => Json(serde_json::json!({ "deleted": true })).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("no budget set for scope {:?}", params.scope),
+            }),
+        )
+            .into_response(),
+        Err(error) => internal(error),
+    }
 }

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
-    ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
+    ApiKeyInfo, Budget, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
     CodeUnitManifest, DEFAULT_TEAM_ID, EventKind, Hardware, Lease, LeaseExtension, LeaseState,
     LedgerEntry, MetricPoint, MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec,
     RunState, RunSummary, UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTelemetry,
@@ -115,6 +115,12 @@ CREATE TABLE IF NOT EXISTS ledger (
   event        TEXT NOT NULL,
   minutes      REAL NOT NULL,
   cost         REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS budgets (
+  scope        TEXT PRIMARY KEY,
+  cap          REAL NOT NULL,
+  period       TEXT NOT NULL,
+  updated_at   REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS teams (
   id           TEXT PRIMARY KEY,
@@ -730,6 +736,30 @@ mod tests {
         );
         store.create_run("r2", &shell_spec(), None, None).await.expect("run2");
         assert_eq!(store.runs(&Default::default(), 10).await.expect("runs").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn budgets_upsert_list_delete() {
+        let store = mem_store().await;
+        assert!(store.budgets().await.expect("q").is_empty());
+        let b = chuk_train_proto::Budget {
+            scope: "provider:vast".into(),
+            cap: 50.0,
+            period: "month".into(),
+            updated_at: 1.0,
+        };
+        store.set_budget(&b).await.expect("set");
+        // Upsert by scope: a second set replaces, never duplicates.
+        store
+            .set_budget(&chuk_train_proto::Budget { cap: 75.0, updated_at: 2.0, ..b.clone() })
+            .await
+            .expect("set");
+        let all = store.budgets().await.expect("q");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].cap, 75.0);
+        assert!(store.delete_budget("provider:vast").await.expect("del"));
+        assert!(!store.delete_budget("provider:vast").await.expect("del"));
+        assert!(store.budgets().await.expect("q").is_empty());
     }
 
     #[tokio::test]

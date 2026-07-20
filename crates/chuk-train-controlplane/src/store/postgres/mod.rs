@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
-    ApiKeyInfo, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo, DEFAULT_TEAM_ID,
+    ApiKeyInfo, Budget, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo, DEFAULT_TEAM_ID,
     CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
     MetricPoint, MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec, RunState,
     RunSummary, UnixSeconds, User, WorkerId, WorkerInfo, WorkerState, WorkerTelemetry,
@@ -135,6 +135,12 @@ CREATE TABLE IF NOT EXISTS ledger (
   event        text NOT NULL,
   minutes      double precision NOT NULL,
   cost         double precision NOT NULL
+);
+CREATE TABLE IF NOT EXISTS budgets (
+  scope        text PRIMARY KEY,
+  cap          double precision NOT NULL,
+  period       text NOT NULL,
+  updated_at   double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS teams (
   id           text PRIMARY KEY,
@@ -500,6 +506,32 @@ mod pg_live {
             .expect("ledger_entries")
             .iter()
             .any(|e| e.worker_id == wid));
+
+        // budgets: upsert-by-scope, list, delete
+        let scope = format!("provider:pgtest-{}", wid.0);
+        store
+            .set_budget(&Budget {
+                scope: scope.clone(),
+                cap: 50.0,
+                period: "month".into(),
+                updated_at: now(),
+            })
+            .await
+            .expect("set_budget");
+        store
+            .set_budget(&Budget {
+                scope: scope.clone(),
+                cap: 75.0,
+                period: "month".into(),
+                updated_at: now(),
+            })
+            .await
+            .expect("upsert_budget");
+        let budgets = store.budgets().await.expect("budgets");
+        let ours = budgets.iter().find(|b| b.scope == scope).expect("our budget");
+        assert_eq!(ours.cap, 75.0);
+        assert!(store.delete_budget(&scope).await.expect("delete_budget"));
+        assert!(!store.delete_budget(&scope).await.expect("delete_budget"));
 
         // ---- the remaining surface, so every postgres/*.rs is exercised ----
 

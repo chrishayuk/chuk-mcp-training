@@ -152,6 +152,26 @@ pub struct LedgerEntry {
     pub cost: f64,
 }
 
+/// A spend cap (spec §8). `scope` is `global` or `provider:<name>`; `period`
+/// is `month` (the current UTC calendar month) or `all` (all-time). Colab
+/// budgets cap compute units rather than dollars (same numeric treatment).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Budget {
+    pub scope: String,
+    pub cap: f64,
+    pub period: String,
+    pub updated_at: UnixSeconds,
+}
+
+/// `set_budget(...)` request (spec §6). Omitted period defaults to `month`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetBudgetRequest {
+    pub scope: String,
+    pub cap: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period: Option<String>,
+}
+
 /// Report from a teardown / lease-end (spec §6 Ack shape, richer here).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TeardownResult {

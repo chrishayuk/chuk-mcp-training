@@ -94,3 +94,7 @@ class ControlPlaneClient:
     async def get_raw(self, path: str, params: dict[str, Any] | None = None) -> Any:
         """GET returning the raw decoded JSON (no model validation)."""
         return await self._request("GET", path, params=params)
+
+    async def delete_params(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """DELETE with query params (e.g. removing a keyed resource)."""
+        return await self._request("DELETE", path, params=params)

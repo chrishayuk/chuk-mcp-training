@@ -20,8 +20,14 @@ API_PROVIDER_OFFERS: Final = "/api/provider_offers"
 API_PROVISION: Final = "/api/provision"
 API_COLAB_CELL: Final = "/api/colab_cell"
 API_SPEND: Final = "/api/spend"
+API_BUDGETS: Final = "/api/budgets"
 API_ARCHIVE: Final = "/api/archive"
 API_ME: Final = "/api/me"
+
+# Budget vocabulary (must match chuk_train_proto::constants).
+BUDGET_PERIOD_MONTH: Final = "month"
+BUDGET_PERIOD_ALL: Final = "all"
+DEFAULT_BUDGET_PERIOD: Final = BUDGET_PERIOD_MONTH
 
 
 def api_worker_lease(worker_id: str) -> str:

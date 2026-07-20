@@ -217,12 +217,35 @@ class SpendLine(BaseModel):
     provider: str
     committed: float
     spent: float
+    # Present when a provider:<name> budget exists for the report's period.
+    cap: float | None = None
+    headroom: float | None = None
 
 
 class SpendReport(BaseModel):
+    period: str = ""
     lines: list[SpendLine] = Field(default_factory=list)
     total_committed: float
     total_spent: float
+    # Present when a global budget exists for the report's period.
+    global_cap: float | None = None
+    global_headroom: float | None = None
+
+
+class Budget(BaseModel):
+    """A spend cap (spec §8): scope `global` or `provider:<name>`, per period
+    (`month` = current UTC calendar month, `all` = all-time)."""
+
+    scope: str
+    cap: float
+    period: str
+    updated_at: float
+
+
+class SetBudgetRequest(BaseModel):
+    scope: str
+    cap: float
+    period: str | None = None
 
 
 class ColabCell(BaseModel):

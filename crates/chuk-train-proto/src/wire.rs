@@ -307,19 +307,32 @@ pub struct TeardownRequest {
     pub force: bool,
 }
 
-/// A spend summary line, per provider (spec §8, minimal for M2's ledger).
+/// A spend summary line, per provider (spec §8). `cap`/`headroom` are present
+/// when a `provider:<name>` budget exists for the report's period.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpendLine {
     pub provider: String,
     pub committed: f64,
     pub spent: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headroom: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpendReport {
+    /// The period spent is computed over (`month` or `all`).
+    #[serde(default)]
+    pub period: String,
     pub lines: Vec<SpendLine>,
     pub total_committed: f64,
     pub total_spent: f64,
+    /// The `global` budget for this period, if one is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_cap: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_headroom: Option<f64>,
 }
 
 /// A ready-to-paste Colab bootstrap cell (spec §6: Colab `provision` returns

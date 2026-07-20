@@ -11,6 +11,7 @@ mod apikey;
 mod archive;
 mod artifacts;
 mod auth;
+mod budget;
 mod codeunit;
 mod config;
 mod crypto;
@@ -206,6 +207,12 @@ async fn main() -> Result<()> {
         .route("/workers/{worker_id}/extend", post(api::extend_lease))
         .route("/workers/{worker_id}/teardown", post(api::teardown))
         .route("/spend", get(api::spend_status))
+        .route(
+            "/budgets",
+            get(api::list_budgets)
+                .post(api::set_budget)
+                .delete(api::delete_budget),
+        )
         .route("/runs/{run_id}/archive", post(api::archive_run))
         .route("/archive", post(api::archive_all).get(api::archive_status))
         .route(

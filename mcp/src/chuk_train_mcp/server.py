@@ -19,6 +19,7 @@ from . import __version__
 from .client import ControlPlaneClient, ControlPlaneError
 from .constants import (
     DEFAULT_ARTIFACT_URL_TTL_S,
+    DEFAULT_BUDGET_PERIOD,
     DEFAULT_LOG_TAIL_LINES,
     DEFAULT_METRIC_DOWNSAMPLE,
     DEFAULT_RUN_LIST_LIMIT,
@@ -48,9 +49,11 @@ from .constants import (
     API_RUNS,
     API_RUNS_SHELL,
     API_ARCHIVE,
+    API_BUDGETS,
     API_SPEND,
 )
 from .models import (
+    Budget,
     BuildCodeUnitRequest,
     CheckpointInfo,
     CodeRef,
@@ -68,6 +71,7 @@ from .models import (
     RunEvent,
     RunRecord,
     RunSummary,
+    SetBudgetRequest,
     SignedUrl,
     SpendReport,
     SubmitRunRequest,
@@ -91,6 +95,8 @@ _PARAM_SINCE_STEP = "since_step"
 _PARAM_DOWNSAMPLE = "downsample"
 _PARAM_KEY = "key"
 _PARAM_TTL_S = "ttl_s"
+_PARAM_PERIOD = "period"
+_PARAM_SCOPE = "scope"
 _METRIC_KEYS_SEP = ","
 
 
@@ -399,10 +405,45 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         return await _envelope(cp.post_model(api_worker_teardown(worker_id), request, TeardownResult))
 
     @mcp.tool
-    async def spend_status() -> dict[str, Any]:
+    async def spend_status(period: str = DEFAULT_BUDGET_PERIOD) -> dict[str, Any]:
         """Committed (live leases) vs spent (realised) per provider, from the
-        ledger (spec §8)."""
-        return await _envelope(cp.get_model(API_SPEND, SpendReport))
+        ledger (spec §8), over `period` ("month" = current UTC calendar month,
+        "all" = all-time). Where a budget matches the period, each line (and
+        the report globally) carries cap + headroom — check headroom before
+        provisioning or extending; those refuse on breach.
+        """
+        return await _envelope(
+            cp.get_model(API_SPEND, SpendReport, params={_PARAM_PERIOD: period})
+        )
+
+    @mcp.tool
+    async def set_budget(
+        scope: str, cap: float, period: str = DEFAULT_BUDGET_PERIOD
+    ) -> dict[str, Any]:
+        """Set (upsert) a spend cap (spec §8). Admin-scoped.
+
+        scope: "global" or "provider:<name>" (e.g. "provider:vast").
+        period: "month" (current UTC calendar month) or "all" (all-time).
+        provision and extend_lease refuse when projected spend (realised +
+        committed live leases + the candidate cost) would exceed any
+        applicable cap. Colab caps are in compute units, not dollars.
+        """
+        request = SetBudgetRequest(scope=scope, cap=cap, period=period)
+        return await _envelope(cp.post_model(API_BUDGETS, request, Budget))
+
+    @mcp.tool
+    async def list_budgets() -> dict[str, Any]:
+        """Every configured spend cap (scope, cap, period)."""
+        return await _envelope(
+            cp.get_list(API_BUDGETS, Budget),
+            empty_hint="No budgets set — spending is uncapped. Set one with "
+            "set_budget (admin-scoped).",
+        )
+
+    @mcp.tool
+    async def delete_budget(scope: str) -> dict[str, Any]:
+        """Remove a spend cap by scope (e.g. "provider:vast"). Admin-scoped."""
+        return await _envelope(cp.delete_params(API_BUDGETS, {_PARAM_SCOPE: scope}))
 
     @mcp.tool
     async def colab_cell(lease_min: float | None = None, labels: str = "colab,t4") -> dict[str, Any]:

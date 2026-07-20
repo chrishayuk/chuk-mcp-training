@@ -125,6 +125,23 @@ pub const DEFAULT_EXPERIMENTS_PROGRAMME_TITLE: &str = "GPU training harness";
 pub const DEFAULT_EXPERIMENTS_EXPERIMENT: &str = "harness-runs";
 pub const DEFAULT_EXPERIMENTS_EXPERIMENT_TITLE: &str = "Harness runs";
 
+// -- cost governance (spec §8) ----------------------------------------------
+
+/// Ledger event names — the vocabulary spend is computed from.
+pub const LEDGER_EVENT_LEASE_START: &str = "lease_start";
+pub const LEDGER_EVENT_EXTEND: &str = "extend";
+pub const LEDGER_EVENT_LEASE_END: &str = "lease_end";
+
+/// Budget scope naming: `global`, or `provider:<name>` (e.g. `provider:vast`).
+/// (`label:<x>` is spec'd but not yet enforced — leases don't carry labels.)
+pub const BUDGET_SCOPE_GLOBAL: &str = "global";
+pub const BUDGET_SCOPE_PROVIDER_PREFIX: &str = "provider:";
+
+/// Budget periods: the current UTC calendar month, or all-time.
+pub const BUDGET_PERIOD_MONTH: &str = "month";
+pub const BUDGET_PERIOD_ALL: &str = "all";
+pub const DEFAULT_BUDGET_PERIOD: &str = BUDGET_PERIOD_MONTH;
+
 /// Default number of log lines returned by the tail endpoint.
 pub const DEFAULT_LOG_TAIL_LINES: u32 = 100;
 /// Default page size for run listings.
