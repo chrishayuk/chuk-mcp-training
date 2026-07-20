@@ -10,6 +10,7 @@ import httpx
 from dotenv import find_dotenv, load_dotenv
 from pydantic import BaseModel, TypeAdapter
 
+from . import auth
 from .constants import DEFAULT_CP_URL, ENV_API_TOKEN, ENV_CP_URL, HTTP_TIMEOUT_S
 
 # Retry transient failures — connection errors, timeouts, 5xx — with backoff.
@@ -44,12 +45,24 @@ class ControlPlaneClient:
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
+            # Auth is per-request (see _auth_headers), never baked into the
+            # client: concurrent HTTP callers each forward their own token.
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
-                headers={"Authorization": f"{_BEARER_PREFIX}{self._api_token}"},
                 timeout=HTTP_TIMEOUT_S,
             )
         return self._client
+
+    def _auth_headers(self) -> dict[str, str]:
+        """The bearer for this call: over HTTP, the calling agent's own token
+        (never substituting our credentials for an anonymous caller — a
+        tokenless call must 401 at the control plane); over stdio, the
+        process's configured token."""
+        if auth.http_request_active():
+            token = auth.bearer_from_mcp_context()
+        else:
+            token = self._api_token
+        return {"Authorization": f"{_BEARER_PREFIX}{token}"} if token else {}
 
     async def _request(self, method: str, path: str, *,
                        params: dict[str, Any] | None = None,
@@ -57,7 +70,9 @@ class ControlPlaneClient:
         last: ControlPlaneError | None = None
         for attempt in range(_MAX_ATTEMPTS):
             try:
-                response = await self._http().request(method, path, params=params, json=json)
+                response = await self._http().request(
+                    method, path, params=params, json=json, headers=self._auth_headers()
+                )
             except httpx.HTTPError as exc:
                 last = ControlPlaneError("request_failed", repr(exc))
             else:

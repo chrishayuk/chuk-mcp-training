@@ -381,6 +381,18 @@ Watchdogs are gates with `action="stop_run"`: `isnan(last(loss))`,
 > The harness keeps `artifact_url` + the checkpoint tools (its execution-side handles) and
 > reports checkpoints/artifacts into the experiments-server through the §11.6 mirror.
 
+### Transports (amended 2026-07-21)
+
+The tool surface is served two ways from one registration:
+- **stdio** (`chuk-train-mcp`) — local single-user mode; the control-plane
+  bearer comes from `CHUK_TRAIN_API_TOKEN` in the process environment.
+- **HTTP** (`chuk-train-mcp --http`, hosted at
+  `https://chuk-train-mcp.fly.dev/mcp`) — a **zero-credential proxy**
+  mirroring chuk-experiments-server: each MCP caller's own `Authorization`
+  bearer is forwarded per request to the control plane, which enforces RBAC
+  per caller. The proxy holds no key; a tokenless call surfaces the CP's 401
+  through the tool's error envelope, never a substituted credential.
+
 ### Identity & fleet introspection
 
 ```python

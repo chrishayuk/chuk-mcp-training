@@ -20,6 +20,8 @@ from .client import ControlPlaneClient, ControlPlaneError
 from .constants import (
     DEFAULT_ARTIFACT_URL_TTL_S,
     DEFAULT_BUDGET_PERIOD,
+    DEFAULT_HTTP_HOST,
+    DEFAULT_HTTP_PORT,
     DEFAULT_SWEEP_METRIC_KEY,
     DEFAULT_LOG_TAIL_LINES,
     DEFAULT_METRIC_DOWNSAMPLE,
@@ -602,7 +604,27 @@ async def _envelope(awaitable: Any, empty_hint: str | None = None) -> dict[str, 
 
 
 def main() -> None:
-    build_server().run_stdio()
+    """`chuk-train-mcp` — stdio by default (local, single-user, token from the
+    environment); `--http` serves /mcp as a zero-credential proxy where every
+    caller's own bearer is forwarded to the control plane (spec: hosted like
+    chuk-experiments-server)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="chuk-train-mcp")
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="serve MCP over HTTP at /mcp (per-caller bearer passthrough) "
+        "instead of stdio",
+    )
+    parser.add_argument("--host", default=DEFAULT_HTTP_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
+    args = parser.parse_args()
+    server = build_server()
+    if args.http:
+        server.run(host=args.host, port=args.port)
+    else:
+        server.run_stdio()
 
 
 if __name__ == "__main__":

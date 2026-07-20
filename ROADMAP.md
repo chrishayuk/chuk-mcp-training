@@ -69,6 +69,13 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   dash.css,app.js}`) behind a thin Rust handler, and the store's monolithic adapters are split into
   10 per-domain sub-traits (`WorkerStore`/`RunStore`/… → `store/{sqlite,postgres}/*.rs`); every
   store file is ≥90% line-covered (sqlite in-process, postgres via the CI Postgres service).
+- **Hosted HTTP MCP endpoint** (2026-07-21) — `chuk-train-mcp --http` serves the same tool
+  registration over HTTP; deployed as its own Fly app (`chuk-train-mcp.fly.dev/mcp`,
+  `deploy/mcp/`, auto-deployed by CI after the CP). It is a **zero-credential proxy**
+  (chuk-experiments-server's pattern): each caller's own bearer is forwarded per request
+  via the ambient ASGI scope, the CP enforces RBAC per caller, and a tokenless call gets
+  the CP's 401 in the tool envelope — the proxy never substitutes its own key (it has
+  none). stdio mode keeps the env-token fallback for local use.
 - **Agent-first MCP surface** (2026-07-20, patterns borrowed from chuk-experiments-server's
   tool design) — `whoami` (role/team/experiments-key-linked, so an agent can predict 403s
   instead of debugging them) and `worker_telemetry` (live `sys/*` sample per worker) expose

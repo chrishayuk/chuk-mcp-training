@@ -130,3 +130,9 @@ jobs:
         run: flyctl deploy -c deploy/fly.toml --dockerfile deploy/Dockerfile --remote-only
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      # The hosted MCP surface (chuk-train-mcp.fly.dev/mcp) — a zero-credential
+      # per-caller bearer proxy over the control plane deployed above.
+      - name: Deploy MCP server
+        run: flyctl deploy -c deploy/mcp/fly.toml --dockerfile deploy/mcp/Dockerfile --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

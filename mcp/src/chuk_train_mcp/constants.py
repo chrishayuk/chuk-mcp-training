@@ -107,3 +107,7 @@ DEFAULT_METRIC_DOWNSAMPLE: Final = 500
 DEFAULT_ARTIFACT_URL_TTL_S: Final = 3600
 
 HTTP_TIMEOUT_S: Final = 30.0
+
+# `chuk-train-mcp --http` bind defaults (the hosted /mcp proxy).
+DEFAULT_HTTP_HOST: Final = "0.0.0.0"
+DEFAULT_HTTP_PORT: Final = 8710

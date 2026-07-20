@@ -1,0 +1,26 @@
+# chuk-train-mcp — hosted MCP endpoint (https://chuk-train-mcp.fly.dev/mcp).
+# A zero-credential proxy over the control plane's REST API: each MCP caller's
+# own bearer token is forwarded per request (mirroring chuk-experiments-server),
+# so this app holds NO secrets — only the CP URL.
+# Deploy from the repo root:
+#   fly deploy -c deploy/mcp/fly.toml --dockerfile deploy/mcp/Dockerfile
+
+app = "chuk-train-mcp"
+primary_region = "lhr"
+
+[env]
+CHUK_TRAIN_URL = "https://chuk-mcp-training.fly.dev"
+
+[http_service]
+internal_port = 8710
+force_https = true
+# Stateless request/response proxy — unlike the control plane (which holds
+# worker websockets), this can scale to zero between sessions.
+auto_stop_machines = "stop"
+auto_start_machines = true
+min_machines_running = 0
+
+[[vm]]
+memory = "256mb"
+cpu_kind = "shared"
+cpus = 1
