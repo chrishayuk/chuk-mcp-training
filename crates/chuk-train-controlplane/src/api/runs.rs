@@ -174,6 +174,23 @@ pub async fn submit_run(
     if let Err(resp) = require_role(&ctx, Role::Write) {
         return resp;
     }
+    // Spec §8 pre-flight: an expensive submission must be a confirmed one.
+    if !request.confirm_cost {
+        let live = match state.hub.store.live_leases().await {
+            Ok(live) => live,
+            Err(error) => return internal(error),
+        };
+        let estimate = crate::budget::estimate_run_cost(&live, request.spec.timeout_s());
+        let threshold = state.config.confirm_cost_threshold;
+        if estimate > threshold {
+            return bad_request(&format!(
+                "estimated worst-case cost ${estimate:.2} ({:.1}h timeout at the most \
+                 expensive live lease) exceeds the ${threshold:.2} confirm threshold — \
+                 resubmit with confirm_cost=true, or lower timeout_s",
+                request.spec.timeout_s() as f64 / 3600.0,
+            ));
+        }
+    }
     match state
         .hub
         .submit(

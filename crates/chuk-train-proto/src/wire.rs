@@ -167,6 +167,11 @@ pub struct SubmitRunRequest {
     /// that run instead of minting a new one. Omit for an unattached scratch run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experiment_ref: Option<String>,
+    /// Spec §8 pre-flight: when the worst-case cost estimate exceeds the
+    /// configured threshold the submission is refused unless this is set —
+    /// the refusal carries the estimate, so confirming is an informed act.
+    #[serde(default)]
+    pub confirm_cost: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

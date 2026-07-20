@@ -47,6 +47,9 @@ pub struct Config {
     pub vast_api_key: Option<String>,
     /// Minutes reserved at the end of a lease for drain.
     pub drain_window_min: f64,
+    /// Dollars above which a submission's worst-case cost estimate requires
+    /// confirm_cost=true (spec §8 pre-flight).
+    pub confirm_cost_threshold: f64,
     /// How often the reconcile loop runs.
     pub reconcile_interval: Duration,
     /// Idle-reaper threshold.
@@ -124,6 +127,12 @@ impl Config {
                 .with_context(|| format!("parsing {}", env::DRAIN_WINDOW_MIN))?,
             Err(_) => DEFAULT_DRAIN_WINDOW_MIN,
         };
+        let confirm_cost_threshold = match std::env::var(env::CONFIRM_COST_THRESHOLD) {
+            Ok(raw) => raw
+                .parse()
+                .with_context(|| format!("parsing {}", env::CONFIRM_COST_THRESHOLD))?,
+            Err(_) => chuk_train_proto::DEFAULT_CONFIRM_COST_THRESHOLD,
+        };
 
         let allowed_emails = std::env::var(env::ALLOWED_EMAILS)
             .unwrap_or_default()
@@ -147,6 +156,7 @@ impl Config {
             min_protocol,
             vast_api_key,
             drain_window_min,
+            confirm_cost_threshold,
             reconcile_interval,
             idle_reap,
             google_client_id: std::env::var(env::GOOGLE_CLIENT_ID)

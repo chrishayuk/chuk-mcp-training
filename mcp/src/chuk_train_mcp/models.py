@@ -334,6 +334,9 @@ class SubmitRunRequest(BaseModel):
     # execution realises. When set, the CP's mirror reports into it instead of
     # minting a new run. Omit for an unattached scratch run.
     experiment_ref: str | None = None
+    # Spec §8 pre-flight: required when the worst-case estimate exceeds the
+    # control plane's confirm threshold; the refusal carries the estimate.
+    confirm_cost: bool = False
 
 
 class BuildCodeUnitRequest(BaseModel):

@@ -142,6 +142,10 @@ pub const BUDGET_PERIOD_MONTH: &str = "month";
 pub const BUDGET_PERIOD_ALL: &str = "all";
 pub const DEFAULT_BUDGET_PERIOD: &str = BUDGET_PERIOD_MONTH;
 
+/// Dollars above which a submission's worst-case estimate requires
+/// `confirm_cost=true` (spec §8 pre-flight; env-overridable).
+pub const DEFAULT_CONFIRM_COST_THRESHOLD: f64 = 5.0;
+
 /// Default number of log lines returned by the tail endpoint.
 pub const DEFAULT_LOG_TAIL_LINES: u32 = 100;
 /// Default page size for run listings.
@@ -217,6 +221,9 @@ pub mod env {
     pub const IDLE_REAP_S: &str = "CHUK_TRAIN_IDLE_REAP_S";
     /// Drain-window override (minutes); short values speed local lease tests.
     pub const DRAIN_WINDOW_MIN: &str = "CHUK_TRAIN_DRAIN_WINDOW_MIN";
+    /// Dollar threshold above which a submission's worst-case cost estimate
+    /// requires confirm_cost=true (spec §8 pre-flight).
+    pub const CONFIRM_COST_THRESHOLD: &str = "CHUK_TRAIN_CONFIRM_COST_THRESHOLD";
     /// Provider selection for the mock/real driver registry (e.g. "mock,vast").
     pub const PROVIDERS: &str = "CHUK_TRAIN_PROVIDERS";
     /// Vast API key (VastProvider only; VPS-side, never on workers).

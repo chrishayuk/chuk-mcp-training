@@ -155,6 +155,14 @@ pub fn evaluate(
     None
 }
 
+/// Worst-case dollar estimate for a submission (spec §8 pre-flight): the run's
+/// wall-clock ceiling priced at the most expensive live lease. Zero when
+/// nothing leased is billing — persistent/free workers have no hourly price.
+pub fn estimate_run_cost(live: &[Lease], timeout_s: u64) -> f64 {
+    let max_price_hr = live.iter().map(|l| l.price_hr).fold(0.0, f64::max);
+    max_price_hr * timeout_s as f64 / 3600.0
+}
+
 /// The spend report (spec §6 `spend_status(period)`): per-provider committed +
 /// period-spent, with cap/headroom attached where a matching-period budget
 /// exists.
@@ -312,6 +320,15 @@ mod tests {
         // An `all` budget would have counted both: 13 + 5 > 10.
         let all_time = vec![budget("provider:vast", 10.0, "all")];
         assert!(evaluate(&all_time, &ledger, &[], "vast", 5.0, MID_JULY).is_some());
+    }
+
+    #[test]
+    fn estimate_prices_the_timeout_at_the_dearest_live_lease() {
+        let live = vec![lease("vast", 2.0, 60.0), lease("lambda", 3.0, 60.0)];
+        // 2h at $3/hr — the dearest lease is the worst case.
+        assert_eq!(estimate_run_cost(&live, 2 * 3600), 6.0);
+        // No billing workers → nothing to price the run against.
+        assert_eq!(estimate_run_cost(&[], 12 * 3600), 0.0);
     }
 
     #[test]

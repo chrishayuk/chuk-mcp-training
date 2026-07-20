@@ -245,6 +245,7 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         arch: str | None = None,
         timeout_s: int = DEFAULT_TRAIN_TIMEOUT_S,
         experiment_ref: str | None = None,
+        confirm_cost: bool = False,
     ) -> dict[str, Any]:
         """Queue a train run against a built code unit (spec §5.1 JobSpec).
 
@@ -255,6 +256,11 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         Pass experiment_ref to attach this execution to an existing
         experiments-server logical run (its RUN-… id): the CP reports into that
         run rather than minting a new one. Omit it for an unattached scratch run.
+
+        Cost pre-flight (spec §8): when the worst-case estimate (timeout_s at
+        the most expensive live lease) exceeds the confirm threshold, the
+        submission is refused with the estimate — read it, then resubmit with
+        confirm_cost=True only if the cost is genuinely intended.
         """
         spec = TrainSpec(
             code=CodeRef(name=code_name, sha=code_sha),
@@ -265,7 +271,9 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
             arch=arch,
             timeout_s=timeout_s,
         )
-        request = SubmitRunRequest(name=name, spec=spec, experiment_ref=experiment_ref)
+        request = SubmitRunRequest(
+            name=name, spec=spec, experiment_ref=experiment_ref, confirm_cost=confirm_cost
+        )
         return await _envelope(cp.post_model(API_RUNS, request, SubmitRunResponse))
 
     @mcp.tool
