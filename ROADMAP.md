@@ -12,8 +12,8 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 | **M1** | train: code units, metrics, lineage checkpoints, resume | ✅ | ✅ **real Colab T4** (E1) — trains, R2 checkpoints, resume passed | E1 |
 | **M2** | leases, drain, provider-verified destroy, reconcile/orphan-kill, ledger | ✅ | 🟡 **mock provider locally** — live Vast pending | E2 |
 | **M3** | packing scheduler (job classes, learned estimates, `submit_batch`, utilization) | ⬜ | — | E3 |
-| **M4** | budget caps, watchdog gates, one-page dashboard | 🟡 **dashboard done**; caps + watchdogs pending | dashboard live | E4 |
-| **M5** | sweeps, panel gates, lazarus `load_checkpoint`, dynamics curve, Lambda driver | ⬜ | — | E5 |
+| **M4** | budget caps, watchdog gates, one-page dashboard | ✅ **code done (2026-07-20)** — caps enforced on provision/extend, watchdog gates checkpoint-then-stop | dashboard live; E4 run pending | E4 |
+| **M5** | sweeps, panel gates, lazarus `load_checkpoint`, dynamics curve, Lambda driver | 🟡 **sweeps done (2026-07-20)**; rest pending | — | E5 |
 
 ## What's built beyond the milestone list
 
@@ -90,26 +90,34 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
    (spec §7, reusing the `detach` requeue; persistent workers keep their run per M3.2), and the
    scheduler no longer assigns new work to a worker unreachable past 90s. Both thresholds are
    pure decisions (`eligible_for_assignment`/`should_reap`) off the fleet's `heartbeat_age_s`.
-3. **M4 budgets + watchdogs** — the dashboard's done; the remaining M4 is per-provider/
-   label caps checked on provision/extend, and watchdog gates (isnan/no-improve/grad-blowup)
-   that checkpoint-then-stop (reusing the stop path from step 1). Surface as MCP
-   `set_budget(scope, cap, period)` / `spend_status(period)` / `register_gate` /
-   `check_gates` per spec §6/§8.
-4. **Cost pre-flight (`confirm_cost`)** — submissions whose estimate exceeds a configurable
-   threshold require `confirm_cost=true` and the refusal carries the shown estimate;
-   sweeps show the multiplied total (spec §8). Closes the third cost leak (sweep
-   multiplication) at the submit boundary.
-5. **`list_runs` filtering + paging** — state / `experiment_ref` filters + `offset`, so an
-   agent (and the dashboard) can ask "what's still running?" or "all executions of RUN-…"
-   without pulling the whole recent window client-side.
-6. **M5 sweeps (first slice)** — `submit_sweep` (template + axes fan-out, per-sweep
-   concurrency) + `sweep_status` cross-child aggregation at matched steps. `submit_batch`
-   stays gated on M3 packing.
-7. **Artifact tools: delegate, don't duplicate** — spec §6's `register_artifact` /
-   `list_artifacts` / `artifact_lineage` are owned by chuk-experiments-server (its
-   artifact/pin/lineage system is the system of record); the harness keeps only
-   `artifact_url` + checkpoint tools and reports artifacts through the mirror. Spec
-   amended accordingly.
+3. ~~**M4 budgets + watchdogs**~~ ✅ **done (2026-07-20).** Budget caps (`global` /
+   `provider:<name>`, per `month`/`all` period) enforced on provision (pre-flight +
+   exact-price check that destroys a refused instance) and extend; watchdog gates with a
+   closed expr grammar (`isnan(last(k))`, `no_improve(k, Nmin)`, `last(k) <op> v`)
+   evaluated on metric ingest + `check_gates` reads, `stop_run` action reuses the stop
+   path (SIGTERM grace = the trainer's checkpoint window). MCP: `set_budget` /
+   `list_budgets` / `delete_budget` / `spend_status(period)` / `register_gate` /
+   `check_gates`. Label-scope budgets remain unimplemented (leases don't carry labels).
+   Found along the way: a NaN metric broke ingest outright on SQLite — non-finite values
+   now round-trip so `isnan` gates actually see them. Gate E4 still to run.
+4. ~~**Cost pre-flight (`confirm_cost`)**~~ ✅ **done (2026-07-20).** Submissions whose
+   worst-case estimate (timeout × dearest live lease) exceeds
+   `CHUK_TRAIN_CONFIRM_COST_THRESHOLD` (default $5) are refused with the estimate unless
+   `confirm_cost=true`; sweeps refuse with the **multiplied** total.
+5. ~~**`list_runs` filtering + paging**~~ ✅ **done (2026-07-20).** `state` /
+   `experiment_ref` / `sweep_id` filters + `offset` paging (stable id-tiebroken order)
+   through store → REST → MCP.
+6. ~~**M5 sweeps (first slice)**~~ ✅ **done (2026-07-20).** `submit_sweep` fans a
+   template out over `seed`/`overrides.<key>` axes (≤256 children, `SWEEP-…` ids, children
+   are `EXEC-…` runs with `sweep_id`); the scheduler holds children to the sweep's
+   concurrency; `sweep_status` reports per-child axis assignments + cross-child
+   mean/std/range at matched steps. Sweep-scope gates + `submit_batch` stay open (the
+   latter gated on M3 packing).
+7. **Artifact tools: delegate, don't duplicate** ✅ *(spec amended 2026-07-20)* — spec §6's
+   `register_artifact` / `list_artifacts` / `artifact_lineage` are owned by
+   chuk-experiments-server (its artifact/pin/lineage system is the system of record); the
+   harness keeps only `artifact_url` + checkpoint tools and reports artifacts through the
+   mirror.
 8. **Single-use, per-provision join tokens** — the spec wants tokens minted per provision and
    bound to a worker id + lease; today a single static config token lets any holder join as any
    worker forever. Mint a one-time token in `provision`, bind + expire on first use.
