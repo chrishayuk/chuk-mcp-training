@@ -14,9 +14,12 @@ provider-verified destroy, reconcile / orphan-kill, ledger) is verified locally
 via a mock provider; live Vast E2 pending.
 
 Beyond the milestones, the harness now has a **full Google-authed operator
-dashboard** (a clean per-run view — live loss + metric toggles, streamed logs,
-checkpoints with metadata + download, events, out-links — plus fleet/runs filters
-and pagination); a complete **Drive cold-archive tier** (completed runs auto-tier
+dashboard** — a tabbed per-run view (a light **Overview** that drills into
+dedicated **Training** / **Logs** / **Events** / **System** screens, the System
+tab graphing live GPU/VRAM/temp/power/CPU/memory from the worker running the run)
+plus fleet/runs filters, pagination, and per-worker live GPU-util; **real-time
+host telemetry** (connected workers stream `sys/*` every few seconds — chuk-compute
+M4); a complete **Drive cold-archive tier** (completed runs auto-tier
 their final checkpoint + logs to Drive, R2 lifecycle expires the hot copies,
 retrieval resolves R2 *or* Drive, with `archive_run`/`archive_runs`/`archive_status`
 MCP tools); and **RBAC** — users + roles (sysadmin › admin › write › read) in a
@@ -36,7 +39,7 @@ and no chuk-experiments-server (reporting mirror off). The harness's own Neon/
 SQLite store + queue are always the source of truth; nothing outside is a hard
 dependency.
 
-**chuk-compute substrate (M1–M3 done).** Underneath the training-first control
+**chuk-compute substrate (M1–M4 done).** Underneath the training-first control
 plane the rig is being factored into a **compute fabric**: a permanently
 compute-generic worker + wire protocol (spec `docs/specs/chuk-compute-spec.md`).
 - **M1** — the worker (`chuk-compute-worker`) is a domain-free executor that runs
@@ -53,6 +56,10 @@ compute-generic worker + wire protocol (spec `docs/specs/chuk-compute-spec.md`).
   never torn down. A version-mismatched persistent worker **self-updates** in
   place (download → verify → atomic replace → re-exec; leased workers just exit).
   All three parts proven end-to-end.
+- **M4 (host telemetry)** — a sampler streams `sys/*` (GPU via `nvidia-smi`, CPU/
+  memory via `sysinfo`) over the existing Metric channel, out-of-band; the CP keeps
+  a pruned per-worker window and the dashboard renders live gauges + per-metric
+  graphs. macmon (Apple-Silicon GPU) + OOM/thermal gates are the follow-ups.
 
 The substrate will grow to run evals, benchmarks, cells, agents, and RL loops
 (spec §10–§11) while the control plane stays training-first.
@@ -81,9 +88,10 @@ control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
   metadata store (`postgres:`/`postgresql:` → Neon, or `sqlite:path.db` local),
   the artifact blob store (`r2:`/`s3:`, or `file:/path`), and the provider
   registry (`mock`, `vast` skeleton). Modules include `store` (SQLite + Postgres
-  adapters), `archive` (Drive tiering + backstop sweep), `drive` (Drive v3
-  client), `apikey` (RBAC keys + bearer→role resolution), and `dash` (the
-  dashboard). Builds code units, mints run-scoped upload grants, ingests metrics
+  adapters, each split into per-domain files behind 10 cohesive sub-traits —
+  `WorkerStore`/`RunStore`/…), `archive` (Drive tiering + backstop sweep), `drive`
+  (Drive v3 client), `apikey` (RBAC keys + bearer→role resolution), and `dash` (the
+  dashboard — a thin Rust handler inlining `dash/{index.html,dash.css,app.js}`). Builds code units, mints run-scoped upload grants, ingests metrics
   + checkpoints, resumes, auto-archives completed runs, and runs the lease clock
   + reconcile loop that enforce the wall and kill orphans.
 - `crates/chuk-compute-worker` — the join-anywhere worker binary (depends only on
@@ -106,7 +114,10 @@ control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
 - `scripts/authorize-drive.py` — one-time `drive.file` offline auth → refresh token.
 - `bootstrap/colab_cell.py` — the one Colab cell that joins a T4 as a worker (E0).
 - `deploy/` — Dockerfile + fly.toml (`auto_stop_machines = "off"`); stateless on
-  Neon (the store URL is a Fly secret; the `/data` volume is legacy).
+  Neon (the store URL is a Fly secret; the `/data` volume is legacy). Deploys are
+  **CI/CD** — a push to `main` that passes clippy + tests (incl. the Postgres
+  adapter against a CI `postgres` service) + the worker target-matrix auto-deploys
+  to Fly (`.github/workflows/ci.yml`).
 
 ## Run locally
 

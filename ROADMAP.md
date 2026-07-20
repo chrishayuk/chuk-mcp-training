@@ -59,8 +59,16 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   run to run) is still open — see below.
 - **Dogfooding demo** — `scripts/demo.sh` spins up a local CP + mock workers running the
   (enriched) stub-trainer, so the dashboard fills with live data; isolated from prod.
-- **Fly deploy**: `chuk-mcp-training.fly.dev`; the CP serves the agent binary and
-  generates the Colab bootstrap cell (`colab_cell`).
+- **Fly deploy via CI/CD**: `chuk-mcp-training.fly.dev`. A push to `main` runs clippy + tests
+  (incl. the Postgres adapter against a throwaway `postgres:16` CI service) and the worker
+  target-matrix, then **auto-deploys to Fly on green** — no hand deploys. The CP serves the agent
+  binary and generates the Colab bootstrap cell (`colab_cell`, now `install.sh`-based).
+- **Real-time host telemetry** (chuk-compute M4): connected workers stream `sys/*` (GPU/CPU/memory)
+  every few seconds; the dashboard shows live gauges + per-metric graphs (see the tabbed run view).
+- **Modular internals**: the operator dashboard is now three inlined assets (`dash/{index.html,
+  dash.css,app.js}`) behind a thin Rust handler, and the store's monolithic adapters are split into
+  10 per-domain sub-traits (`WorkerStore`/`RunStore`/… → `store/{sqlite,postgres}/*.rs`); every
+  store file is ≥90% line-covered (sqlite in-process, postgres via the CI Postgres service).
 
 ## Immediate next steps
 
@@ -141,9 +149,13 @@ agent/MCP-deployment platform never colonizes the rig. Sequencing (spec §11):
   persistent worker downloads → verifies → atomically replaces itself → re-execs (leased workers
   just exit). **All three proven** (bounce-the-CP survive-disconnect; forced-version self-update).
   `WorkerClass` is an enum so destroying a persistent worker is unrepresentable.
-- **M4 — `sys/*` telemetry sampler** — one sampler task over the existing Metric channel: NVML
-  (`nvml-wrapper`, runtime-loaded) + `sysinfo` first; macmon/IOReport MPS once the Mac is on
-  (tier-2 best-effort, gaps as absent metrics not zeros). Feeds packing-util, OOM/thermal gates, MFU.
+- **M4 — `sys/*` telemetry sampler** ✅ **done (2026-07-20).** One sampler task streams `sys/*`
+  over the existing Metric channel (out-of-band: no `job_id`, not outboxed) — GPU via `nvidia-smi`
+  (the distributed worker is static musl and can't `dlopen` NVML, so a subprocess is the portable
+  choice; degrades to absent GPU metrics, not zeros) + CPU/memory via `sysinfo`; macmon MPS once the
+  Mac is on. The CP ingests host samples into a pruned `worker_samples` window (latest-per-worker on
+  the fleet, per-key series for sparklines); the dashboard's **System** tab renders a graph per
+  metric. macmon (Apple-Silicon GPU) + the OOM/thermal gates + packing-util/MFU are the follow-ups.
 - **M5 — service jobs** — `ServiceSpec` + registry + `needs` wiring + `Secret` env refs;
   LARQL-on-Mac as the first service, cell-runtime second.
 - **M6 — campaigns + budgets** — `submit_campaign(template, matrix)` fan-out with CP-side spend
@@ -189,15 +201,14 @@ candidate *Requirements-aware assignment* / *generalized bootstrap* items feed i
   dark; a disk-backed outbound buffer + monotonic seq/ack makes "tolerate a dark CP" real.
 
 **Product / UX**
-- **Overview → drill-in screen hierarchy + a real-time telemetry tab** (M, high value) — restructure
-  the per-run view into *progressive disclosure*: the overview shows a brief, latest-value summary of
-  each signal (loss, logs tail, CPU/mem/GPU, checkpoints, events), and each is a click-through to its
-  own detailed screen you can drill into. A dedicated **Telemetry tab** streams CPU / memory / GPU
-  utilization (+ mem/temp/power) in real time the way tokens/sec streams today — consuming the `sys/*`
-  metric namespace (chuk-compute M4), not crammed into the overview. Detailed screens per signal:
-  full historical **logs** view (search/filter/follow), a metrics explorer (pick/compare series), a
-  telemetry board (per-device curves), checkpoints, and events. Pairs with **Live dashboard push
-  (SSE)** below so the detailed screens are truly live rather than 2s-polled.
+- **Overview → drill-in screen hierarchy + a real-time telemetry tab** ✅ **done (2026-07-20).**
+  The per-run view is now tabbed *progressive disclosure*: a light **Overview** (status strip +
+  compact system gauges + last few events + recent-log tail, each drilling into its screen) plus
+  dedicated **Training** (metrics chart + checkpoints), full **Logs**, full **Events**, and a
+  **System** tab with a time-series graph per `sys/*` metric (GPU util / VRAM / temp / power / CPU /
+  memory) over the retained window. The fleet table also shows live GPU-util per worker. Still open
+  here: log search/filter/follow and a metrics explorer (pick/compare) — and **live push (SSE)**
+  below so the detailed screens stream rather than 2s-poll.
 - **Notifications** (S–M) — run complete/fail, gate trip, orphan kill, budget breach to a
   webhook/Slack/email sink; turns the rig from pull to push. Orphan kills only warn to the log today.
 - **Live dashboard push (SSE)** (S–M) — the per-run view polls five endpoints every 2s; relay

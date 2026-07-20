@@ -269,8 +269,11 @@ never torn down. **Proven** (kill the CP mid-run → job runs through the outage
 replay → completes). **M3.3 — DONE:** a version-mismatched persistent worker self-updates from a
 `HelloReject` (the CP sends the target's `/agent/<triple>` URL + sha256; the worker downloads →
 verifies → atomically replaces itself → re-execs; a leased worker gets a bare reject and exits).
-Proven. **M3 complete.** M4 — `sys/*`
-sampler (NVML + sysinfo first; macmon-based MPS once the Mac is on). M5 — service jobs, registry,
+Proven. **M3 complete.** **M4 — DONE:** the `sys/*` telemetry sampler streams GPU (via `nvidia-smi`
+subprocess — the distributed worker is static musl and can't `dlopen` NVML) + CPU/memory (`sysinfo`)
+over the existing Metric channel, out-of-band (no `job_id`, not outboxed); the CP ingests it into a
+pruned per-worker window and the dashboard renders live gauges + per-metric graphs. macmon-based MPS
+(Apple-Silicon GPU) once the Mac is on. M5 — service jobs, registry,
 `needs` wiring, secrets; LARQL-on-Mac as first service, cell-runtime second. M6 — campaigns with
 budgets and the bench template's pinning gate. M7 — first RL composition: controller job + rollout
 campaign + cell-signed scoring against an existing training template.
