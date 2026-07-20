@@ -229,6 +229,31 @@ class ColabCell(BaseModel):
     cell: str
 
 
+class TelemetryPoint(BaseModel):
+    ts: float
+    value: float
+
+
+class WorkerTelemetry(BaseModel):
+    """A worker's latest host sample (chuk-compute M4 `sys/*`): GPU/CPU/memory
+    utilisation, VRAM, temperature, power — plus recent per-key series."""
+
+    worker_id: str
+    sampled_at: float
+    values: dict[str, float] = Field(default_factory=dict)
+    series: dict[str, list[TelemetryPoint]] = Field(default_factory=dict)
+
+
+class WhoAmI(BaseModel):
+    """The caller's own resolved identity: role, team, and whether a personal
+    experiments-server key is linked."""
+
+    role: str
+    team_id: str | None = None
+    subject: str | None = None
+    experiments_key_set: bool = False
+
+
 class WorkerInfo(BaseModel):
     id: str
     labels: list[str]
@@ -251,6 +276,9 @@ class RunSummary(BaseModel):
     # The experiments-server logical run (RUN-…) this EXEC-… execution belongs
     # to, if any; None for an unattached scratch run.
     experiment_ref: str | None = None
+    # Email of the submitting user (from their session or API key's owner);
+    # None for pre-tracking runs or the legacy master token.
+    created_by: str | None = None
     created_at: float
     updated_at: float
 
@@ -322,12 +350,21 @@ class Envelope(BaseModel):
 
     ok: bool
     data: Any | None = None
+    # List results carry a count, and empty lists a message saying why the
+    # result may be empty — so an agent can tell "nothing exists" from
+    # "wrong query" from "tool failure".
+    count: int | None = None
+    message: str | None = None
     error: str | None = None
     detail: str | None = None
 
     @classmethod
-    def success(cls, data: Any) -> dict[str, Any]:
-        return cls(ok=True, data=data).model_dump(exclude_none=True)
+    def success(
+        cls, data: Any, count: int | None = None, message: str | None = None
+    ) -> dict[str, Any]:
+        return cls(ok=True, data=data, count=count, message=message).model_dump(
+            exclude_none=True
+        )
 
     @classmethod
     def failure(cls, error: str, detail: str | None = None) -> dict[str, Any]:

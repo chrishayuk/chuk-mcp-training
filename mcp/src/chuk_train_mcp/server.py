@@ -37,6 +37,8 @@ from .constants import (
     api_worker_extend,
     api_worker_lease,
     api_worker_teardown,
+    api_worker_telemetry,
+    API_ME,
     API_ARTIFACT_URL,
     API_CODE_UNITS,
     API_COLAB_CELL,
@@ -74,10 +76,15 @@ from .models import (
     TeardownRequest,
     TeardownResult,
     TrainSpec,
+    WhoAmI,
     WorkerInfo,
+    WorkerTelemetry,
 )
 
 _PARAM_LIMIT = "limit"
+_PARAM_OFFSET = "offset"
+_PARAM_STATE = "state"
+_PARAM_EXPERIMENT_REF = "experiment_ref"
 _PARAM_LINES = "lines"
 _PARAM_KEYS = "keys"
 _PARAM_SINCE_STEP = "since_step"
@@ -96,9 +103,37 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
     )
 
     @mcp.tool
+    async def whoami() -> dict[str, Any]:
+        """The caller's own resolved identity: role (read/write/admin/sysadmin),
+        team, and whether a personal experiments-server key is linked.
+
+        Check this before attempting write- or admin-scoped tools — a 403 from
+        them means the presented credential's role is too low, not a bug. If
+        `experiments_key_set` is false, mirrored runs report under the shared
+        default identity; link a personal key on the dashboard's Team screen
+        (never paste an API key through this tool surface).
+        """
+        return await _envelope(cp.get_model(API_ME, WhoAmI))
+
+    @mcp.tool
     async def fleet() -> dict[str, Any]:
         """List all workers: id, GPU/hardware, connection state, heartbeat age, current run."""
-        return await _envelope(cp.get_list(API_FLEET, WorkerInfo))
+        return await _envelope(
+            cp.get_list(API_FLEET, WorkerInfo),
+            empty_hint="No workers connected. Provision a leased one (provision), "
+            "or generate a Colab bootstrap cell (colab_cell).",
+        )
+
+    @mcp.tool
+    async def worker_telemetry(worker_id: str) -> dict[str, Any]:
+        """The worker's latest host telemetry sample (`sys/*`): GPU/CPU/memory
+        utilisation, VRAM, temperature, power — plus recent per-key series.
+
+        Use it to judge whether a worker is actually busy before submitting,
+        tearing down, or extending a lease. 404s if the worker has never
+        reported telemetry (worker ids come from fleet).
+        """
+        return await _envelope(cp.get_model(api_worker_telemetry(worker_id), WorkerTelemetry))
 
     @mcp.tool
     async def submit_shell(
@@ -113,9 +148,34 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         return await _envelope(cp.post_model(API_RUNS_SHELL, request, SubmitRunResponse))
 
     @mcp.tool
-    async def list_runs(limit: int = DEFAULT_RUN_LIST_LIMIT) -> dict[str, Any]:
-        """Recent runs with state, worker, and exit code."""
-        return await _envelope(cp.get_list(API_RUNS, RunSummary, params={_PARAM_LIMIT: limit}))
+    async def list_runs(
+        limit: int = DEFAULT_RUN_LIST_LIMIT,
+        offset: int = 0,
+        state: str | None = None,
+        experiment_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Recent runs with state, worker, and exit code — newest first.
+
+        Filter with `state` (queued|assigned|running|completed|failed|cancelled)
+        or `experiment_ref` (an experiments-server RUN-… id: every execution of
+        that logical run). Page with limit/offset; a full page means there may
+        be more.
+        """
+        params: dict[str, Any] = {_PARAM_LIMIT: limit, _PARAM_OFFSET: offset}
+        if state is not None:
+            params[_PARAM_STATE] = state
+        if experiment_ref is not None:
+            params[_PARAM_EXPERIMENT_REF] = experiment_ref
+        filtered = state is not None or experiment_ref is not None or offset > 0
+        return await _envelope(
+            cp.get_list(API_RUNS, RunSummary, params=params),
+            empty_hint=(
+                "No runs matched this filter/page — try dropping the state/"
+                "experiment_ref filter or resetting offset to 0."
+                if filtered
+                else "No runs recorded yet. Queue one with submit_shell or submit_run."
+            ),
+        )
 
     @mcp.tool
     async def run_status(run_id: str) -> dict[str, Any]:
@@ -148,7 +208,10 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
     @mcp.tool
     async def run_events(run_id: str) -> dict[str, Any]:
         """The run's append-only lifecycle event log (provenance record)."""
-        return await _envelope(cp.get_list(api_run_events(run_id), RunEvent))
+        return await _envelope(
+            cp.get_list(api_run_events(run_id), RunEvent),
+            empty_hint="No events for this run — check the run_id against list_runs.",
+        )
 
     # -- M1: code units, train runs, metrics, checkpoints, artifacts --------
 
@@ -241,7 +304,11 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
     @mcp.tool
     async def list_checkpoints(run_id: str) -> dict[str, Any]:
         """Checkpoints uploaded for a run, with lineage-complete metadata."""
-        return await _envelope(cp.get_list(api_run_checkpoints(run_id), CheckpointInfo))
+        return await _envelope(
+            cp.get_list(api_run_checkpoints(run_id), CheckpointInfo),
+            empty_hint="No checkpoints for this run. Train runs upload on their "
+            "checkpoint-policy cadence; shell runs never checkpoint.",
+        )
 
     @mcp.tool
     async def pin_checkpoint(run_id: str, step: int, name: str) -> dict[str, Any]:
@@ -290,7 +357,11 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
             params["gpu"] = gpu
         if max_price_hr is not None:
             params["max_price_hr"] = max_price_hr
-        return await _envelope(cp.get_list(API_PROVIDER_OFFERS, Offer, params=params))
+        return await _envelope(
+            cp.get_list(API_PROVIDER_OFFERS, Offer, params=params),
+            empty_hint="No offers matched — relax the gpu or max_price_hr filter, "
+            "or try another provider.",
+        )
 
     @mcp.tool
     async def provision(
@@ -353,8 +424,13 @@ def _dump(value: Any) -> Any:
     return value.model_dump(mode="json") if isinstance(value, BaseModel) else value
 
 
-async def _envelope(awaitable: Any) -> dict[str, Any]:
-    """Run a client call and wrap the outcome; tools never raise."""
+async def _envelope(awaitable: Any, empty_hint: str | None = None) -> dict[str, Any]:
+    """Run a client call and wrap the outcome; tools never raise.
+
+    List results carry a `count`; an empty list additionally carries
+    `empty_hint` as `message`, so the agent can tell "nothing exists" (and what
+    to do about it) from "wrong query" or "tool failure".
+    """
     try:
         result = await awaitable
     except ControlPlaneError as exc:
@@ -362,7 +438,11 @@ async def _envelope(awaitable: Any) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — envelope pattern: surface, don't crash
         return Envelope.failure("unexpected_error", repr(exc))
     if isinstance(result, list):
-        return Envelope.success([_dump(item) for item in result])
+        return Envelope.success(
+            [_dump(item) for item in result],
+            count=len(result),
+            message=empty_hint if not result else None,
+        )
     return Envelope.success(_dump(result))
 
 

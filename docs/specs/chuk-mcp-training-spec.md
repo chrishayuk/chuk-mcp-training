@@ -363,13 +363,6 @@ def archive_status(run_id: str | None = None) -> ArchiveStatus
 def build_code_unit(repo: str, commit: str, name: str | None = None) -> CodeUnitRef
      # tarball + uv.lock + manifest, hashed, uploaded; agents cache by hash
 @tool
-def register_artifact(name: str, kind: str, uri: str, hash: str) -> Ack
-@tool
-def list_artifacts(kind: str | None = None, name: str | None = None) -> list[ArtifactInfo]
-@tool
-def artifact_lineage(ref: str, direction: str = "up") -> LineageGraph
-     # "up": everything this was built from; "down": everything built from this
-@tool
 def artifact_url(name: str, ttl_min: int = 60) -> SignedUrl    # lazarus pulls via this
 @tool
 def register_gate(scope_id: str, name: str, expr: str, scope: str = "run",
@@ -380,6 +373,29 @@ def check_gates(scope_id: str) -> list[GateVerdict]
 
 Watchdogs are gates with `action="stop_run"`: `isnan(last(loss))`,
 `no_improve(loss, 120min)`, `last(grad_norm) > 1e3`. Auto-stop always checkpoints first.
+
+> **Amended 2026-07-20 — artifact registry delegated.** Earlier drafts specified
+> `register_artifact` / `list_artifacts` / `artifact_lineage` here. That registry is
+> **owned by chuk-experiments-server** (its artifact/pin/lineage system is the system of
+> record for research artifacts); duplicating it in the harness would split the record.
+> The harness keeps `artifact_url` + the checkpoint tools (its execution-side handles) and
+> reports checkpoints/artifacts into the experiments-server through the §11.6 mirror.
+
+### Identity & fleet introspection
+
+```python
+@tool
+def whoami() -> WhoAmI                 # caller's role/team + experiments_key_set;
+                                       # check before write/admin tools — never a path
+                                       # for passing key material through model context
+@tool
+def worker_telemetry(worker_id: str) -> WorkerTelemetry
+     # latest sys/* host sample (GPU/CPU/mem/VRAM/temp/power) + recent per-key series
+```
+
+All list-returning tools return `{ok, data, count}`, and an empty list additionally
+carries a `message` explaining the likely reason and next action — an agent must be able
+to tell "nothing exists" from "wrong query" from "tool failure" without guessing.
 
 ---
 

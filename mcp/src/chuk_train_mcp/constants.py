@@ -21,6 +21,7 @@ API_PROVISION: Final = "/api/provision"
 API_COLAB_CELL: Final = "/api/colab_cell"
 API_SPEND: Final = "/api/spend"
 API_ARCHIVE: Final = "/api/archive"
+API_ME: Final = "/api/me"
 
 
 def api_worker_lease(worker_id: str) -> str:
@@ -33,6 +34,10 @@ def api_worker_extend(worker_id: str) -> str:
 
 def api_worker_teardown(worker_id: str) -> str:
     return f"/api/workers/{worker_id}/teardown"
+
+
+def api_worker_telemetry(worker_id: str) -> str:
+    return f"/api/workers/{worker_id}/telemetry"
 
 
 def api_run(run_id: str) -> str:

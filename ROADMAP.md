@@ -69,6 +69,15 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   dash.css,app.js}`) behind a thin Rust handler, and the store's monolithic adapters are split into
   10 per-domain sub-traits (`WorkerStore`/`RunStore`/… → `store/{sqlite,postgres}/*.rs`); every
   store file is ≥90% line-covered (sqlite in-process, postgres via the CI Postgres service).
+- **Agent-first MCP surface** (2026-07-20, patterns borrowed from chuk-experiments-server's
+  tool design) — `whoami` (role/team/experiments-key-linked, so an agent can predict 403s
+  instead of debugging them) and `worker_telemetry` (live `sys/*` sample per worker) expose
+  the two CP routes agents previously couldn't reach; every list tool now returns
+  `count` + a self-describing `message` on empty results (distinguishes "nothing exists"
+  from "wrong query" from "tool failure"). Credential management (users/keys/worker tokens)
+  stays deliberately dashboard-only, mirroring the experiments-server's precedent; `whoami`
+  surfaces `experiments_key_set` so agents can *detect* a missing link and point the user at
+  the dashboard rather than pass key material through model context.
 
 ## Immediate next steps
 
@@ -83,13 +92,30 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
    pure decisions (`eligible_for_assignment`/`should_reap`) off the fleet's `heartbeat_age_s`.
 3. **M4 budgets + watchdogs** — the dashboard's done; the remaining M4 is per-provider/
    label caps checked on provision/extend, and watchdog gates (isnan/no-improve/grad-blowup)
-   that checkpoint-then-stop (reusing the stop path from step 1).
-4. **Single-use, per-provision join tokens** — the spec wants tokens minted per provision and
+   that checkpoint-then-stop (reusing the stop path from step 1). Surface as MCP
+   `set_budget(scope, cap, period)` / `spend_status(period)` / `register_gate` /
+   `check_gates` per spec §6/§8.
+4. **Cost pre-flight (`confirm_cost`)** — submissions whose estimate exceeds a configurable
+   threshold require `confirm_cost=true` and the refusal carries the shown estimate;
+   sweeps show the multiplied total (spec §8). Closes the third cost leak (sweep
+   multiplication) at the submit boundary.
+5. **`list_runs` filtering + paging** — state / `experiment_ref` filters + `offset`, so an
+   agent (and the dashboard) can ask "what's still running?" or "all executions of RUN-…"
+   without pulling the whole recent window client-side.
+6. **M5 sweeps (first slice)** — `submit_sweep` (template + axes fan-out, per-sweep
+   concurrency) + `sweep_status` cross-child aggregation at matched steps. `submit_batch`
+   stays gated on M3 packing.
+7. **Artifact tools: delegate, don't duplicate** — spec §6's `register_artifact` /
+   `list_artifacts` / `artifact_lineage` are owned by chuk-experiments-server (its
+   artifact/pin/lineage system is the system of record); the harness keeps only
+   `artifact_url` + checkpoint tools and reports artifacts through the mirror. Spec
+   amended accordingly.
+8. **Single-use, per-provision join tokens** — the spec wants tokens minted per provision and
    bound to a worker id + lease; today a single static config token lets any holder join as any
    worker forever. Mint a one-time token in `provision`, bind + expire on first use.
-5. **Live Vast E2** — rent 15 min, hang the agent, prove provider-verified destroy.
-6. **M3 packing** when there's rented-GPU pressure.
-7. **R2 lifecycle permission** (see backlog) so the R2 hot copies actually auto-expire.
+9. **Live Vast E2** — rent 15 min, hang the agent, prove provider-verified destroy.
+10. **M3 packing** when there's rented-GPU pressure.
+11. **R2 lifecycle permission** (see backlog) so the R2 hot copies actually auto-expire.
 
 *(E0 and E1 are done — both proven on a real Colab T4, including E1's resume test.)*
 
