@@ -73,7 +73,7 @@ pub async fn archive_status(State(state): State<Arc<AppState>>) -> Response {
     let runs = match state
         .hub
         .store
-        .runs(chuk_train_proto::DEFAULT_RUN_LIST_LIMIT)
+        .runs(&Default::default(), chuk_train_proto::DEFAULT_RUN_LIST_LIMIT)
         .await
     {
         Ok(runs) => runs,

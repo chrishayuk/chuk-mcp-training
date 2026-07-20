@@ -729,6 +729,45 @@ mod tests {
             Some("RUN-20260101-000000-00001"),
         );
         store.create_run("r2", &shell_spec(), None, None).await.expect("run2");
-        assert_eq!(store.runs(10).await.expect("runs").len(), 2);
+        assert_eq!(store.runs(&Default::default(), 10).await.expect("runs").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn runs_filters_by_state_and_ref_and_pages() {
+        let store = mem_store().await;
+        let attached = store
+            .create_run("a", &shell_spec(), Some("RUN-20260101-000000-00001"), None)
+            .await
+            .expect("run");
+        let scratch = store.create_run("b", &shell_spec(), None, None).await.expect("run");
+        store
+            .transition(&scratch, RunState::Completed, None, Some(0), serde_json::json!({}))
+            .await
+            .expect("t");
+
+        let completed = crate::store::RunQuery {
+            state: Some(RunState::Completed),
+            ..Default::default()
+        };
+        let got = store.runs(&completed, 10).await.expect("runs");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, scratch);
+
+        let by_ref = crate::store::RunQuery {
+            experiment_ref: Some("RUN-20260101-000000-00001".into()),
+            ..Default::default()
+        };
+        let got = store.runs(&by_ref, 10).await.expect("runs");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, attached);
+
+        // Offset paging: newest first, id-tiebroken, so page 2 of size 1 is the
+        // older run; an offset past the end is empty, not an error.
+        let page2 = crate::store::RunQuery { offset: 1, ..Default::default() };
+        let got = store.runs(&page2, 1).await.expect("runs");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, attached);
+        let past_end = crate::store::RunQuery { offset: 5, ..Default::default() };
+        assert!(store.runs(&past_end, 10).await.expect("runs").is_empty());
     }
 }

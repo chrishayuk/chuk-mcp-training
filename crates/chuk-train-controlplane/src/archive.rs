@@ -140,12 +140,13 @@ impl Archiver {
     /// One sweep pass: archive every completed run whose final isn't yet on
     /// Drive. Returns how many it archived this pass. Idempotent.
     pub async fn sweep_once(&self) -> Result<usize> {
-        let runs = self.store.runs(SWEEP_LIMIT).await?;
+        let completed = crate::store::RunQuery {
+            state: Some(RunState::Completed),
+            ..Default::default()
+        };
+        let runs = self.store.runs(&completed, SWEEP_LIMIT).await?;
         let mut archived = 0;
-        for run in runs
-            .into_iter()
-            .filter(|r| matches!(r.state, RunState::Completed))
-        {
+        for run in runs {
             match self.archive_run(&run.id, false).await {
                 Ok(Outcome::Archived { .. }) => archived += 1,
                 Ok(_) => {}

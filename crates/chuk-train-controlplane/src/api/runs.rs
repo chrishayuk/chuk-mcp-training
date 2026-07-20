@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chuk_train_proto::{
     BuildCodeUnitRequest, LogsResponse, MetricSeries, Role, RunEvent, RunId, RunRecord, RunSpec,
-    RunSummary, ShellSpec, SubmitRunRequest, SubmitRunResponse, SubmitShellRequest, WorkerId,
+    RunState, RunSummary, ShellSpec, SubmitRunRequest, SubmitRunResponse, SubmitShellRequest, WorkerId,
     WorkerInfo, WorkerTelemetry, DEFAULT_LOG_TAIL_LINES, DEFAULT_METRIC_DOWNSAMPLE,
     DEFAULT_RUN_LIST_LIMIT, DEFAULT_SHELL_TIMEOUT,
 };
@@ -67,16 +67,24 @@ pub async fn submit_shell(
 #[derive(Deserialize)]
 pub struct ListParams {
     limit: Option<u32>,
+    offset: Option<u32>,
+    state: Option<RunState>,
+    experiment_ref: Option<String>,
 }
 
 pub async fn list_runs(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListParams>,
 ) -> Response {
+    let query = crate::store::RunQuery {
+        state: params.state,
+        experiment_ref: params.experiment_ref,
+        offset: params.offset.unwrap_or(0),
+    };
     match state
         .hub
         .store
-        .runs(params.limit.unwrap_or(DEFAULT_RUN_LIST_LIMIT))
+        .runs(&query, params.limit.unwrap_or(DEFAULT_RUN_LIST_LIMIT))
         .await
     {
         Ok(runs) => Json::<Vec<RunSummary>>(runs).into_response(),

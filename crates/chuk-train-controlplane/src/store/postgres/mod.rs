@@ -431,7 +431,23 @@ mod pg_live {
             .expect("transition");
         let rec2 = store.run(&run_id).await.expect("run").expect("some");
         assert!(matches!(rec2.summary.state, RunState::Running));
-        assert!(store.runs(5).await.expect("runs").iter().any(|r| r.id == run_id));
+        assert!(store
+            .runs(&Default::default(), 5)
+            .await
+            .expect("runs")
+            .iter()
+            .any(|r| r.id == run_id));
+        // Filtered read: state + offset paging.
+        let running = crate::store::RunQuery {
+            state: Some(RunState::Running),
+            ..Default::default()
+        };
+        assert!(store.runs(&running, 5).await.expect("runs").iter().any(|r| r.id == run_id));
+        let queued = crate::store::RunQuery {
+            state: Some(RunState::Queued),
+            ..Default::default()
+        };
+        assert!(!store.runs(&queued, 5).await.expect("runs").iter().any(|r| r.id == run_id));
         assert!(!store.events(&run_id).await.expect("events").is_empty());
 
         // logs: monotonic n via COALESCE(MAX(n)+1), tail order

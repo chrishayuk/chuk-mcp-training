@@ -71,6 +71,16 @@ pub trait WorkerStore: Send + Sync {
     async fn worker_telemetry(&self, worker_id: &WorkerId) -> Result<Option<WorkerTelemetry>>;
 }
 
+/// Filter + page for [`RunStore::runs`]: optional state / external-parent
+/// filters, and the page offset. `Default` means "everything, first page".
+#[derive(Debug, Clone, Default)]
+pub struct RunQuery {
+    pub state: Option<RunState>,
+    /// Match runs attached to this experiments-server logical run (`RUN-…`).
+    pub experiment_ref: Option<String>,
+    pub offset: u32,
+}
+
 /// Run rows + the monotonic exec sequence, plus the experiments-server
 /// mirror ids and the durable reporting outbox (retried mirror events).
 #[async_trait]
@@ -135,7 +145,9 @@ pub trait RunStore: Send + Sync {
 
     async fn run(&self, run_id: &RunId) -> Result<Option<RunRecord>>;
 
-    async fn runs(&self, limit: u32) -> Result<Vec<RunSummary>>;
+    /// Newest-first page of runs matching `query` (id-tiebroken so paging is
+    /// stable across equal timestamps).
+    async fn runs(&self, query: &RunQuery, limit: u32) -> Result<Vec<RunSummary>>;
 }
 
 /// A run's streamed logs and its append-only lifecycle event log.

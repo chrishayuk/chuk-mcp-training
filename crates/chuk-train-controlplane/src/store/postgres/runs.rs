@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::store::prelude::*;
+use crate::store::RunQuery;
 
 #[async_trait]
 impl RunStore for PgStore {
@@ -185,12 +186,22 @@ impl RunStore for PgStore {
         row.map(|r| run_from_row(&r)).transpose()
     }
 
-    async fn runs(&self, limit: u32) -> Result<Vec<RunSummary>> {
-        // Postgres has no unsigned integers, so LIMIT is bound as i64.
-        let rows = sqlx::query("SELECT * FROM runs ORDER BY created_at DESC LIMIT $1")
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?;
+    async fn runs(&self, query: &RunQuery, limit: u32) -> Result<Vec<RunSummary>> {
+        // Postgres has no unsigned integers, so LIMIT/OFFSET are bound as i64;
+        // the `$n::text` casts keep NULL binds typed for the null-means-any filters.
+        let rows = sqlx::query(
+            "SELECT * FROM runs
+             WHERE ($1::text IS NULL OR state = $1)
+               AND ($2::text IS NULL OR experiment_ref = $2)
+             ORDER BY created_at DESC, id DESC
+             LIMIT $3 OFFSET $4",
+        )
+        .bind(query.state.map(RunState::as_str))
+        .bind(query.experiment_ref.as_deref())
+        .bind(limit as i64)
+        .bind(query.offset as i64)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter()
             .map(|r| Ok(run_from_row(r)?.summary))
             .collect()
