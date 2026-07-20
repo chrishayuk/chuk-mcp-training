@@ -331,6 +331,7 @@ mod tests {
     use super::*;
     use crate::store::prelude::*;
     use chuk_train_proto::ShellSpec;
+    use std::collections::BTreeMap;
 
     async fn mem_store() -> SqliteStore {
         // A private in-memory db; the single pooled connection keeps it alive
@@ -556,5 +557,178 @@ mod tests {
             .expect("set");
         let user = store.get_user("admin@example.com").await.expect("get_user").expect("some");
         assert_eq!(user.role, Role::Admin, "linking a key must not downgrade an existing role");
+    }
+
+    // ---- coverage: the remaining domains, exercised end-to-end on :memory: ----
+
+    fn a_lease(w: &str) -> Lease {
+        Lease {
+            worker_id: WorkerId(w.into()), provider: "vast".into(), instance_id: "i-1".into(),
+            price_hr: 0.5, granted_min: 60.0, drain_window_min: 5.0, started_at: 1000.0,
+            state: LeaseState::Active, extensions: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn code_unit_registers_and_reads_back() {
+        let store = mem_store().await;
+        let code = CodeRef { name: "gpt-nano".into(), sha: "abc123".into() };
+        let manifest = CodeUnitManifest {
+            name: "gpt-nano".into(), version: "0.1".into(),
+            entrypoints: BTreeMap::from([("train".to_owned(), "python train.py".to_owned())]),
+            python: Some("3.11".into()), requires: Default::default(),
+        };
+        assert!(store.code_unit("gpt-nano", "abc123").await.expect("q").is_none());
+        store.register_code_unit(&code, &manifest, "s3://unit.tar.zst").await.expect("register");
+        let got = store.code_unit("gpt-nano", "abc123").await.expect("q").expect("some");
+        assert_eq!(got.uri, "s3://unit.tar.zst");
+        assert_eq!(got.manifest.entrypoints["train"], "python train.py");
+        assert!(store.code_unit("gpt-nano", "wrong").await.expect("q").is_none());
+    }
+
+    #[tokio::test]
+    async fn lease_lifecycle_create_extend_drain_destroy() {
+        let store = mem_store().await;
+        let w = WorkerId("w1".into());
+        assert!(store.lease(&w).await.expect("q").is_none());
+        store.create_lease(&a_lease("w1")).await.expect("create");
+        assert_eq!(store.lease(&w).await.expect("q").expect("some").provider, "vast");
+        assert_eq!(store.live_leases().await.expect("live").len(), 1);
+        let ext = store
+            .extend_lease(&w, LeaseExtension { minutes: 30.0, at: 2000.0, reason: "more".into() })
+            .await.expect("extend").expect("some");
+        assert_eq!(ext.extensions.len(), 1);
+        store.set_lease_state(&w, LeaseState::Draining).await.expect("drain");
+        assert!(matches!(store.lease(&w).await.expect("q").expect("some").state, LeaseState::Draining));
+        store.set_lease_state(&w, LeaseState::Destroyed).await.expect("destroy");
+        assert!(store.live_leases().await.expect("live").is_empty());
+        assert!(store
+            .extend_lease(&WorkerId("nope".into()), LeaseExtension { minutes: 1.0, at: 0.0, reason: String::new() })
+            .await.expect("extend").is_none());
+    }
+
+    #[tokio::test]
+    async fn ledger_appends_and_lists() {
+        let store = mem_store().await;
+        assert!(store.ledger_entries().await.expect("q").is_empty());
+        for (ts, cost) in [(100.0, 0.5), (200.0, 0.25)] {
+            store.ledger_append(&LedgerEntry {
+                ts, worker_id: WorkerId("w".into()), provider: "vast".into(),
+                event: "lease_end".into(), minutes: 60.0, cost,
+            }).await.expect("append");
+        }
+        let e = store.ledger_entries().await.expect("q");
+        assert_eq!(e.len(), 2);
+        assert!((e.iter().map(|x| x.cost).sum::<f64>() - 0.75).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_record_pin_locate_archive() {
+        let store = mem_store().await;
+        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        assert!(store.latest_checkpoint(&run).await.expect("q").is_none());
+        for step in [100u64, 200] {
+            let meta = CheckpointMeta { step, seed: Some(42), arch: Some("cn7".into()), ..Default::default() };
+            store.record_checkpoint(&run, step, &format!("ckpt-hot/r/step_{step}/model.safetensors"), &format!("hash{step}"), &meta).await.expect("record");
+        }
+        assert_eq!(store.checkpoints(&run).await.expect("q").len(), 2);
+        assert_eq!(store.latest_checkpoint(&run).await.expect("q").expect("some").step, 200);
+        assert!(store.pin_checkpoint(&run, 100, "best").await.expect("pin"));
+        assert!(!store.pin_checkpoint(&run, 999, "x").await.expect("pin"));
+        store.set_checkpoint_location(&run, 200, CheckpointLocation::R2Final).await.expect("loc");
+        let ids = BTreeMap::from([("model.safetensors".to_owned(), "drive-1".to_owned())]);
+        store.mark_checkpoint_archived(&run, 100, &ids, 5000.0).await.expect("archive");
+        assert_eq!(store.checkpoint_drive_ids(&run, 100).await.expect("q").expect("some")["model.safetensors"], "drive-1");
+        assert!(store.checkpoint_drive_ids(&run, 200).await.expect("q").is_none());
+    }
+
+    #[tokio::test]
+    async fn logs_and_events_round_trip() {
+        let store = mem_store().await;
+        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        for i in 0..5 { store.append_log(&run, &format!("line {i}")).await.expect("log"); }
+        assert_eq!(store.tail_logs(&run, 3).await.expect("tail"), vec!["line 2", "line 3", "line 4"]);
+        store.add_event(&run, EventKind::Running, serde_json::json!({ "worker": "w1" })).await.expect("event");
+        let ev = store.events(&run).await.expect("events");
+        assert!(ev.iter().any(|e| matches!(e.event, EventKind::Running)));
+        assert!(ev.len() >= 3); // create_run seeds Created + Queued
+    }
+
+    #[tokio::test]
+    async fn metrics_ingest_series_filter_and_window() {
+        let store = mem_store().await;
+        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        for step in 0u64..3 {
+            store.append_metrics(&run, step, &BTreeMap::from([
+                ("loss".to_owned(), 1.0 - step as f64 * 0.1), ("lr".to_owned(), 0.001),
+            ])).await.expect("metrics");
+        }
+        let s = store.metric_series(&run, Some(&["loss".to_owned()]), 0, 500).await.expect("series");
+        assert_eq!(s.series["loss"].len(), 3);
+        assert!(!s.series.contains_key("lr"));
+        let since = store.metric_series(&run, None, 1, 500).await.expect("series");
+        assert!(since.series["loss"].iter().all(|p| p.step >= 1));
+    }
+
+    #[tokio::test]
+    async fn users_teams_and_api_keys() {
+        let store = mem_store().await;
+        store.ensure_team("t1", "Team One").await.expect("team");
+        store.ensure_team("t1", "Renamed").await.expect("team");
+        store.upsert_user("a@x.com", "t1", Role::Write).await.expect("user");
+        store.upsert_user("b@x.com", "t1", Role::Admin).await.expect("user");
+        assert_eq!(store.get_user("a@x.com").await.expect("q").expect("some").role, Role::Write);
+        assert_eq!(store.list_users("t1").await.expect("q").len(), 2);
+        store.remove_user("b@x.com").await.expect("remove");
+        assert_eq!(store.list_users("t1").await.expect("q").len(), 1);
+        store.create_api_key("k1", "t1", "a@x.com", "ci", "ck_abcd", "hash1", Role::Write).await.expect("key");
+        assert_eq!(store.list_api_keys("t1").await.expect("q").len(), 1);
+        assert_eq!(store.resolve_api_key("hash1").await.expect("q").expect("some").id, "k1");
+        store.touch_api_key("k1", 9999.0).await.expect("touch");
+        assert!(store.revoke_api_key("k1").await.expect("revoke"));
+        assert!(!store.revoke_api_key("k1").await.expect("revoke"));
+        assert!(store.resolve_api_key("hash1").await.expect("q").is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_tokens_resolve_list_touch() {
+        let store = mem_store().await;
+        store.create_worker_token("tok-1", &WorkerId("mac".into()), "mac", "cw_abcd", "hash").await.expect("create");
+        assert_eq!(store.resolve_worker_token("hash").await.expect("q").expect("some").worker_id, WorkerId("mac".into()));
+        assert_eq!(store.list_worker_tokens().await.expect("q").len(), 1);
+        store.touch_worker_token("tok-1", 8888.0).await.expect("touch");
+        assert!(store.revoke_worker_token("tok-1").await.expect("revoke"));
+        assert!(store.resolve_worker_token("hash").await.expect("q").is_none());
+    }
+
+    #[tokio::test]
+    async fn run_transitions_and_next_queued() {
+        let store = mem_store().await;
+        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        assert_eq!(store.next_queued().await.expect("q").expect("some").summary.id, run);
+        let w = WorkerId("w1".into());
+        store.transition(&run, RunState::Assigned, Some(&w), None, serde_json::json!({})).await.expect("t");
+        store.transition(&run, RunState::Running, Some(&w), None, serde_json::json!({})).await.expect("t");
+        store.transition(&run, RunState::Completed, None, Some(0), serde_json::json!({})).await.expect("t");
+        let rec = store.run(&run).await.expect("q").expect("some");
+        assert_eq!(rec.summary.state, RunState::Completed);
+        assert_eq!(rec.summary.exit_code, Some(0));
+        assert!(store.next_queued().await.expect("q").is_none());
+        let s1 = store.next_run_seq().await.expect("seq");
+        assert_eq!(store.next_run_seq().await.expect("seq"), s1 + 1);
+    }
+
+    #[tokio::test]
+    async fn experiments_run_id_round_trips_and_runs_lists() {
+        let store = mem_store().await;
+        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        assert!(store.experiments_run_id(&run).await.expect("q").is_none());
+        store.set_experiments_run_id(&run, "RUN-20260101-000000-00001").await.expect("set");
+        assert_eq!(
+            store.experiments_run_id(&run).await.expect("q").as_deref(),
+            Some("RUN-20260101-000000-00001"),
+        );
+        store.create_run("r2", &shell_spec(), None, None).await.expect("run2");
+        assert_eq!(store.runs(10).await.expect("runs").len(), 2);
     }
 }
