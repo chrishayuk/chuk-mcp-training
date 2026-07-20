@@ -48,9 +48,19 @@ CREATE TABLE IF NOT EXISTS runs (
   worker_id      TEXT,
   exit_code      INTEGER,
   experiment_ref TEXT,
+  sweep_id       TEXT,
   created_by     TEXT,
   created_at     REAL NOT NULL,
   updated_at     REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sweeps (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,
+  template     TEXT NOT NULL,
+  axes         TEXT NOT NULL,
+  concurrency  INTEGER NOT NULL DEFAULT 0,
+  created_by   TEXT,
+  created_at   REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS run_logs (
   run_id       TEXT NOT NULL,
@@ -221,6 +231,7 @@ impl SqliteStore {
             "ALTER TABLE runs ADD COLUMN experiments_run_id TEXT",
             "ALTER TABLE runs ADD COLUMN experiment_ref TEXT",
             "ALTER TABLE runs ADD COLUMN created_by TEXT",
+            "ALTER TABLE runs ADD COLUMN sweep_id TEXT",
             "ALTER TABLE users ADD COLUMN experiments_api_key_encrypted TEXT",
         ] {
             let _ = sqlx::query(stmt).execute(&pool).await;
@@ -238,6 +249,7 @@ mod checkpoints;
 mod leases;
 mod ledger;
 mod gates;
+mod sweeps;
 mod auth;
 mod tokens;
 
@@ -338,6 +350,7 @@ fn run_from_row(row: sqlx::sqlite::SqliteRow) -> Result<RunRecord> {
             worker_id: row.get::<Option<String>, _>("worker_id").map(WorkerId),
             exit_code: row.get("exit_code"),
             experiment_ref: row.get("experiment_ref"),
+            sweep_id: row.get("sweep_id"),
             created_by: row.get("created_by"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
@@ -366,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn our_ids_use_the_exec_prefix() {
         let store = mem_store().await;
-        let id = store.create_run("r", &shell_spec(), None, None).await.expect("create");
+        let id = store.create_run("r", &shell_spec(), None, None, None).await.expect("create");
         assert!(id.0.starts_with("EXEC-"), "{}", id.0);
     }
 
@@ -374,11 +387,11 @@ mod tests {
     async fn experiment_ref_round_trips_the_external_parent() {
         let store = mem_store().await;
         let attached = store
-            .create_run("attached", &shell_spec(), Some("RUN-20260718-160217-00042"), None)
+            .create_run("attached", &shell_spec(), Some("RUN-20260718-160217-00042"), None, None)
             .await
             .expect("create attached");
         let scratch = store
-            .create_run("scratch", &shell_spec(), None, None)
+            .create_run("scratch", &shell_spec(), None, None, None)
             .await
             .expect("create scratch");
 
@@ -451,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn outbox_event_becomes_due_then_done() {
         let store = mem_store().await;
-        let run_id = store.create_run("r", &shell_spec(), None, None).await.expect("create");
+        let run_id = store.create_run("r", &shell_spec(), None, None, None).await.expect("create");
         let at = now();
         let id = store
             .enqueue_outbox_event(&run_id, "state", "{}", at)
@@ -473,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn failed_outbox_event_waits_for_its_scheduled_retry_time() {
         let store = mem_store().await;
-        let run_id = store.create_run("r", &shell_spec(), None, None).await.expect("create");
+        let run_id = store.create_run("r", &shell_spec(), None, None, None).await.expect("create");
         let at = now();
         let id = store
             .enqueue_outbox_event(&run_id, "state", "{}", at)
@@ -500,7 +513,7 @@ mod tests {
     async fn create_run_persists_the_submitting_user() {
         let store = mem_store().await;
         let run_id = store
-            .create_run("r", &shell_spec(), None, Some("chris@example.com"))
+            .create_run("r", &shell_spec(), None, Some("chris@example.com"), None)
             .await
             .expect("create");
         let run = store.run(&run_id).await.expect("run").expect("some");
@@ -510,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn create_run_without_a_submitter_leaves_created_by_unset() {
         let store = mem_store().await;
-        let run_id = store.create_run("r", &shell_spec(), None, None).await.expect("create");
+        let run_id = store.create_run("r", &shell_spec(), None, None, None).await.expect("create");
         let run = store.run(&run_id).await.expect("run").expect("some");
         assert_eq!(run.summary.created_by, None);
     }
@@ -645,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_record_pin_locate_archive() {
         let store = mem_store().await;
-        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        let run = store.create_run("r", &shell_spec(), None, None, None).await.expect("run");
         assert!(store.latest_checkpoint(&run).await.expect("q").is_none());
         for step in [100u64, 200] {
             let meta = CheckpointMeta { step, seed: Some(42), arch: Some("cn7".into()), ..Default::default() };
@@ -665,7 +678,7 @@ mod tests {
     #[tokio::test]
     async fn logs_and_events_round_trip() {
         let store = mem_store().await;
-        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        let run = store.create_run("r", &shell_spec(), None, None, None).await.expect("run");
         for i in 0..5 { store.append_log(&run, &format!("line {i}")).await.expect("log"); }
         assert_eq!(store.tail_logs(&run, 3).await.expect("tail"), vec!["line 2", "line 3", "line 4"]);
         store.add_event(&run, EventKind::Running, serde_json::json!({ "worker": "w1" })).await.expect("event");
@@ -677,7 +690,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_ingest_series_filter_and_window() {
         let store = mem_store().await;
-        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        let run = store.create_run("r", &shell_spec(), None, None, None).await.expect("run");
         for step in 0u64..3 {
             store.append_metrics(&run, step, &BTreeMap::from([
                 ("loss".to_owned(), 1.0 - step as f64 * 0.1), ("lr".to_owned(), 0.001),
@@ -724,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn run_transitions_and_next_queued() {
         let store = mem_store().await;
-        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        let run = store.create_run("r", &shell_spec(), None, None, None).await.expect("run");
         assert_eq!(store.next_queued().await.expect("q").expect("some").summary.id, run);
         let w = WorkerId("w1".into());
         store.transition(&run, RunState::Assigned, Some(&w), None, serde_json::json!({})).await.expect("t");
@@ -741,14 +754,14 @@ mod tests {
     #[tokio::test]
     async fn experiments_run_id_round_trips_and_runs_lists() {
         let store = mem_store().await;
-        let run = store.create_run("r", &shell_spec(), None, None).await.expect("run");
+        let run = store.create_run("r", &shell_spec(), None, None, None).await.expect("run");
         assert!(store.experiments_run_id(&run).await.expect("q").is_none());
         store.set_experiments_run_id(&run, "RUN-20260101-000000-00001").await.expect("set");
         assert_eq!(
             store.experiments_run_id(&run).await.expect("q").as_deref(),
             Some("RUN-20260101-000000-00001"),
         );
-        store.create_run("r2", &shell_spec(), None, None).await.expect("run2");
+        store.create_run("r2", &shell_spec(), None, None, None).await.expect("run2");
         assert_eq!(store.runs(&Default::default(), 10).await.expect("runs").len(), 2);
     }
 
@@ -780,10 +793,10 @@ mod tests {
     async fn runs_filters_by_state_and_ref_and_pages() {
         let store = mem_store().await;
         let attached = store
-            .create_run("a", &shell_spec(), Some("RUN-20260101-000000-00001"), None)
+            .create_run("a", &shell_spec(), Some("RUN-20260101-000000-00001"), None, None)
             .await
             .expect("run");
-        let scratch = store.create_run("b", &shell_spec(), None, None).await.expect("run");
+        let scratch = store.create_run("b", &shell_spec(), None, None, None).await.expect("run");
         store
             .transition(&scratch, RunState::Completed, None, Some(0), serde_json::json!({}))
             .await

@@ -21,6 +21,7 @@ API_PROVISION: Final = "/api/provision"
 API_COLAB_CELL: Final = "/api/colab_cell"
 API_SPEND: Final = "/api/spend"
 API_BUDGETS: Final = "/api/budgets"
+API_SWEEPS: Final = "/api/sweeps"
 API_ARCHIVE: Final = "/api/archive"
 API_ME: Final = "/api/me"
 
@@ -28,6 +29,9 @@ API_ME: Final = "/api/me"
 BUDGET_PERIOD_MONTH: Final = "month"
 BUDGET_PERIOD_ALL: Final = "all"
 DEFAULT_BUDGET_PERIOD: Final = BUDGET_PERIOD_MONTH
+
+# Sweeps (must match chuk_train_proto::constants).
+DEFAULT_SWEEP_METRIC_KEY: Final = "loss"
 
 
 def api_worker_lease(worker_id: str) -> str:
@@ -88,6 +92,10 @@ def api_run_archive(run_id: str) -> str:
 
 def api_run_gates(run_id: str) -> str:
     return f"{API_RUNS}/{run_id}/gates"
+
+
+def api_sweep(sweep_id: str) -> str:
+    return f"{API_SWEEPS}/{sweep_id}"
 
 
 # Defaults mirrored from chuk-train-proto.

@@ -880,7 +880,7 @@ mod live {
         // A real `runs` row, exactly as Hub::submit creates before mirroring —
         // set_experiments_run_id later needs a matching row to update.
         let run_id = store
-            .create_run("outbox-smoke-test", &spec, None, None)
+            .create_run("outbox-smoke-test", &spec, None, None, None)
             .await
             .expect("create_run");
 
@@ -968,7 +968,7 @@ mod live {
         .expect("valid TrainSpec");
         let spec = RunSpec::Train(Box::new(train));
         let run_id = store
-            .create_run("bearer-for-test", &spec, None, Some(email))
+            .create_run("bearer-for-test", &spec, None, Some(email), None)
             .await
             .expect("create_run");
 

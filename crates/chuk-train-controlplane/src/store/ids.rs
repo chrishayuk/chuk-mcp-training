@@ -20,6 +20,9 @@ use chuk_train_proto::{MetricPoint, TelemetryPoint, UnixSeconds, WorkerId, Worke
 /// shared prefix. The sequence comes from a store-backed monotonic counter, so
 /// it's stable and collision-free.
 const EXEC_ID_PREFIX: &str = "EXEC-";
+/// Sweep ids share the sortable shape under their own prefix (spec §5.2); a
+/// sweep names a *fan-out*, not an execution, so it gets its own namespace.
+const SWEEP_ID_PREFIX: &str = "SWEEP-";
 /// Zero-pad width of the sequence tail (grows past 5 digits after 99999).
 const RUN_ID_SEQ_WIDTH: usize = 5;
 
@@ -35,9 +38,19 @@ pub(super) fn now() -> UnixSeconds {
 
 /// Build a run id from a wall-clock timestamp + a store-backed sequence number.
 pub(super) fn new_run_id(at: UnixSeconds, seq: i64) -> String {
+    stamped_id(EXEC_ID_PREFIX, at, seq)
+}
+
+/// Build a sweep id (same sequence counter as runs — ids stay unique and
+/// chronologically sortable across both namespaces).
+pub(super) fn new_sweep_id(at: UnixSeconds, seq: i64) -> String {
+    stamped_id(SWEEP_ID_PREFIX, at, seq)
+}
+
+fn stamped_id(prefix: &str, at: UnixSeconds, seq: i64) -> String {
     let (y, m, d, hh, mm, ss) = utc_parts(at as i64);
     format!(
-        "{EXEC_ID_PREFIX}{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}-{seq:0width$}",
+        "{prefix}{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}-{seq:0width$}",
         width = RUN_ID_SEQ_WIDTH
     )
 }

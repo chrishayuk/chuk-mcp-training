@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::{Context, Result};
 use chuk_compute_wire as wire;
 use chuk_train_proto::{
-    keys, CheckpointMeta, EventKind, GateAction, GateInfo, Hardware, LeaseState, RunId, RunSpec,
+    keys, CheckpointMeta, EventKind, GateAction, GateInfo, Hardware, LeaseState, RunId, RunRecord, RunSpec,
     RunState, TrainSpec, WorkerId, WorkerInfo, WorkerState, CHECKPOINT_DIR_PREFIX,
     CHECKPOINT_META_FILE, CHECKPOINT_MODEL_FILE, EXIT_CODE_AGENT_ERROR, EXIT_CODE_CANCELLED,
     GATE_SCOPE_RUN, HEARTBEAT_PREEMPT_TIMEOUT, HEARTBEAT_TIMEOUT,
@@ -31,6 +31,13 @@ use tracing::{debug, info, warn};
 use crate::artifacts::ArtifactStore;
 use crate::experiments::Experiments;
 use crate::gate;
+use crate::grant::GrantTable;
+use crate::jobspec::{self, ResumeStaging, TrainStaging};
+use crate::store::Store;
+use crate::sweep;
+
+/// How many queued runs one pump pass scans for an assignable candidate.
+const QUEUE_SCAN_LIMIT: u32 = 500;
 
 fn unix_now() -> f64 {
     std::time::SystemTime::now()
@@ -38,9 +45,6 @@ fn unix_now() -> f64 {
         .expect("system clock before unix epoch")
         .as_secs_f64()
 }
-use crate::grant::GrantTable;
-use crate::jobspec::{self, ResumeStaging, TrainStaging};
-use crate::store::Store;
 
 /// The artifact class the control plane records checkpoint outputs under (the
 /// value it stamps into each train job's checkpoint [`wire::OutputRule`]).
@@ -237,7 +241,7 @@ impl Hub {
             if !eligible_for_assignment(&worker, HEARTBEAT_TIMEOUT.as_secs_f64()) {
                 continue;
             }
-            let Some(run) = self.store.next_queued().await? else {
+            let Some(run) = self.next_assignable_queued().await? else {
                 break;
             };
             let run_id = run.summary.id.clone();
@@ -272,6 +276,33 @@ impl Hub {
             links.remove(&worker_id);
         }
         Ok(())
+    }
+
+    /// The oldest queued run that may actually be assigned: a sweep child is
+    /// held back while its sweep already has `concurrency` children
+    /// assigned/running (0 = unlimited). Non-sweep runs are never held.
+    async fn next_assignable_queued(&self) -> Result<Option<RunRecord>> {
+        let queued = crate::store::RunQuery {
+            state: Some(RunState::Queued),
+            ..Default::default()
+        };
+        // The store pages newest-first; scan a generous window and walk it
+        // oldest-first. A backlog deeper than the window waits its turn.
+        let page = self.store.runs(&queued, QUEUE_SCAN_LIMIT).await?;
+        for summary in page.into_iter().rev() {
+            if let Some(sweep_id) = &summary.sweep_id {
+                if let Some(sweep_row) = self.store.sweep(sweep_id).await? {
+                    if sweep_row.concurrency > 0
+                        && self.store.sweep_active_children(sweep_id).await?
+                            >= sweep_row.concurrency
+                    {
+                        continue;
+                    }
+                }
+            }
+            return self.store.run(&summary.id).await;
+        }
+        Ok(None)
     }
 
     /// Translate a run into a compute-generic [`wire::Job`]. For a train run this
@@ -557,11 +588,105 @@ impl Hub {
     ) -> Result<RunId> {
         let run_id = self
             .store
-            .create_run(name, spec, experiment_ref, created_by)
+            .create_run(name, spec, experiment_ref, created_by, None)
             .await?;
         self.mirror_created(&run_id, spec, experiment_ref);
         self.pump().await?;
         Ok(run_id)
+    }
+
+    /// Fan a sweep out into child runs (spec §5.2): expand template × axes,
+    /// record the sweep, queue every child (named `{name}-{i:03}` in axis
+    /// order), and pump — the scheduler holds children to the sweep's
+    /// concurrency. Children are unattached scratch runs mirror-wise.
+    pub async fn submit_sweep(
+        &self,
+        name: &str,
+        spec: &chuk_train_proto::SweepSpec,
+        created_by: Option<&str>,
+    ) -> Result<(String, Vec<RunId>)> {
+        let children =
+            sweep::expand(&spec.template, &spec.axes).map_err(|reason| anyhow::anyhow!(reason))?;
+        let sweep_id = self
+            .store
+            .create_sweep(
+                name,
+                &serde_json::to_string(&spec.template)?,
+                &serde_json::to_string(&spec.axes)?,
+                spec.concurrency,
+                created_by,
+            )
+            .await?;
+        let mut run_ids = Vec::with_capacity(children.len());
+        for (i, (_assignment, child_spec)) in children.into_iter().enumerate() {
+            let run_id = self
+                .store
+                .create_run(
+                    &format!("{name}-{i:03}"),
+                    &RunSpec::Train(Box::new(child_spec)),
+                    None,
+                    created_by,
+                    Some(&sweep_id),
+                )
+                .await?;
+            run_ids.push(run_id);
+        }
+        info!(sweep = %sweep_id, children = run_ids.len(), "sweep fanned out");
+        self.pump().await?;
+        Ok((sweep_id, run_ids))
+    }
+
+    /// A sweep's children + the cross-child aggregate of one metric key at
+    /// matched steps (spec §5.2 `sweep_status`). `None` if no such sweep.
+    pub async fn sweep_status(
+        &self,
+        sweep_id: &str,
+        key: &str,
+    ) -> Result<Option<chuk_train_proto::SweepStatus>> {
+        let Some(row) = self.store.sweep(sweep_id).await? else {
+            return Ok(None);
+        };
+        let axes: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+            serde_json::from_str(&row.axes)?;
+        let query = crate::store::RunQuery {
+            sweep_id: Some(sweep_id.to_owned()),
+            ..Default::default()
+        };
+        let summaries = self
+            .store
+            .runs(&query, chuk_train_proto::MAX_SWEEP_CHILDREN as u32)
+            .await?;
+        let mut children = Vec::with_capacity(summaries.len());
+        let mut series: Vec<Vec<chuk_train_proto::MetricPoint>> = Vec::new();
+        // Oldest first, matching the submit-time `{name}-{i:03}` order.
+        for summary in summaries.into_iter().rev() {
+            let assignment = match self.store.run(&summary.id).await?.map(|r| r.spec) {
+                Some(RunSpec::Train(train)) => sweep::assignment_of(&train, &axes),
+                _ => Default::default(),
+            };
+            let child_series = self
+                .store
+                .metric_series(&summary.id, Some(std::slice::from_ref(&key.to_owned())), 0, 0)
+                .await?;
+            if let Some(points) = child_series.series.get(key) {
+                if !points.is_empty() {
+                    series.push(points.clone());
+                }
+            }
+            children.push(chuk_train_proto::SweepChild {
+                run_id: summary.id,
+                state: summary.state,
+                assignment,
+            });
+        }
+        Ok(Some(chuk_train_proto::SweepStatus {
+            sweep_id: row.id,
+            name: row.name,
+            concurrency: row.concurrency,
+            children,
+            key: key.to_owned(),
+            aggregate: sweep::aggregate(&series),
+        }))
     }
 
     /// Submit a train run built entirely from an existing chuk-experiments-server
@@ -867,6 +992,78 @@ mod tests {
 
     fn shell_run() -> RunSpec {
         RunSpec::Shell(ShellSpec { command: "sleep 1".into(), timeout_s: 60 })
+    }
+
+    fn train_template() -> TrainSpec {
+        TrainSpec {
+            code: chuk_train_proto::CodeRef { name: "unit".into(), sha: "abc".into() },
+            entrypoint: "train".into(),
+            config: None,
+            overrides: serde_json::json!({}),
+            artifacts_in: Vec::new(),
+            checkpoint: Default::default(),
+            seed: None,
+            arch: None,
+            timeout_s: 3600,
+            links: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_fans_out_caps_concurrency_and_aggregates() {
+        let hub = test_hub().await;
+        let spec = chuk_train_proto::SweepSpec {
+            template: train_template(),
+            axes: std::collections::BTreeMap::from([(
+                "seed".to_owned(),
+                vec![80.into(), 81.into(), 82.into()],
+            )]),
+            concurrency: 2,
+        };
+        let (sweep_id, run_ids) = hub.submit_sweep("var", &spec, None).await.unwrap();
+        assert_eq!(run_ids.len(), 3);
+        let status = hub.sweep_status(&sweep_id, "loss").await.unwrap().unwrap();
+        assert_eq!(status.children.len(), 3);
+        assert_eq!(status.children[0].assignment["seed"], serde_json::json!(80));
+        assert_eq!(status.children[2].assignment["seed"], serde_json::json!(82));
+
+        // Oldest child is assignable first; once two are active the sweep is
+        // at its concurrency and the third is held back...
+        let first = hub.next_assignable_queued().await.unwrap().unwrap().summary.id;
+        assert_eq!(first, run_ids[0]);
+        for id in &run_ids[..2] {
+            hub.store
+                .transition(id, RunState::Running, None, None, serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+        assert!(hub.next_assignable_queued().await.unwrap().is_none());
+        // ...while a non-sweep run stays assignable.
+        let scratch = hub.submit("probe", &shell_run(), None, None).await.unwrap();
+        assert_eq!(
+            hub.next_assignable_queued().await.unwrap().unwrap().summary.id,
+            scratch
+        );
+        // A child finishing frees a slot for the held-back (older) child.
+        hub.store
+            .transition(&run_ids[0], RunState::Completed, None, Some(0), serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.next_assignable_queued().await.unwrap().unwrap().summary.id,
+            run_ids[2]
+        );
+
+        // Cross-child aggregation at the matched step.
+        for (id, loss) in [(&run_ids[0], 2.0), (&run_ids[1], 4.0)] {
+            let values = std::collections::BTreeMap::from([("loss".to_owned(), loss)]);
+            hub.store.append_metrics(id, 0, &values).await.unwrap();
+        }
+        let status = hub.sweep_status(&sweep_id, "loss").await.unwrap().unwrap();
+        assert_eq!(status.aggregate.len(), 1);
+        assert_eq!(status.aggregate[0].n, 2);
+        assert_eq!(status.aggregate[0].mean, 3.0);
+        assert_eq!((status.aggregate[0].min, status.aggregate[0].max), (2.0, 4.0));
     }
 
     #[tokio::test]

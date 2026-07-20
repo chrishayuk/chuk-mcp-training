@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     ArtifactKind, CheckpointLocation, CodeRef, EventKind, Hardware, Role, RunId, RunSpec, RunState,
-    UnixSeconds, WorkerId, WorkerState,
+    TrainSpec, UnixSeconds, WorkerId, WorkerState,
 };
 use crate::lease::Lease;
 use crate::manifest::{CheckpointMeta, CodeUnitManifest};
@@ -86,6 +86,9 @@ pub struct RunSummary {
     /// for an unattached scratch run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub experiment_ref: Option<String>,
+    /// The sweep this run is a child of (spec §5.2), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
     /// Email of the user who submitted this run (resolved from their session or
     /// the owning email of the API key they used — never a bare key prefix).
     /// `None` for runs submitted before this was tracked, or via the legacy
@@ -338,6 +341,66 @@ pub struct SpendReport {
     pub global_cap: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_headroom: Option<f64>,
+}
+
+/// A sweep: one template fanned out over axes (spec §5.2). Axis paths are
+/// `seed` or `overrides.<key>`; each combination becomes a child run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepSpec {
+    pub template: TrainSpec,
+    pub axes: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+    /// Max children assigned/running at once; 0 = unlimited.
+    #[serde(default)]
+    pub concurrency: u32,
+}
+
+/// `submit_sweep(...)` request (spec §6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubmitSweepRequest {
+    pub name: String,
+    pub spec: SweepSpec,
+    /// Spec §8: sweeps show the *multiplied* total in the pre-flight refusal.
+    #[serde(default)]
+    pub confirm_cost: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubmitSweepResponse {
+    pub sweep_id: String,
+    pub run_ids: Vec<RunId>,
+}
+
+/// One child in a sweep status: which axis point it runs, and where it is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepChild {
+    pub run_id: RunId,
+    pub state: RunState,
+    /// Axis path → the value this child got (derived from its spec).
+    pub assignment: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Cross-child aggregate of one metric at one matched step (spec §5.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepAggregatePoint {
+    pub step: u64,
+    /// How many children reported this step.
+    pub n: u32,
+    pub mean: f64,
+    /// Population standard deviation.
+    pub std: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SweepStatus {
+    pub sweep_id: String,
+    pub name: String,
+    pub concurrency: u32,
+    pub children: Vec<SweepChild>,
+    /// The metric key the aggregate below is computed over.
+    pub key: String,
+    pub aggregate: Vec<SweepAggregatePoint>,
 }
 
 /// What happens when a gate trips (spec §6). A `record` gate is a labelled

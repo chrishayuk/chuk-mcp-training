@@ -8,8 +8,9 @@ use axum::Json;
 use chuk_train_proto::{
     BuildCodeUnitRequest, LogsResponse, MetricSeries, RegisterGateRequest, Role, RunEvent, RunId,
     RunRecord, RunSpec, RunState, RunSummary, ShellSpec, SubmitRunRequest, SubmitRunResponse,
-    SubmitShellRequest, WorkerId, WorkerInfo, WorkerTelemetry, DEFAULT_LOG_TAIL_LINES,
-    DEFAULT_METRIC_DOWNSAMPLE, DEFAULT_RUN_LIST_LIMIT, DEFAULT_SHELL_TIMEOUT, GATE_SCOPE_RUN,
+    SubmitShellRequest, SubmitSweepRequest, SubmitSweepResponse, WorkerId, WorkerInfo,
+    WorkerTelemetry, DEFAULT_LOG_TAIL_LINES, DEFAULT_METRIC_DOWNSAMPLE, DEFAULT_RUN_LIST_LIMIT,
+    DEFAULT_SHELL_TIMEOUT, GATE_SCOPE_RUN,
 };
 use serde::Deserialize;
 
@@ -70,6 +71,7 @@ pub struct ListParams {
     offset: Option<u32>,
     state: Option<RunState>,
     experiment_ref: Option<String>,
+    sweep_id: Option<String>,
 }
 
 pub async fn list_runs(
@@ -79,6 +81,7 @@ pub async fn list_runs(
     let query = crate::store::RunQuery {
         state: params.state,
         experiment_ref: params.experiment_ref,
+        sweep_id: params.sweep_id,
         offset: params.offset.unwrap_or(0),
     };
     match state
@@ -252,6 +255,74 @@ pub async fn submit_run_from_experiment(
     {
         Ok(run_id) => Json(SubmitRunResponse { run_id }).into_response(),
         Err(error) => bad_request(&error.to_string()),
+    }
+}
+
+/// `POST /api/sweeps` — fan a sweep out into child runs (spec §5.2/§6
+/// `submit_sweep`). The §8 pre-flight multiplies the per-child worst case by
+/// the fan-out, so sweep multiplication is confirmed knowingly or not at all.
+pub async fn submit_sweep(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Json(request): Json<SubmitSweepRequest>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Write) {
+        return resp;
+    }
+    // Expand first: a bad axis is a 400 before anything is recorded, and the
+    // pre-flight needs the child count.
+    let children = match crate::sweep::expand(&request.spec.template, &request.spec.axes) {
+        Ok(children) => children,
+        Err(reason) => return bad_request(&reason),
+    };
+    if !request.confirm_cost {
+        let live = match state.hub.store.live_leases().await {
+            Ok(live) => live,
+            Err(error) => return internal(error),
+        };
+        let per_child =
+            crate::budget::estimate_run_cost(&live, request.spec.template.timeout_s);
+        let total = per_child * children.len() as f64;
+        let threshold = state.config.confirm_cost_threshold;
+        if total > threshold {
+            return bad_request(&format!(
+                "estimated worst-case cost ${total:.2} ({} children × ${per_child:.2}) \
+                 exceeds the ${threshold:.2} confirm threshold — resubmit with \
+                 confirm_cost=true, or narrow the axes / lower timeout_s",
+                children.len(),
+            ));
+        }
+    }
+    match state
+        .hub
+        .submit_sweep(&request.name, &request.spec, Some(&ctx.owner_email))
+        .await
+    {
+        Ok((sweep_id, run_ids)) => Json(SubmitSweepResponse { sweep_id, run_ids }).into_response(),
+        Err(error) => bad_request(&error.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SweepStatusParams {
+    key: Option<String>,
+}
+
+/// `GET /api/sweeps/{sweep_id}` — children + cross-child mean/std/range of one
+/// metric key at matched steps (spec §5.2 `sweep_status`; `?key=` defaults to
+/// `loss`).
+pub async fn sweep_status(
+    State(state): State<Arc<AppState>>,
+    Path(sweep_id): Path<String>,
+    Query(params): Query<SweepStatusParams>,
+) -> Response {
+    let key = params
+        .key
+        .unwrap_or_else(|| chuk_train_proto::DEFAULT_SWEEP_METRIC_KEY.to_owned());
+    match state.hub.sweep_status(&sweep_id, &key).await {
+        Ok(Some(status)) => Json(status).into_response(),
+        Ok(None) => not_found(),
+        Err(error) => internal(error),
     }
 }
 

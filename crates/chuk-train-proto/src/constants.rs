@@ -150,6 +150,12 @@ pub const DEFAULT_CONFIRM_COST_THRESHOLD: f64 = 5.0;
 /// with sweeps' cross-seed rules.
 pub const GATE_SCOPE_RUN: &str = "run";
 
+/// Fan-out ceiling for one sweep (spec §5.2) — a fat-fingered axis list must
+/// be a 400, not a thousand queued runs.
+pub const MAX_SWEEP_CHILDREN: usize = 256;
+/// Default metric key `sweep_status` aggregates across children.
+pub const DEFAULT_SWEEP_METRIC_KEY: &str = "loss";
+
 /// Default number of log lines returned by the tail endpoint.
 pub const DEFAULT_LOG_TAIL_LINES: u32 = 100;
 /// Default page size for run listings.

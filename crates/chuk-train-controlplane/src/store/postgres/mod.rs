@@ -68,9 +68,19 @@ CREATE TABLE IF NOT EXISTS runs (
   worker_id      text,
   exit_code      bigint,
   experiment_ref text,
+  sweep_id       text,
   created_by     text,
   created_at     double precision NOT NULL,
   updated_at     double precision NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sweeps (
+  id           text PRIMARY KEY,
+  name         text NOT NULL,
+  template     text NOT NULL,
+  axes         text NOT NULL,
+  concurrency  bigint NOT NULL DEFAULT 0,
+  created_by   text,
+  created_at   double precision NOT NULL
 );
 CREATE TABLE IF NOT EXISTS run_logs (
   run_id       text NOT NULL,
@@ -214,6 +224,7 @@ CREATE INDEX IF NOT EXISTS idx_worker_samples ON worker_samples (worker_id, ts);
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS location text NOT NULL DEFAULT 'r2_hot';
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS drive_file_ids text;
 ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS archived_at double precision;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS sweep_id text;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS experiments_run_id text;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS experiment_ref text;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS created_by text;
@@ -258,6 +269,7 @@ mod checkpoints;
 mod leases;
 mod ledger;
 mod gates;
+mod sweeps;
 mod auth;
 mod tokens;
 
@@ -362,6 +374,7 @@ fn run_from_row(row: &PgRow) -> Result<RunRecord> {
             worker_id: row.get::<Option<String>, _>("worker_id").map(WorkerId),
             exit_code: row.get("exit_code"),
             experiment_ref: row.get("experiment_ref"),
+            sweep_id: row.get("sweep_id"),
             created_by: row.get("created_by"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
@@ -441,7 +454,7 @@ mod pg_live {
 
         // runs + events + transition + sortable id
         let spec = RunSpec::Shell(ShellSpec { command: "echo hi".into(), timeout_s: 60 });
-        let run_id = store.create_run("pg-live", &spec, None, None).await.expect("create_run");
+        let run_id = store.create_run("pg-live", &spec, None, None, None).await.expect("create_run");
         assert!(run_id.0.starts_with("EXEC-"), "{}", run_id.0);
         let rec = store.run(&run_id).await.expect("run").expect("some");
         assert_eq!(rec.summary.name, "pg-live");

@@ -79,6 +79,8 @@ pub struct RunQuery {
     pub state: Option<RunState>,
     /// Match runs attached to this experiments-server logical run (`RUN-…`).
     pub experiment_ref: Option<String>,
+    /// Match children of this sweep (`SWEEP-…`).
+    pub sweep_id: Option<String>,
     pub offset: u32,
 }
 
@@ -89,13 +91,14 @@ pub trait RunStore: Send + Sync {
     /// Create a queued run. `experiment_ref` is the optional external parent —
     /// the experiments-server logical run (`RUN-…`) this execution realises.
     /// `created_by` is the submitting user's email (`AuthContext.owner_email`),
-    /// or `None` for pre-attribution callers.
+    /// or `None` for pre-attribution callers. `sweep_id` marks a sweep child.
     async fn create_run(
         &self,
         name: &str,
         spec: &RunSpec,
         experiment_ref: Option<&str>,
         created_by: Option<&str>,
+        sweep_id: Option<&str>,
     ) -> Result<RunId>;
 
     /// Next value of the monotonic execution sequence (the 5-digit id tail).
@@ -247,6 +250,39 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Result<Option<std::collections::BTreeMap<String, String>>>;
 }
 
+/// One sweep's stored record (spec §5.2): the template + axes it fans out,
+/// with `template`/`axes` kept as their JSON text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SweepRow {
+    pub id: String,
+    pub name: String,
+    pub template: String,
+    pub axes: String,
+    pub concurrency: u32,
+    pub created_at: UnixSeconds,
+    pub created_by: Option<String>,
+}
+
+/// Sweeps: the fan-out record and the child-concurrency count the scheduler
+/// caps against.
+#[async_trait]
+pub trait SweepStore: Send + Sync {
+    /// Create a sweep row; the store mints its `SWEEP-…` id.
+    async fn create_sweep(
+        &self,
+        name: &str,
+        template: &str,
+        axes: &str,
+        concurrency: u32,
+        created_by: Option<&str>,
+    ) -> Result<String>;
+
+    async fn sweep(&self, sweep_id: &str) -> Result<Option<SweepRow>>;
+
+    /// How many of this sweep's children are currently assigned or running.
+    async fn sweep_active_children(&self, sweep_id: &str) -> Result<u32>;
+}
+
 /// A timestamped metric observation for gate evaluation (ascending by step).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetricObservation {
@@ -272,6 +308,7 @@ pub trait GateStore: Send + Sync {
     async fn gates(&self, scope: &str, scope_id: &str) -> Result<Vec<GateInfo>>;
 
     /// Persist a gate's latest verdict.
+    #[allow(clippy::too_many_arguments)]
     async fn record_gate_result(
         &self,
         scope: &str,
@@ -407,6 +444,7 @@ pub trait Store:
     + MetricStore
     + CheckpointStore
     + GateStore
+    + SweepStore
     + LeaseStore
     + LedgerStore
     + AuthStore
@@ -422,6 +460,7 @@ impl<T> Store for T where
     + MetricStore
     + CheckpointStore
     + GateStore
+    + SweepStore
     + LeaseStore
     + LedgerStore
     + AuthStore
@@ -434,7 +473,7 @@ impl<T> Store for T where
 pub(crate) mod prelude {
     pub(crate) use super::{
         AuthStore, CheckpointStore, CodeUnitStore, GateStore, LeaseStore, LedgerStore, MetricStore,
-        RunLogStore, RunStore, WorkerStore, WorkerTokenStore,
+        RunLogStore, RunStore, SweepStore, WorkerStore, WorkerTokenStore,
     };
 }
 

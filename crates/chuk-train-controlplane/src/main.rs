@@ -25,6 +25,7 @@ mod jobspec;
 mod lease;
 mod provider;
 mod store;
+mod sweep;
 mod upload;
 mod ws;
 
@@ -196,6 +197,8 @@ async fn main() -> Result<()> {
             "/runs/{run_id}/gates",
             get(api::check_gates).post(api::register_gate),
         )
+        .route("/sweeps", post(api::submit_sweep))
+        .route("/sweeps/{sweep_id}", get(api::sweep_status))
         .route("/runs/{run_id}/logs", get(api::tail_logs))
         .route("/runs/{run_id}/events", get(api::run_events))
         .route("/runs/{run_id}/metrics", get(api::run_metrics))

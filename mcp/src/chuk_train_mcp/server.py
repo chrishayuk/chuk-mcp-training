@@ -20,6 +20,7 @@ from .client import ControlPlaneClient, ControlPlaneError
 from .constants import (
     DEFAULT_ARTIFACT_URL_TTL_S,
     DEFAULT_BUDGET_PERIOD,
+    DEFAULT_SWEEP_METRIC_KEY,
     DEFAULT_LOG_TAIL_LINES,
     DEFAULT_METRIC_DOWNSAMPLE,
     DEFAULT_RUN_LIST_LIMIT,
@@ -33,6 +34,7 @@ from .constants import (
     api_run_from_experiment,
     api_run_gates,
     api_run_logs,
+    api_sweep,
     api_run_metrics,
     api_run_resume,
     api_run_stop,
@@ -52,6 +54,7 @@ from .constants import (
     API_ARCHIVE,
     API_BUDGETS,
     API_SPEND,
+    API_SWEEPS,
 )
 from .models import (
     Budget,
@@ -81,6 +84,10 @@ from .models import (
     SubmitRunRequest,
     SubmitRunResponse,
     SubmitShellRequest,
+    SubmitSweepRequest,
+    SubmitSweepResponse,
+    SweepSpec,
+    SweepStatus,
     TeardownRequest,
     TeardownResult,
     TrainSpec,
@@ -93,6 +100,7 @@ _PARAM_LIMIT = "limit"
 _PARAM_OFFSET = "offset"
 _PARAM_STATE = "state"
 _PARAM_EXPERIMENT_REF = "experiment_ref"
+_PARAM_SWEEP_ID = "sweep_id"
 _PARAM_LINES = "lines"
 _PARAM_KEYS = "keys"
 _PARAM_SINCE_STEP = "since_step"
@@ -163,20 +171,28 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         offset: int = 0,
         state: str | None = None,
         experiment_ref: str | None = None,
+        sweep_id: str | None = None,
     ) -> dict[str, Any]:
         """Recent runs with state, worker, and exit code — newest first.
 
-        Filter with `state` (queued|assigned|running|completed|failed|cancelled)
-        or `experiment_ref` (an experiments-server RUN-… id: every execution of
-        that logical run). Page with limit/offset; a full page means there may
-        be more.
+        Filter with `state` (queued|assigned|running|completed|failed|cancelled),
+        `experiment_ref` (an experiments-server RUN-… id: every execution of
+        that logical run), or `sweep_id` (a SWEEP-… id: that sweep's children).
+        Page with limit/offset; a full page means there may be more.
         """
         params: dict[str, Any] = {_PARAM_LIMIT: limit, _PARAM_OFFSET: offset}
         if state is not None:
             params[_PARAM_STATE] = state
         if experiment_ref is not None:
             params[_PARAM_EXPERIMENT_REF] = experiment_ref
-        filtered = state is not None or experiment_ref is not None or offset > 0
+        if sweep_id is not None:
+            params[_PARAM_SWEEP_ID] = sweep_id
+        filtered = (
+            state is not None
+            or experiment_ref is not None
+            or sweep_id is not None
+            or offset > 0
+        )
         return await _envelope(
             cp.get_list(API_RUNS, RunSummary, params=params),
             empty_hint=(
@@ -279,6 +295,59 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
             name=name, spec=spec, experiment_ref=experiment_ref, confirm_cost=confirm_cost
         )
         return await _envelope(cp.post_model(API_RUNS, request, SubmitRunResponse))
+
+    @mcp.tool
+    async def submit_sweep(
+        name: str,
+        code_name: str,
+        code_sha: str,
+        axes: dict[str, list[Any]],
+        entrypoint: str = "train",
+        config: str | None = None,
+        overrides: dict[str, Any] | None = None,
+        arch: str | None = None,
+        timeout_s: int = DEFAULT_TRAIN_TIMEOUT_S,
+        concurrency: int = 0,
+        confirm_cost: bool = False,
+    ) -> dict[str, Any]:
+        """Fan one train template out over axes (spec §5.2) — e.g. a cross-seed
+        variance sweep: axes={"seed": [80, 81, 82]}. Write-scoped.
+
+        Axis paths are "seed" or "overrides.<key>"; every combination becomes
+        a child run named {name}-{i:03}, capped at 256 children. concurrency
+        limits how many children run at once (0 = unlimited); the scheduler
+        holds the rest queued. Follow with sweep_status / list_runs(sweep
+        children carry a sweep_id).
+
+        Cost pre-flight (spec §8): the refusal shows the MULTIPLIED total
+        (children × per-child worst case) — read it before resubmitting with
+        confirm_cost=True; sweep multiplication is the classic cost leak.
+        """
+        template = TrainSpec(
+            code=CodeRef(name=code_name, sha=code_sha),
+            entrypoint=entrypoint,
+            config=config,
+            overrides=overrides or {},
+            arch=arch,
+            timeout_s=timeout_s,
+        )
+        request = SubmitSweepRequest(
+            name=name,
+            spec=SweepSpec(template=template, axes=axes, concurrency=concurrency),
+            confirm_cost=confirm_cost,
+        )
+        return await _envelope(cp.post_model(API_SWEEPS, request, SubmitSweepResponse))
+
+    @mcp.tool
+    async def sweep_status(
+        sweep_id: str, key: str = DEFAULT_SWEEP_METRIC_KEY
+    ) -> dict[str, Any]:
+        """A sweep's children (state + which axis point each got) and the
+        cross-child mean/std/min/max of one metric key at matched steps —
+        e.g. cross-seed loss variance. `key` defaults to "loss"."""
+        return await _envelope(
+            cp.get_model(api_sweep(sweep_id), SweepStatus, params={_PARAM_KEY: key})
+        )
 
     @mcp.tool
     async def submit_run_from_experiment(

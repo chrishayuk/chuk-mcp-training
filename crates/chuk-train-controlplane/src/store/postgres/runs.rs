@@ -110,11 +110,12 @@ impl RunStore for PgStore {
         spec: &RunSpec,
         experiment_ref: Option<&str>,
         created_by: Option<&str>,
+        sweep_id: Option<&str>,
     ) -> Result<RunId> {
         let run_id = RunId(new_run_id(now(), self.next_run_seq().await?));
         sqlx::query(
-            "INSERT INTO runs (id, name, kind, spec, state, experiment_ref, created_by, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
+            "INSERT INTO runs (id, name, kind, spec, state, experiment_ref, created_by, sweep_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)",
         )
         .bind(&run_id.0)
         .bind(name)
@@ -123,6 +124,7 @@ impl RunStore for PgStore {
         .bind(RunState::Queued.as_str())
         .bind(experiment_ref)
         .bind(created_by)
+        .bind(sweep_id)
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -193,11 +195,13 @@ impl RunStore for PgStore {
             "SELECT * FROM runs
              WHERE ($1::text IS NULL OR state = $1)
                AND ($2::text IS NULL OR experiment_ref = $2)
+               AND ($3::text IS NULL OR sweep_id = $3)
              ORDER BY created_at DESC, id DESC
-             LIMIT $3 OFFSET $4",
+             LIMIT $4 OFFSET $5",
         )
         .bind(query.state.map(RunState::as_str))
         .bind(query.experiment_ref.as_deref())
+        .bind(query.sweep_id.as_deref())
         .bind(limit as i64)
         .bind(query.offset as i64)
         .fetch_all(&self.pool)

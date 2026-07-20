@@ -300,6 +300,8 @@ class RunSummary(BaseModel):
     # The experiments-server logical run (RUN-…) this EXEC-… execution belongs
     # to, if any; None for an unattached scratch run.
     experiment_ref: str | None = None
+    # The sweep (SWEEP-…) this run is a child of, if any.
+    sweep_id: str | None = None
     # Email of the submitting user (from their session or API key's owner);
     # None for pre-tracking runs or the legacy master token.
     created_by: str | None = None
@@ -320,6 +322,51 @@ class RunEvent(BaseModel):
 class LogsResponse(BaseModel):
     run_id: str
     lines: list[str]
+
+
+class SweepSpec(BaseModel):
+    """One template fanned out over axes (spec §5.2). Axis paths are `seed`
+    or `overrides.<key>`; concurrency 0 = unlimited."""
+
+    template: TrainSpec
+    axes: dict[str, list[Any]]
+    concurrency: int = 0
+
+
+class SubmitSweepRequest(BaseModel):
+    name: str
+    spec: SweepSpec
+    confirm_cost: bool = False
+
+
+class SubmitSweepResponse(BaseModel):
+    sweep_id: str
+    run_ids: list[str]
+
+
+class SweepChild(BaseModel):
+    run_id: str
+    state: RunState
+    # Axis path -> the value this child got.
+    assignment: dict[str, Any] = Field(default_factory=dict)
+
+
+class SweepAggregatePoint(BaseModel):
+    step: int
+    n: int
+    mean: float
+    std: float
+    min: float
+    max: float
+
+
+class SweepStatus(BaseModel):
+    sweep_id: str
+    name: str
+    concurrency: int
+    children: list[SweepChild] = Field(default_factory=list)
+    key: str
+    aggregate: list[SweepAggregatePoint] = Field(default_factory=list)
 
 
 class GateAction(StrEnum):
