@@ -11,6 +11,21 @@ jobs:
   check:
     name: clippy · test
     runs-on: ubuntu-latest
+    # A throwaway Postgres so the store's Postgres adapter is exercised for real
+    # (the `pg_live` integration test); the sqlite adapter is covered in-process.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: chuktest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +46,14 @@ jobs:
       # not gated here.
       - name: Test
         run: cargo test --workspace
+
+      # The Postgres adapter is a real DB adapter: exercise it against the service
+      # above via the (otherwise #[ignore]d) pg_live round-trip. Scoped to that
+      # test so the other #[ignore]d tests (R2/Drive/experiments) stay skipped.
+      - name: Test (postgres adapter)
+        env:
+          CHUK_TRAIN_STORE: postgresql://postgres:test@localhost:5432/chuktest
+        run: cargo test -p chuk-train-controlplane pg_live -- --ignored
 
   # chuk-compute M2: build the worker for every distributed target (the
   # SUPPORTED_TARGETS matrix). Linux-musl via cargo-zigbuild; darwin natively on

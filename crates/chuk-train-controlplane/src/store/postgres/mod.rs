@@ -360,7 +360,10 @@ fn run_from_row(row: &PgRow) -> Result<RunRecord> {
 mod pg_live {
     use super::*;
     use crate::store::prelude::*;
-    use chuk_train_proto::{Hardware, LedgerEntry, ShellSpec};
+    use chuk_train_proto::{
+        CheckpointLocation, CodeRef, CodeUnitManifest, Hardware, Lease, LeaseExtension, LeaseState,
+        LedgerEntry, Role, ShellSpec,
+    };
 
     fn pg_url() -> Option<String> {
         match std::env::var("CHUK_TRAIN_STORE") {
@@ -438,12 +441,21 @@ mod pg_live {
         let tail = store.tail_logs(&run_id, 2).await.expect("tail");
         assert_eq!(tail, vec!["line 1".to_string(), "line 2".to_string()]);
 
-        // metrics: transaction + upsert
+        // metrics: transaction + upsert, then the key-filter + downsample reads
         let mut m = BTreeMap::new();
         m.insert("loss".to_string(), 1.5);
         store.append_metrics(&run_id, 10, &m).await.expect("metrics");
         let series = store.metric_series(&run_id, None, 0, 0).await.expect("series");
         assert_eq!(series.series.get("loss").expect("loss series")[0].value, 1.5);
+        for step in 0..6 {
+            store
+                .append_metrics(&run_id, step, &BTreeMap::from([("loss".to_owned(), step as f64), ("lr".to_owned(), 0.1)]))
+                .await.expect("metrics2");
+        }
+        let filtered = store.metric_series(&run_id, Some(&["loss".to_owned()]), 1, 3).await.expect("filtered");
+        assert!(filtered.series.contains_key("loss")); // key filter keeps loss
+        assert!(!filtered.series.contains_key("lr")); // …and drops lr
+        assert!(filtered.series["loss"].iter().all(|p| p.step >= 1)); // since_step
 
         // checkpoints + pin: the other boolean column
         let meta = CheckpointMeta { step: 10, ..Default::default() };
@@ -473,24 +485,109 @@ mod pg_live {
             .iter()
             .any(|e| e.worker_id == wid));
 
-        // cleanup — remove this test's rows so the shared Neon DB stays tidy
+        // ---- the remaining surface, so every postgres/*.rs is exercised ----
+
+        // workers: run-binding, fleet, persistence, telemetry
+        store.set_worker_run(&wid, Some(&run_id)).await.expect("set_worker_run");
+        store.set_worker_run(&wid, None).await.expect("clear_worker_run");
+        assert!(store.fleet().await.expect("fleet").iter().any(|w| w.id == wid));
+        assert!(!store.worker_is_persistent(&wid).await.expect("persistent"));
+        store
+            .record_worker_samples(&wid, &BTreeMap::from([("sys/cpu_util".to_owned(), 0.5)]))
+            .await.expect("samples");
+        assert!(store.worker_telemetry(&wid).await.expect("telemetry").is_some());
+
+        // runs: next_queued + the experiments-mirror id + the outbox
+        let _ = store.next_queued().await.expect("next_queued");
+        store.set_experiments_run_id(&run_id, "RUN-pgtest-1").await.expect("set_exp_id");
+        assert_eq!(store.experiments_run_id(&run_id).await.expect("exp_id").as_deref(), Some("RUN-pgtest-1"));
+        let oid = store.enqueue_outbox_event(&run_id, "state", "{}", now()).await.expect("enqueue");
+        assert!(store.due_outbox_events(now() + 1.0, 10).await.expect("due").iter().any(|e| e.id == oid));
+        store.mark_outbox_event_failed(oid, "boom", now() + 9999.0).await.expect("failed");
+        store.mark_outbox_event_done(oid).await.expect("done");
+
+        // checkpoints: latest, location, archive
+        assert_eq!(store.latest_checkpoint(&run_id).await.expect("latest").expect("some").step, 10);
+        store.set_checkpoint_location(&run_id, 10, CheckpointLocation::R2Final).await.expect("loc");
+        let dids = BTreeMap::from([("model.safetensors".to_owned(), "drive-x".to_owned())]);
+        store.mark_checkpoint_archived(&run_id, 10, &dids, now()).await.expect("archive");
+        assert!(store.checkpoint_drive_ids(&run_id, 10).await.expect("drive_ids").is_some());
+
+        // code units
+        let cu_name = format!("cu-{}", store.next_run_seq().await.unwrap());
+        let code = CodeRef { name: cu_name.clone(), sha: "sha1".into() };
+        let manifest = CodeUnitManifest {
+            name: cu_name.clone(), version: "0".into(),
+            entrypoints: BTreeMap::from([("train".to_owned(), "python x".to_owned())]),
+            python: None, requires: Default::default(),
+        };
+        store.register_code_unit(&code, &manifest, "s3://cu").await.expect("register_cu");
+        assert!(store.code_unit(&cu_name, "sha1").await.expect("code_unit").is_some());
+
+        // leases
+        let lease = Lease {
+            worker_id: wid.clone(), provider: "vast".into(), instance_id: "i".into(),
+            price_hr: 1.0, granted_min: 60.0, drain_window_min: 5.0, started_at: now(),
+            state: LeaseState::Active, extensions: vec![],
+        };
+        store.create_lease(&lease).await.expect("create_lease");
+        assert!(store.lease(&wid).await.expect("lease").is_some());
+        assert!(store.live_leases().await.expect("live").iter().any(|l| l.worker_id == wid));
+        store.extend_lease(&wid, LeaseExtension { minutes: 10.0, at: now(), reason: "x".into() }).await.expect("extend");
+        store.set_lease_state(&wid, LeaseState::Destroyed).await.expect("set_state");
+
+        // auth: teams, users, api keys
+        let team = format!("pgt-{}", store.next_run_seq().await.unwrap());
+        store.ensure_team(&team, "PG Test").await.expect("team");
+        let email = format!("u{}@pgtest", store.next_run_seq().await.unwrap());
+        store.upsert_user(&email, &team, Role::Write).await.expect("user");
+        assert!(store.get_user(&email).await.expect("get_user").is_some());
+        assert!(store.list_users(&team).await.expect("list_users").iter().any(|u| u.email == email));
+        store.set_user_experiments_key(&email, Some("enc")).await.expect("set_key");
+        assert_eq!(store.user_experiments_key(&email).await.expect("get_key").as_deref(), Some("enc"));
+        let kid = format!("k{}", store.next_run_seq().await.unwrap());
+        let khash = format!("kh-{kid}");
+        store.create_api_key(&kid, &team, &email, "ci", "ck_x", &khash, Role::Write).await.expect("api_key");
+        assert!(store.list_api_keys(&team).await.expect("list_keys").iter().any(|k| k.id == kid));
+        assert!(store.resolve_api_key(&khash).await.expect("resolve_key").is_some());
+        store.touch_api_key(&kid, now()).await.expect("touch_key");
+        assert!(store.revoke_api_key(&kid).await.expect("revoke_key"));
+        store.remove_user(&email).await.expect("remove_user");
+
+        // worker tokens
+        let tid = format!("wt{}", store.next_run_seq().await.unwrap());
+        let thash = format!("th-{tid}");
+        store.create_worker_token(&tid, &wid, "w", "cw_x", &thash).await.expect("worker_token");
+        assert!(store.resolve_worker_token(&thash).await.expect("resolve_wt").is_some());
+        assert!(store.list_worker_tokens().await.expect("list_wt").iter().any(|t| t.id == tid));
+        store.touch_worker_token(&tid, now()).await.expect("touch_wt");
+        assert!(store.revoke_worker_token(&tid).await.expect("revoke_wt"));
+
+        // cleanup — remove this test's rows so a shared DB stays tidy
         let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.expect("cleanup pool");
         for stmt in [
             "DELETE FROM run_logs WHERE run_id = $1",
             "DELETE FROM run_events WHERE run_id = $1",
             "DELETE FROM metrics WHERE run_id = $1",
             "DELETE FROM checkpoints WHERE run_id = $1",
+            "DELETE FROM experiments_outbox WHERE run_id = $1",
             "DELETE FROM runs WHERE id = $1",
         ] {
             sqlx::query(stmt).bind(&run_id.0).execute(&pool).await.expect("cleanup run rows");
         }
         for stmt in [
             "DELETE FROM workers WHERE id = $1",
+            "DELETE FROM worker_samples WHERE worker_id = $1",
+            "DELETE FROM worker_tokens WHERE worker_id = $1",
             "DELETE FROM leases WHERE worker_id = $1",
             "DELETE FROM ledger WHERE worker_id = $1",
         ] {
             sqlx::query(stmt).bind(&wid.0).execute(&pool).await.expect("cleanup worker rows");
         }
+        let _ = sqlx::query("DELETE FROM code_units WHERE name = $1").bind(&cu_name).execute(&pool).await;
+        let _ = sqlx::query("DELETE FROM api_keys WHERE team_id = $1").bind(&team).execute(&pool).await;
+        let _ = sqlx::query("DELETE FROM users WHERE team_id = $1").bind(&team).execute(&pool).await;
+        let _ = sqlx::query("DELETE FROM teams WHERE id = $1").bind(&team).execute(&pool).await;
         eprintln!("pg live round-trip ok: {}", run_id.0);
     }
 }
