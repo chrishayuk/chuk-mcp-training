@@ -17,6 +17,7 @@ mod config;
 mod crypto;
 mod dash;
 mod drive;
+mod gate;
 mod experiments;
 mod grant;
 mod hub;
@@ -191,6 +192,10 @@ async fn main() -> Result<()> {
         .route("/runs/{run_id}", get(api::run_status))
         .route("/runs/{run_id}/stop", post(api::stop_run))
         .route("/runs/{run_id}/resume", post(api::resume_run))
+        .route(
+            "/runs/{run_id}/gates",
+            get(api::check_gates).post(api::register_gate),
+        )
         .route("/runs/{run_id}/logs", get(api::tail_logs))
         .route("/runs/{run_id}/events", get(api::run_events))
         .route("/runs/{run_id}/metrics", get(api::run_metrics))

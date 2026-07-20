@@ -16,7 +16,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chuk_train_proto::{
     ApiKeyInfo, Budget, CheckpointInfo, CheckpointLocation, CheckpointMeta, CodeRef, CodeUnitInfo,
-    CodeUnitManifest, EventKind, Hardware, Lease, LeaseExtension, LeaseState, LedgerEntry,
+    CodeUnitManifest, EventKind, GateAction, GateInfo, Hardware, Lease, LeaseExtension, LeaseState,
+    LedgerEntry,
     MetricSeries, OutboxRow, Role, RunEvent, RunId, RunRecord, RunSpec, RunState, RunSummary,
     UnixSeconds, User, WorkerId, WorkerInfo, WorkerTelemetry, WorkerTokenInfo,
 };
@@ -246,6 +247,47 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Result<Option<std::collections::BTreeMap<String, String>>>;
 }
 
+/// A timestamped metric observation for gate evaluation (ascending by step).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetricObservation {
+    pub ts: UnixSeconds,
+    pub value: f64,
+}
+
+/// Gates + watchdogs (spec §6/§8): registration, latest verdicts, and the
+/// per-key metric history gate evaluation reads.
+#[async_trait]
+pub trait GateStore: Send + Sync {
+    /// Upsert a gate by (scope, scope_id, name); a re-register replaces the
+    /// expression/action and clears the previous verdict.
+    async fn register_gate(
+        &self,
+        scope: &str,
+        scope_id: &str,
+        name: &str,
+        expr: &str,
+        action: GateAction,
+    ) -> Result<()>;
+
+    async fn gates(&self, scope: &str, scope_id: &str) -> Result<Vec<GateInfo>>;
+
+    /// Persist a gate's latest verdict.
+    async fn record_gate_result(
+        &self,
+        scope: &str,
+        scope_id: &str,
+        name: &str,
+        tripped: bool,
+        last_value: Option<f64>,
+        detail: &str,
+        at: UnixSeconds,
+    ) -> Result<()>;
+
+    /// One key's full (ts, value) history for a run, ascending by step.
+    async fn metric_history(&self, run_id: &RunId, key: &str)
+        -> Result<Vec<MetricObservation>>;
+}
+
 /// Provider leases: the wall the lease manager + reconcile loop enforce (§3).
 #[async_trait]
 pub trait LeaseStore: Send + Sync {
@@ -364,6 +406,7 @@ pub trait Store:
     + CodeUnitStore
     + MetricStore
     + CheckpointStore
+    + GateStore
     + LeaseStore
     + LedgerStore
     + AuthStore
@@ -378,6 +421,7 @@ impl<T> Store for T where
     + CodeUnitStore
     + MetricStore
     + CheckpointStore
+    + GateStore
     + LeaseStore
     + LedgerStore
     + AuthStore
@@ -389,7 +433,7 @@ impl<T> Store for T where
 /// `use crate::store::prelude::*;`.
 pub(crate) mod prelude {
     pub(crate) use super::{
-        AuthStore, CheckpointStore, CodeUnitStore, LeaseStore, LedgerStore, MetricStore,
+        AuthStore, CheckpointStore, CodeUnitStore, GateStore, LeaseStore, LedgerStore, MetricStore,
         RunLogStore, RunStore, WorkerStore, WorkerTokenStore,
     };
 }

@@ -15,6 +15,11 @@ impl MetricStore for SqliteStore {
         let step = step as i64;
         let mut tx = self.pool.begin().await?;
         for (key, value) in values {
+            // SQLite has no NaN (binding one becomes NULL and would trip the
+            // NOT NULL constraint on older DBs): store non-finite explicitly
+            // as NULL, and read it back as NaN (see gates.rs metric_history) —
+            // a NaN loss must trip the isnan gate, not break metric ingest.
+            let storable = Some(*value).filter(|v| v.is_finite());
             sqlx::query(
                 "INSERT INTO metrics (run_id, step, key, value, ts) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(run_id, key, step) DO UPDATE SET value = excluded.value",
@@ -22,7 +27,7 @@ impl MetricStore for SqliteStore {
             .bind(&run_id.0)
             .bind(step)
             .bind(key)
-            .bind(value)
+            .bind(storable)
             .bind(ts)
             .execute(&mut *tx)
             .await?;
@@ -57,9 +62,15 @@ impl MetricStore for SqliteStore {
             if wanted.as_ref().is_some_and(|w| !w.contains(key.as_str())) {
                 continue;
             }
+            // A NULL value is a stored non-finite observation; it can't ride a
+            // JSON series response (JSON has no NaN), so series reads skip it —
+            // the isnan gate is where non-finite values are surfaced.
+            let Some(value) = row.get::<Option<f64>, _>("value") else {
+                continue;
+            };
             series.entry(key).or_default().push(MetricPoint {
                 step: row.get::<i64, _>("step") as u64,
-                value: row.get("value"),
+                value,
             });
         }
         if downsample > 0 {

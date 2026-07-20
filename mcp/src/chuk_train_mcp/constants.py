@@ -86,6 +86,10 @@ def api_run_archive(run_id: str) -> str:
     return f"{API_RUNS}/{run_id}/archive"
 
 
+def api_run_gates(run_id: str) -> str:
+    return f"{API_RUNS}/{run_id}/gates"
+
+
 # Defaults mirrored from chuk-train-proto.
 DEFAULT_SHELL_TIMEOUT_S: Final = 600
 DEFAULT_TRAIN_TIMEOUT_S: Final = 12 * 3600

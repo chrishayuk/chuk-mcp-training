@@ -78,9 +78,22 @@ CREATE TABLE IF NOT EXISTS metrics (
   run_id       TEXT NOT NULL,
   step         INTEGER NOT NULL,
   key          TEXT NOT NULL,
-  value        REAL NOT NULL,
+  value        REAL,
   ts           REAL NOT NULL,
   PRIMARY KEY (run_id, key, step)
+);
+CREATE TABLE IF NOT EXISTS gates (
+  scope        TEXT NOT NULL,
+  scope_id     TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  expr         TEXT NOT NULL,
+  action       TEXT NOT NULL,
+  created_at   REAL NOT NULL,
+  tripped      INTEGER,
+  last_value   REAL,
+  evaluated_at REAL,
+  detail       TEXT,
+  PRIMARY KEY (scope, scope_id, name)
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
   run_id         TEXT NOT NULL,
@@ -224,6 +237,7 @@ mod metrics;
 mod checkpoints;
 mod leases;
 mod ledger;
+mod gates;
 mod auth;
 mod tokens;
 

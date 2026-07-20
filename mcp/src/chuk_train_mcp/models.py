@@ -39,6 +39,7 @@ class EventKind(StrEnum):
     CHECKPOINT = "checkpoint"
     SLICED = "sliced"
     RESUMED = "resumed"
+    GATE_EVALUATED = "gate_evaluated"
 
 
 class RunKind(StrEnum):
@@ -319,6 +320,32 @@ class RunEvent(BaseModel):
 class LogsResponse(BaseModel):
     run_id: str
     lines: list[str]
+
+
+class GateAction(StrEnum):
+    RECORD = "record"
+    STOP_RUN = "stop_run"
+
+
+class GateInfo(BaseModel):
+    """A registered gate plus its latest verdict (None until first evaluated)."""
+
+    scope: str
+    scope_id: str
+    name: str
+    expr: str
+    action: GateAction
+    created_at: float
+    tripped: bool | None = None
+    last_value: float | None = None
+    evaluated_at: float | None = None
+    detail: str | None = None
+
+
+class RegisterGateRequest(BaseModel):
+    name: str
+    expr: str
+    action: GateAction = GateAction.RECORD
 
 
 class SubmitShellRequest(BaseModel):

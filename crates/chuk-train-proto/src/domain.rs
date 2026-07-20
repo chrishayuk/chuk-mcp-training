@@ -159,6 +159,8 @@ pub enum EventKind {
     Checkpoint,
     Sliced,
     Resumed,
+    // M4: a gate's verdict flipped (spec §5.3 `gate_evaluated`).
+    GateEvaluated,
 }
 
 impl From<RunState> for EventKind {

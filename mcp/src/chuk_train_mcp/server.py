@@ -31,6 +31,7 @@ from .constants import (
     api_run_checkpoints,
     api_run_events,
     api_run_from_experiment,
+    api_run_gates,
     api_run_logs,
     api_run_metrics,
     api_run_resume,
@@ -61,12 +62,15 @@ from .models import (
     ColabCell,
     Envelope,
     ExtendLeaseRequest,
+    GateAction,
+    GateInfo,
     Lease,
     LogsResponse,
     MetricSeries,
     Offer,
     PinCheckpointRequest,
     ProvisionRequest,
+    RegisterGateRequest,
     ProvisionResult,
     RunEvent,
     RunRecord,
@@ -348,6 +352,39 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
         """Per-run archive state: each recent run's final checkpoint location
         (R2 hot/final or Drive) and when it was archived."""
         return await _envelope(cp.get_raw(API_ARCHIVE))
+
+    @mcp.tool
+    async def register_gate(
+        run_id: str, name: str, expr: str, action: str = "record"
+    ) -> dict[str, Any]:
+        """Register (upsert by name) a gate on a run (spec §6/§8). Write-scoped.
+
+        expr is one of exactly three forms (validated at registration):
+          isnan(last(<key>))          — trips when the latest value is not finite
+          no_improve(<key>, <N>min)   — trips when the best value in the trailing
+                                        N minutes is no better than the best before
+          last(<key>) <op> <value>    — op: > >= < <=   e.g. last(grad_norm) > 1e3
+
+        action "record" observes; "stop_run" is a watchdog: trip ⇒ the run is
+        stopped (the worker's SIGTERM grace is the trainer's checkpoint window).
+        The classic watchdog trio: isnan(last(loss)), no_improve(loss, 120min),
+        last(grad_norm) > 1e3 — all with action="stop_run".
+        Gates re-evaluate on every metric ingest and on check_gates reads; a
+        verdict flip lands a gate_evaluated event in run_events.
+        Returns the run's gates after registration.
+        """
+        request = RegisterGateRequest(name=name, expr=expr, action=GateAction(action))
+        return await _envelope(cp.post_raw(api_run_gates(run_id), request))
+
+    @mcp.tool
+    async def check_gates(run_id: str) -> dict[str, Any]:
+        """Evaluate every gate on a run fresh and return the verdicts
+        (tripped/last_value/detail per gate). Reading re-evaluates, so verdicts
+        are current even for a run that has stopped emitting metrics."""
+        return await _envelope(
+            cp.get_list(api_run_gates(run_id), GateInfo),
+            empty_hint="No gates registered on this run — add one with register_gate.",
+        )
 
     @mcp.tool
     async def artifact_url(key: str, ttl_s: int = DEFAULT_ARTIFACT_URL_TTL_S) -> dict[str, Any]:

@@ -102,6 +102,19 @@ CREATE TABLE IF NOT EXISTS metrics (
   ts           double precision NOT NULL,
   PRIMARY KEY (run_id, key, step)
 );
+CREATE TABLE IF NOT EXISTS gates (
+  scope        text NOT NULL,
+  scope_id     text NOT NULL,
+  name         text NOT NULL,
+  expr         text NOT NULL,
+  action       text NOT NULL,
+  created_at   double precision NOT NULL,
+  tripped      boolean,
+  last_value   double precision,
+  evaluated_at double precision,
+  detail       text,
+  PRIMARY KEY (scope, scope_id, name)
+);
 CREATE TABLE IF NOT EXISTS checkpoints (
   run_id         text NOT NULL,
   step           bigint NOT NULL,
@@ -244,6 +257,7 @@ mod metrics;
 mod checkpoints;
 mod leases;
 mod ledger;
+mod gates;
 mod auth;
 mod tokens;
 
@@ -399,6 +413,7 @@ mod pg_live {
             "DELETE FROM run_events WHERE run_id IN (SELECT id FROM runs WHERE name='pg-live')",
             "DELETE FROM metrics    WHERE run_id IN (SELECT id FROM runs WHERE name='pg-live')",
             "DELETE FROM checkpoints WHERE run_id IN (SELECT id FROM runs WHERE name='pg-live')",
+            "DELETE FROM gates      WHERE scope_id IN (SELECT id FROM runs WHERE name='pg-live')",
             "DELETE FROM runs   WHERE name='pg-live'",
             "DELETE FROM workers WHERE id LIKE 'pgtest-%'",
             "DELETE FROM leases  WHERE worker_id LIKE 'pgtest-%'",
@@ -506,6 +521,27 @@ mod pg_live {
             .expect("ledger_entries")
             .iter()
             .any(|e| e.worker_id == wid));
+
+        // gates: upsert-by-name (re-register resets the verdict), verdict
+        // round-trip, and the (ts, value) history read gate evaluation uses
+        store
+            .register_gate("run", &run_id.0, "grad", "last(grad_norm) > 1e3", chuk_train_proto::GateAction::StopRun)
+            .await
+            .expect("register_gate");
+        store
+            .record_gate_result("run", &run_id.0, "grad", true, Some(5e3), "blew up", now())
+            .await
+            .expect("record_gate_result");
+        let gates = store.gates("run", &run_id.0).await.expect("gates");
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].tripped, Some(true));
+        store
+            .register_gate("run", &run_id.0, "grad", "last(grad_norm) > 2e3", chuk_train_proto::GateAction::Record)
+            .await
+            .expect("re-register_gate");
+        let gates = store.gates("run", &run_id.0).await.expect("gates");
+        assert_eq!(gates[0].tripped, None, "re-register clears the verdict");
+        assert!(!store.metric_history(&run_id, "loss").await.expect("history").is_empty());
 
         // budgets: upsert-by-scope, list, delete
         let scope = format!("provider:pgtest-{}", wid.0);

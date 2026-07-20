@@ -18,10 +18,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use anyhow::{Context, Result};
 use chuk_compute_wire as wire;
 use chuk_train_proto::{
-    keys, CheckpointMeta, EventKind, Hardware, LeaseState, RunId, RunSpec, RunState, TrainSpec,
-    WorkerId, WorkerInfo, WorkerState, CHECKPOINT_DIR_PREFIX, CHECKPOINT_META_FILE,
-    CHECKPOINT_MODEL_FILE, EXIT_CODE_AGENT_ERROR, EXIT_CODE_CANCELLED, HEARTBEAT_PREEMPT_TIMEOUT,
-    HEARTBEAT_TIMEOUT,
+    keys, CheckpointMeta, EventKind, GateAction, GateInfo, Hardware, LeaseState, RunId, RunSpec,
+    RunState, TrainSpec, WorkerId, WorkerInfo, WorkerState, CHECKPOINT_DIR_PREFIX,
+    CHECKPOINT_META_FILE, CHECKPOINT_MODEL_FILE, EXIT_CODE_AGENT_ERROR, EXIT_CODE_CANCELLED,
+    GATE_SCOPE_RUN, HEARTBEAT_PREEMPT_TIMEOUT, HEARTBEAT_TIMEOUT,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -30,6 +30,14 @@ use tracing::{debug, info, warn};
 
 use crate::artifacts::ArtifactStore;
 use crate::experiments::Experiments;
+use crate::gate;
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs_f64()
+}
 use crate::grant::GrantTable;
 use crate::jobspec::{self, ResumeStaging, TrainStaging};
 use crate::store::Store;
@@ -365,9 +373,13 @@ impl Hub {
                 // A job's own metric: the (job, step)-indexed training series.
                 Some(job_id) => {
                     if let Some(step) = step {
-                        self.store
-                            .append_metrics(&run_id(&job_id), step, &values)
-                            .await?;
+                        let rid = run_id(&job_id);
+                        self.store.append_metrics(&rid, step, &values).await?;
+                        // Gate evaluation rides ingest; a policy failure must
+                        // never fail the metric write itself.
+                        if let Err(error) = self.evaluate_gates(&rid).await {
+                            warn!(run = %rid.0, %error, "gate evaluation failed");
+                        }
                     }
                 }
                 // Host telemetry (chuk-compute M4): `sys/*` samples carry no job
@@ -591,6 +603,75 @@ impl Hub {
     /// `JobKilled{Cancel}`, which lands the run in `Cancelled`); a queued run, or
     /// one whose worker link is already gone, is finalised here and now. A
     /// terminal run is rejected.
+    /// Evaluate every gate on a run against its metric history, persist the
+    /// verdicts, and act on newly-tripped ones (spec §6/§8): a
+    /// `gate_evaluated` run event, plus — for `stop_run` watchdogs — the stop
+    /// path (the worker's SIGTERM grace is the trainer's checkpoint window).
+    /// Runs on metric ingest and on `check_gates` reads, so verdicts stay
+    /// current even when a run stops emitting metrics. Returns the refreshed
+    /// gates. Events fire only on a verdict *flip* to tripped, not per batch.
+    pub async fn evaluate_gates(&self, run_id: &RunId) -> Result<Vec<GateInfo>> {
+        let gates = self.store.gates(GATE_SCOPE_RUN, &run_id.0).await?;
+        let mut refreshed = Vec::with_capacity(gates.len());
+        for info in gates {
+            // Expressions are validated at registration; tolerate a bad stored
+            // row (e.g. a grammar change) rather than poisoning ingest.
+            let expr = match gate::parse(&info.expr) {
+                Ok(expr) => expr,
+                Err(reason) => {
+                    warn!(run = %run_id.0, gate = %info.name, %reason, "unparseable stored gate");
+                    refreshed.push(info);
+                    continue;
+                }
+            };
+            let history = self.store.metric_history(run_id, expr.key()).await?;
+            let at = unix_now();
+            let verdict = gate::evaluate(&expr, &history, at);
+            let newly_tripped = verdict.tripped && info.tripped != Some(true);
+            self.store
+                .record_gate_result(
+                    GATE_SCOPE_RUN,
+                    &run_id.0,
+                    &info.name,
+                    verdict.tripped,
+                    verdict.last_value,
+                    &verdict.detail,
+                    at,
+                )
+                .await?;
+            if newly_tripped {
+                self.store
+                    .add_event(
+                        run_id,
+                        EventKind::GateEvaluated,
+                        serde_json::json!({
+                            "gate": info.name,
+                            "expr": info.expr,
+                            "tripped": true,
+                            "action": info.action.as_str(),
+                            "detail": verdict.detail,
+                        }),
+                    )
+                    .await?;
+                if info.action == GateAction::StopRun {
+                    warn!(run = %run_id.0, gate = %info.name, detail = %verdict.detail,
+                          "watchdog tripped; stopping run");
+                    if let Err(error) = self.stop_run(run_id).await {
+                        warn!(run = %run_id.0, %error, "watchdog stop failed");
+                    }
+                }
+            }
+            refreshed.push(GateInfo {
+                tripped: Some(verdict.tripped),
+                last_value: verdict.last_value,
+                evaluated_at: Some(at),
+                detail: Some(verdict.detail),
+                ..info
+            });
+        }
+        Ok(refreshed)
+    }
+
     pub async fn stop_run(&self, run_id: &RunId) -> Result<()> {
         let run = self
             .store
@@ -786,6 +867,59 @@ mod tests {
 
     fn shell_run() -> RunSpec {
         RunSpec::Shell(ShellSpec { command: "sleep 1".into(), timeout_s: 60 })
+    }
+
+    #[tokio::test]
+    async fn tripped_watchdog_gate_stops_the_run_and_records_the_event() {
+        let hub = test_hub().await;
+        let run = hub.submit("r", &shell_run(), None, None).await.unwrap();
+        hub.store
+            .register_gate(GATE_SCOPE_RUN, &run.0, "grad-blowup", "last(grad_norm) > 1e3", GateAction::StopRun)
+            .await
+            .unwrap();
+
+        // Healthy metrics: evaluated, not tripped, run untouched.
+        let mut healthy = std::collections::BTreeMap::new();
+        healthy.insert("grad_norm".to_owned(), 10.0);
+        hub.store.append_metrics(&run, 1, &healthy).await.unwrap();
+        let gates = hub.evaluate_gates(&run).await.unwrap();
+        assert_eq!(gates[0].tripped, Some(false));
+        let rec = hub.store.run(&run).await.unwrap().unwrap();
+        assert_eq!(rec.summary.state, RunState::Queued);
+
+        // A gradient blowup trips the watchdog: run stops (queued → cancelled
+        // directly), and the flip is a gate_evaluated event — exactly once.
+        let mut blowup = std::collections::BTreeMap::new();
+        blowup.insert("grad_norm".to_owned(), 5e3);
+        hub.store.append_metrics(&run, 2, &blowup).await.unwrap();
+        let gates = hub.evaluate_gates(&run).await.unwrap();
+        assert_eq!(gates[0].tripped, Some(true));
+        let rec = hub.store.run(&run).await.unwrap().unwrap();
+        assert_eq!(rec.summary.state, RunState::Cancelled);
+
+        // Re-evaluating while still tripped neither re-stops nor re-events.
+        hub.evaluate_gates(&run).await.unwrap();
+        let events = hub.store.events(&run).await.unwrap();
+        let flips = events.iter().filter(|e| e.event == EventKind::GateEvaluated).count();
+        assert_eq!(flips, 1);
+    }
+
+    #[tokio::test]
+    async fn record_gate_observes_without_stopping() {
+        let hub = test_hub().await;
+        let run = hub.submit("r", &shell_run(), None, None).await.unwrap();
+        hub.store
+            .register_gate(GATE_SCOPE_RUN, &run.0, "nan-check", "isnan(last(loss))", GateAction::Record)
+            .await
+            .unwrap();
+        let mut nan = std::collections::BTreeMap::new();
+        nan.insert("loss".to_owned(), f64::NAN);
+        hub.store.append_metrics(&run, 1, &nan).await.unwrap();
+        let gates = hub.evaluate_gates(&run).await.unwrap();
+        assert_eq!(gates[0].tripped, Some(true));
+        // Recorded, not enforced: the run stays queued.
+        let rec = hub.store.run(&run).await.unwrap().unwrap();
+        assert_eq!(rec.summary.state, RunState::Queued);
     }
 
     #[tokio::test]

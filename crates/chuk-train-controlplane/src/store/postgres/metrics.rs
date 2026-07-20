@@ -57,9 +57,16 @@ impl MetricStore for PgStore {
             if wanted.as_ref().is_some_and(|w| !w.contains(key.as_str())) {
                 continue;
             }
+            // Postgres stores NaN/Inf natively, but a JSON series response
+            // can't carry them — skip non-finite points; the isnan gate is
+            // where they surface.
+            let value: f64 = row.get("value");
+            if !value.is_finite() {
+                continue;
+            }
             series.entry(key).or_default().push(MetricPoint {
                 step: row.get::<i64, _>("step") as u64,
-                value: row.get("value"),
+                value,
             });
         }
         if downsample > 0 {

@@ -146,6 +146,10 @@ pub const DEFAULT_BUDGET_PERIOD: &str = BUDGET_PERIOD_MONTH;
 /// `confirm_cost=true` (spec §8 pre-flight; env-overridable).
 pub const DEFAULT_CONFIRM_COST_THRESHOLD: f64 = 5.0;
 
+/// Gate scopes (spec §6). Only `run` exists today; sweep-scope gates arrive
+/// with sweeps' cross-seed rules.
+pub const GATE_SCOPE_RUN: &str = "run";
+
 /// Default number of log lines returned by the tail endpoint.
 pub const DEFAULT_LOG_TAIL_LINES: u32 = 100;
 /// Default page size for run listings.

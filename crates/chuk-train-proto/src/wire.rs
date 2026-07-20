@@ -340,6 +340,57 @@ pub struct SpendReport {
     pub global_headroom: Option<f64>,
 }
 
+/// What happens when a gate trips (spec §6). A `record` gate is a labelled
+/// observation; a `stop_run` gate is a watchdog — trip ⇒ stop the run (the
+/// worker's SIGTERM grace is the trainer's checkpoint window).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GateAction {
+    #[default]
+    Record,
+    StopRun,
+}
+
+impl GateAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Record => "record",
+            Self::StopRun => "stop_run",
+        }
+    }
+}
+
+/// A registered gate plus its latest verdict (spec §6 `check_gates`). The
+/// verdict fields are `None` until the first evaluation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateInfo {
+    pub scope: String,
+    pub scope_id: String,
+    pub name: String,
+    /// One of the closed expression forms: `isnan(last(<key>))`,
+    /// `no_improve(<key>, <N>min)`, or `last(<key>) <op> <value>`.
+    pub expr: String,
+    pub action: GateAction,
+    pub created_at: UnixSeconds,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tripped: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluated_at: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `register_gate(...)` request (spec §6); scope/scope_id come from the route.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegisterGateRequest {
+    pub name: String,
+    pub expr: String,
+    #[serde(default)]
+    pub action: GateAction,
+}
+
 /// A ready-to-paste Colab bootstrap cell (spec §6: Colab `provision` returns
 /// cell text). The control plane fills in its own URL + join token, so the
 /// caller pastes it verbatim into a T4 notebook.

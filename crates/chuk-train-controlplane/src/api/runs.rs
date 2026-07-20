@@ -6,10 +6,10 @@ use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chuk_train_proto::{
-    BuildCodeUnitRequest, LogsResponse, MetricSeries, Role, RunEvent, RunId, RunRecord, RunSpec,
-    RunState, RunSummary, ShellSpec, SubmitRunRequest, SubmitRunResponse, SubmitShellRequest, WorkerId,
-    WorkerInfo, WorkerTelemetry, DEFAULT_LOG_TAIL_LINES, DEFAULT_METRIC_DOWNSAMPLE,
-    DEFAULT_RUN_LIST_LIMIT, DEFAULT_SHELL_TIMEOUT,
+    BuildCodeUnitRequest, LogsResponse, MetricSeries, RegisterGateRequest, Role, RunEvent, RunId,
+    RunRecord, RunSpec, RunState, RunSummary, ShellSpec, SubmitRunRequest, SubmitRunResponse,
+    SubmitShellRequest, WorkerId, WorkerInfo, WorkerTelemetry, DEFAULT_LOG_TAIL_LINES,
+    DEFAULT_METRIC_DOWNSAMPLE, DEFAULT_RUN_LIST_LIMIT, DEFAULT_SHELL_TIMEOUT, GATE_SCOPE_RUN,
 };
 use serde::Deserialize;
 
@@ -252,6 +252,62 @@ pub async fn submit_run_from_experiment(
     {
         Ok(run_id) => Json(SubmitRunResponse { run_id }).into_response(),
         Err(error) => bad_request(&error.to_string()),
+    }
+}
+
+/// `POST /runs/{run_id}/gates` — register (upsert by name) a gate on a run
+/// (spec §6). The expression is validated against the closed grammar here, so
+/// a typo is a 400 at registration, never a silently-dead watchdog.
+pub async fn register_gate(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+    Path(run_id): Path<String>,
+    Json(request): Json<RegisterGateRequest>,
+) -> Response {
+    if let Err(resp) = require_role(&ctx, Role::Write) {
+        return resp;
+    }
+    if request.name.trim().is_empty() {
+        return bad_request("gate name required");
+    }
+    if let Err(reason) = crate::gate::parse(&request.expr) {
+        return bad_request(&reason);
+    }
+    match state.hub.store.run(&RunId(run_id.clone())).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found(),
+        Err(error) => return internal(error),
+    }
+    match state
+        .hub
+        .store
+        .register_gate(
+            GATE_SCOPE_RUN,
+            &run_id,
+            request.name.trim(),
+            request.expr.trim(),
+            request.action,
+        )
+        .await
+    {
+        Ok(()) => match state.hub.store.gates(GATE_SCOPE_RUN, &run_id).await {
+            Ok(gates) => Json(gates).into_response(),
+            Err(error) => internal(error),
+        },
+        Err(error) => internal(error),
+    }
+}
+
+/// `GET /runs/{run_id}/gates` — evaluate every gate fresh and return the
+/// verdicts (spec §6 `check_gates`). Evaluating on read keeps `no_improve`
+/// honest for a run that has stopped emitting metrics.
+pub async fn check_gates(
+    State(state): State<Arc<AppState>>,
+    Path(run_id): Path<String>,
+) -> Response {
+    match state.hub.evaluate_gates(&RunId(run_id)).await {
+        Ok(gates) => Json(gates).into_response(),
+        Err(error) => internal(error),
     }
 }
 
