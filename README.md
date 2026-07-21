@@ -292,8 +292,9 @@ Drive automatically (a background loop is both the prompt archiver and the
 idempotent backstop); the final is promoted to `ckpt-final/` on R2, and R2
 lifecycle expires the hot copies (`ckpt-hot/` 1d, `ckpt-final/` 30d). A stable
 per-checkpoint URL resolves R2-or-Drive. Trigger/inspect via `archive_run`,
-`archive_runs`, `archive_status`. (R2 lifecycle needs an Admin R/W token, or set
-the two rules in the Cloudflare R2 dashboard.)
+`archive_runs`, `archive_status`. (The two R2 lifecycle rules are live on the
+bucket; the CP's boot-time apply merges with existing rules rather than
+replacing them, and will self-manage once its token gains lifecycle permission.)
 
 ## Current limits (deliberate — see spec §14)
 
