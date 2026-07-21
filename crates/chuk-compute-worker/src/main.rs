@@ -130,6 +130,13 @@ fn jitter_entropy() -> u64 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Workspace feature unification can leave rustls with both `ring` and
+    // `aws-lc-rs` compiled in (aws-sdk-s3 wants one, reqwest the other);
+    // rustls then refuses to auto-pick a process-level CryptoProvider and
+    // panics at the first TLS handshake. Pin ring before any TLS; Err just
+    // means a provider is already installed, which is equally fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

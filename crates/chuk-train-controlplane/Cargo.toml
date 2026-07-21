@@ -10,6 +10,7 @@ name = "chuk-train-controlplane"
 path = "src/main.rs"
 
 [dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 chuk-compute-wire = { workspace = true }
 chuk-train-proto = { workspace = true }
 aes-gcm = "0.10"

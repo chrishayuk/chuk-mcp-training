@@ -359,12 +359,13 @@ Things we've hit or know are soft, roughly by priority:
   single-use provision join tokens done (2026-07-21). Remaining: periodic API-token
   rotation; retire the legacy static join token once dev flows use minted tokens;
   optional Cloudflare Access as an outer layer; scope upload grants tighter.
-- **Local debug worker rustls panic** (found 2026-07-21) — a locally-launched debug
-  `chuk-compute-worker` panics at startup ("Could not automatically determine the
-  process-level CryptoProvider"): rustls feature unification (ring vs aws-lc-rs) in the
-  workspace debug build. Distributed/CI binaries are unaffected, but `demo.sh`'s mock
-  workers won't boot until it's pinned (install a default provider at worker startup, or
-  unify the feature).
+- ~~**Local debug worker rustls panic**~~ ✅ **fixed (2026-07-21).** Workspace feature
+  unification left rustls 0.23 with both providers compiled in (aws-sdk-s3 wants
+  aws-lc-rs, reqwest wants ring), so any workspace-built binary panicked at its first
+  TLS handshake ("could not determine the process-level CryptoProvider"). Both binaries
+  now pin ring explicitly at startup (`install_default`, before any TLS); single-package
+  CI builds are unaffected either way. Proven: the full local mock loop runs again —
+  provision → worker boots → joins with its bound `cj_` token → fleet connected.
 - **Observability** — structured request logging, a `/metrics` endpoint, orphan/gate
   alerting beyond log lines.
 - **Tests** — integration tests for the agent↔CP protocol and the lease state machine;
