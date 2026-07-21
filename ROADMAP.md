@@ -146,11 +146,13 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
 - **M3 · packing** — atomic vs resumable job classes, learned p90 estimates per
   (entrypoint, config, gpu-class), the `est × safety_factor` fit rule, resumable slices
   as filler, `submit_batch` packing preview, utilization metric. Gate E3: ≥85% util.
-- **M4 · budgets + watchdogs** (dashboard shipped) — per-provider/label caps checked on
-  provision/extend, watchdog gates (`isnan(loss)`, `no_improve`, `grad_norm` blowups)
-  that checkpoint-then-stop. Gate E4.
-- **M5 · science** — sweeps (`submit_sweep`, cross-seed variance), panel gates evaluated
-  from streamed metrics, lazarus `load_checkpoint` + tokenizer-hash verification (the
+- ~~**M4 · budgets + watchdogs**~~ ✅ **code done (2026-07-20)** — caps enforced on
+  provision/extend (abort-and-destroy on post-price breach), the watchdog trio
+  checkpoint-then-stops via the cancel path, `confirm_cost` pre-flight. Remaining: the
+  **E4 proving run** on real hardware, dashboard cards, label-scope caps.
+- **M5 · science** — ~~sweeps~~ ✅ done 2026-07-20 (`submit_sweep` fan-out + concurrency +
+  cross-seed aggregation). Remaining: panel gates evaluated from streamed metrics (needs
+  the `eval` job kind), lazarus `load_checkpoint` + tokenizer-hash verification (the
   archive tier's stable checkpoint URLs are the handle it consumes), the first
   training-dynamics curve, Lambda driver. Gate E5.
 

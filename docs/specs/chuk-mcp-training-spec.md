@@ -1,10 +1,24 @@
-# chuk-mcp-training — Specification v0.7
+# chuk-mcp-training — Specification v0.8
 
 **MCP-controlled remote training harness for Colab and rented single GPUs**
 Control plane + a compute-generic worker (`chuk-compute-worker`) in **Rust** (axum · tokio ·
 sqlx) · MCP tool surface in **Python** on `chuk-mcp-server` (thin client over the control
 plane's REST API) · Workers: Google Colab, Vast.ai, Lambda Cloud
 
+v0.8 changes: **cost governance (§8) is built** — budget caps (`global` / `provider:<name>`
+per `month`/`all` period) enforced on provision/extend, and a `confirm_cost` pre-flight on
+submissions (sweeps refuse with the multiplied total). **Watchdog gates (§6) are built** —
+a closed expression grammar (`isnan(last(k))`, `no_improve(k, Nmin)`, `last(k) <op> v`)
+evaluated on metric ingest; `stop_run` gates stop through the existing cancel path.
+**Sweeps (§5.2) are built** — `submit_sweep` fans a template over `seed`/`overrides.*`
+axes with per-sweep scheduler concurrency; `sweep_status` aggregates cross-child
+mean/std/range at matched steps. The MCP surface gains **two transports** (§6): stdio, and
+a hosted zero-credential HTTP proxy (`chuk-train-mcp.fly.dev/mcp`) forwarding each
+caller's own bearer per request. **Single-use join tokens (§12)**: provisioning and the
+Colab cell mint `cj_` tokens bound to one worker id — first use consumes them; a consumed
+token only readmits its own bound id. `list_runs` filters (state / `experiment_ref` /
+`sweep_id`) + offset paging. The artifact-registry tools are **delegated to
+chuk-experiments-server** (§6 amendment); `whoami` + `worker_telemetry` added.
 v0.7 changes: the control plane is **stateless on Neon** (serverless Postgres) via the
 `Store` seam (SQLite kept for local dev + tests). The **archive tier (§11.5) is complete** —
 completed runs auto-tier their final checkpoint + logs + metrics to Drive, R2 lifecycle
@@ -33,7 +47,7 @@ scheduler; cost governance and dashboard; lazarus reduced to the artifact contra
 
 ---
 
-## 0. Implementation status (v0.7, 2026-07-19)
+## 0. Implementation status (v0.8, 2026-07-21)
 
 | Milestone | State | Gate | Proven |
 |-----------|-------|------|--------|
@@ -41,8 +55,8 @@ scheduler; cost governance and dashboard; lazarus reduced to the artifact contra
 | **M1** train: code units, metrics, lineage checkpoints, resume | ✅ done | E1 | ✅ **on real Colab T4** — v11 (115M) trains on CUDA, metrics stream, ~460 MB checkpoints to R2 with full lineage, **resume test passed** (bounced the cell mid-run → resumed from the R2 checkpoint → completed; `slices [[0,80],[80,390]]`) |
 | **M2** leases + provable cleanup | ✅ done | E2 | **locally via a mock provider** (launches real agent processes: drain, T-0 verified destroy with the agent hung, reconcile/orphan-kill, ledger); **live Vast E2 not yet run** (costs $) |
 | **M3** packing scheduler | ⬜ not started | E3 | — |
-| **M4** budgets + dashboard | 🟡 partial | E4 | ledger + `spend_status` (in M2) and the **one-page dashboard done** (Fleet · Runs · Money · Health, served by the CP), gated behind **Google sign-in** (email allowlist, HMAC session cookie); **budget caps + watchdog gates not done** |
-| **M5** sweeps + panel gates + lazarus `load_checkpoint` + dynamics curve | ⬜ not started | E5 | — |
+| **M4** budgets + watchdogs + dashboard | ✅ code done (2026-07-20) | E4 | dashboard live; budget caps enforced on provision/extend (pre-flight + exact-price abort-and-destroy), watchdog gates trip on real metric ingest (unit + hub tests); **E4 proving run pending** |
+| **M5** sweeps + panel gates + lazarus `load_checkpoint` + dynamics curve | 🟡 sweeps done (2026-07-20) | E5 | sweep fan-out / concurrency / aggregation hub-tested; panel gates need the `eval` job kind; lazarus + dynamics curve pending |
 
 Deployed: control plane on Fly (`chuk-mcp-training.fly.dev`), **stateless on Neon**
 (serverless Postgres), artifacts on R2, dashboard gated behind Google sign-in. The
@@ -51,15 +65,20 @@ Colab run's final checkpoint + logs + metrics tiered to Drive, promoted to `ckpt
 R2, and streamed back through the retrieval resolver. **RBAC** (§12) is live: users +
 roles (sysadmin › admin › write › read) in a team, with **self-service** scoped MCP API
 keys (any signed-in user mints their own ≤ their role; admins manage the team) from the
-dashboard's Access screen. The **chuk-experiments-server reporting mirror** (§11.6) is built
-and verified end-to-end — optional and gated (off unless configured), it mirrors run
-lifecycle + checkpoints (as artifacts) + final metrics (as results). Providers: `mock`
-(tested), `vast` (skeleton, untested against the live API). Not yet built: the packing
-scheduler (M3), budget caps + watchdog gates (M4), sweeps + lazarus integration + Lambda
-driver (M5). (The R2 lifecycle rules that expire the hot copies need an Admin R/W R2 token,
-or a manual dashboard config.)
+dashboard's Access screen, and **single-use `cj_` join tokens** minted per provision /
+Colab cell (the shared static join token survives only for local dev). The MCP surface is
+hosted at **`chuk-train-mcp.fly.dev/mcp`** (its own Fly app, CI-deployed) as a
+zero-credential per-caller bearer proxy, alongside local stdio. The
+**chuk-experiments-server reporting mirror** (§11.6) is built and verified end-to-end —
+optional and gated (off unless configured), it mirrors run lifecycle + checkpoints (as
+artifacts) + final metrics (as results). Providers: `mock` (tested), `vast` (skeleton,
+untested against the live API). Not yet built: the packing scheduler + `submit_batch`
+(M3), the `eval` job kind / panel gates, lazarus integration, dynamics curve, Lambda
+driver (M5); budgets/gates/sweeps have no dashboard cards yet (MCP/REST only). (The R2
+lifecycle rules that expire the hot copies need an Admin R/W R2 token, or a manual
+dashboard config.)
 
-**Substrate (chuk-compute M1–M3 done):** the worker + wire protocol are now the
+**Substrate (chuk-compute M1–M4 done):** the worker + wire protocol are now the
 compute-generic **chuk-compute** crates (`chuk-compute-wire` + `chuk-compute-worker`; see §7 and
 `chuk-compute-spec.md`). M1 — the worker is a domain-free job executor; the control plane
 translates a run into a generic job and interprets results back into checkpoints (parity proven,
@@ -67,8 +86,10 @@ incl. E1 resume). M2 — per-target worker distribution (`/agent/{triple}` + `.s
 `/agent/version` + `/install.sh`; CI target matrix). M3 (persistent worker class) — long-lived
 `cw_` tokens bound to a stable id + **survive-disconnect** (a persistent worker keeps its job
 running across a dropped socket / CP restart and replays on reconnect; no lease ⇒ never torn
-down; and a version-mismatched persistent worker **self-updates** in place). All proven. (The
-control plane crate is `chuk-train-controlplane`.)
+down; and a version-mismatched persistent worker **self-updates** in place). M4 — the `sys/*`
+host-telemetry sampler streams GPU/CPU/memory out-of-band; the CP keeps a pruned per-worker
+window (`worker_telemetry` + dashboard gauges). All proven. (The control plane crate is
+`chuk-train-controlplane`.)
 
 ---
 

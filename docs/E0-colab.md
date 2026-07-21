@@ -52,9 +52,18 @@ Read the two secret values back for the next steps:
 
 ## 2 · Join a Colab T4
 
+The easy path: call the **`colab_cell`** MCP tool — the control plane returns a
+ready-to-paste cell with its own URL and a **single-use `cj_` join token**
+(spec §12) already filled in, bound to a fresh worker id. Paste it into one
+cell of a T4 notebook (Runtime → Change runtime type → **T4 GPU**) and run it.
+
+Manual fallback (`bootstrap/colab_cell.py`):
+
 1. New Colab notebook → Runtime → Change runtime type → **T4 GPU**.
 2. Paste `bootstrap/colab_cell.py` into one cell.
-3. Fill in `CP_URL = "https://<app>.fly.dev"` and `JOIN_TOKEN = "<join token>"`.
+3. Fill in `CP_URL = "https://<app>.fly.dev"` and `JOIN_TOKEN = "<join token>"`
+   (the shared `CHUK_TRAIN_JOIN_TOKEN` — dev fallback; `colab_cell`'s minted
+   single-use token is preferred).
 4. Run the cell. It downloads the worker and dials home; **leave it running**.
 
 Within a second the worker appears in `fleet`.

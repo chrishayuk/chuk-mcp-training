@@ -1,17 +1,19 @@
 # chuk-mcp-training
 
 MCP-controlled remote training harness for Colab and rented single GPUs.
-Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.7) · status + plan: `ROADMAP.md`.
+Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.8) · status + plan: `ROADMAP.md`.
 
-Milestones **M0–M2** are built; the control plane is deployed on Fly
+Milestones **M0–M2** are built and **M4 (budgets + watchdogs)** and the first
+slice of **M5 (sweeps)** are code-complete; the control plane is deployed on Fly
 (`chuk-mcp-training.fly.dev`), **stateless on Neon** (serverless Postgres), with
-checkpoints in Cloudflare R2 and cold storage on Google Drive. Proven on real
-hardware: **E0** (agent joins a Colab T4, `nvidia-smi` + matmul probe, live logs)
+checkpoints in Cloudflare R2 and cold storage on Google Drive, and the MCP tool
+surface hosted at **`chuk-train-mcp.fly.dev/mcp`**. Proven on real hardware:
+**E0** (agent joins a Colab T4, `nvidia-smi` + matmul probe, live logs)
 and **E1** (a 115M-param model trains on the T4, metrics stream, lineage-complete
 checkpoints upload directly to R2, and the resume test passes — bounce the Colab
 cell mid-run and it resumes from the R2 checkpoint). **M2** (leases, drain,
 provider-verified destroy, reconcile / orphan-kill, ledger) is verified locally
-via a mock provider; live Vast E2 pending.
+via a mock provider; live Vast E2 and the E4 budget/watchdog proving run pending.
 
 Beyond the milestones, the harness now has a **full Google-authed operator
 dashboard** — a tabbed per-run view (a light **Overview** that drills into
@@ -30,8 +32,23 @@ configured, run lifecycle + checkpoints-as-artifacts + final-metrics-as-results
 mirror into the experiments registry through a durable, retrying outbox — a
 transient failure is retried, never silently dropped — with each run attributed
 to whichever user's own linked chuk-experiments-server key submitted it, falling
-back to the shared server-wide key otherwise). Next M-work: M4 budget caps +
-watchdogs, then M3 packing. See `ROADMAP.md`.
+back to the shared server-wide key otherwise).
+
+**Cost governance + watchdogs (spec §8, M4):** **budget caps** (`global` or
+`provider:<name>`, per calendar-month or all-time) are enforced on
+`provision`/`extend_lease` — projected spend (realised ledger + committed live
+leases + the candidate) over any cap refuses, and a post-price breach destroys
+the fresh instance rather than keep it billing; a **`confirm_cost` pre-flight**
+refuses expensive submissions with the estimate shown (sweeps show the
+*multiplied* total); and **watchdog gates** — `isnan(last(loss))`,
+`no_improve(loss, 120min)`, `last(grad_norm) > 1e3` — evaluate on metric ingest
+and can checkpoint-then-stop a run. **Sweeps (spec §5.2, M5):** `submit_sweep`
+fans one template over `seed`/`overrides.*` axes into child runs the scheduler
+holds to a per-sweep concurrency; `sweep_status` reports cross-child
+mean/std/range at matched steps. **Join security (spec §12):** provisioning and
+the Colab cell mint **single-use `cj_` join tokens** bound to one worker id —
+consumed on first join, only ever readmitting their own identity afterwards.
+Next M-work: the E2/E4 proving runs, then M3 packing. See `ROADMAP.md`.
 
 **Runs standalone.** Every external tier is gated and optional — no R2 (falls
 back to `file:`), no Drive (archive tier off), no Google auth (API-token box),
@@ -66,8 +83,13 @@ The substrate will grow to run evals, benchmarks, cells, agents, and RL loops
 
 **Stack:** Rust control plane + Rust worker (`chuk-compute-worker`); the MCP tool
 surface is Python on `chuk-mcp-server`, a thin client over the control plane's
-REST API. House rules: async native, no magic strings, no magic numbers, pydantic
-native on the Python side, clean/decoupled modules, ≥90% test coverage per file.
+REST API, served two ways from one tool registration: **stdio** (local,
+single-user, token from the env) and **hosted HTTP** (`chuk-train-mcp.fly.dev/mcp`,
+its own scale-to-zero Fly app) — a **zero-credential proxy** that forwards each
+caller's own bearer per request, so the control plane enforces RBAC per caller
+and the proxy holds no key. House rules: async native, no magic strings, no
+magic numbers, pydantic native on the Python side, clean/decoupled modules,
+≥90% test coverage per file.
 The worker↔control-plane protocol lives in `chuk-compute-wire` (generic, serde-
 only); training domain types + constants live in `chuk-train-proto` (Rust,
 control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
@@ -101,11 +123,18 @@ control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
   reconnects with backoff. Domain-free: the training-ness (code units, resume,
   checkpoint lineage) is expressed by the control plane in the job it sends.
   Builds to a static musl binary workers download.
-- `mcp/` — `chuk-train-mcp` Python package: `fleet`, `submit_shell`, `list_runs`,
-  `run_status`, `tail_logs`, `run_events`, `build_code_unit`, `submit_run`,
-  `run_metrics`, `list_checkpoints`, `pin_checkpoint`, `artifact_url`,
-  `provider_offers`, `provision`, `spend_status`, `colab_cell`, and the archive
-  tools `archive_run`, `archive_runs`, `archive_status`.
+- `mcp/` — `chuk-train-mcp` Python package: 34 tools across identity (`whoami`),
+  fleet (`fleet`, `worker_telemetry`), runs (`submit_shell`, `build_code_unit`,
+  `submit_run`, `submit_run_from_experiment`, `list_runs`, `run_status`,
+  `stop_run`, `resume_run`, `tail_logs`, `run_events`, `run_metrics`), sweeps
+  (`submit_sweep`, `sweep_status`), gates (`register_gate`, `check_gates`),
+  checkpoints (`list_checkpoints`, `pin_checkpoint`, `artifact_url`), leases
+  (`provider_offers`, `provision`, `lease_status`, `extend_lease`, `teardown`,
+  `colab_cell`), cost (`spend_status`, `set_budget`, `list_budgets`,
+  `delete_budget`), and archive (`archive_run`, `archive_runs`,
+  `archive_status`). Every list result carries `count` + a self-describing
+  message when empty. Runs as stdio (`chuk-train-mcp`) or HTTP
+  (`chuk-train-mcp --http`, the hosted per-caller bearer proxy).
 - `examples/stub-trainer/` — a contract-honouring stub trainer code unit (the E1
   fixture + demo trainer): reads `$CHUK_CONFIG`, emits rich metrics
   (loss/lr/grad_norm/tokens_per_s/tflops) + logs, writes checkpoints, resumes.
@@ -113,11 +142,13 @@ control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
   stub-trainer so the dashboard fills with live data (isolated from prod).
 - `scripts/authorize-drive.py` — one-time `drive.file` offline auth → refresh token.
 - `bootstrap/colab_cell.py` — the one Colab cell that joins a T4 as a worker (E0).
-- `deploy/` — Dockerfile + fly.toml (`auto_stop_machines = "off"`); stateless on
-  Neon (the store URL is a Fly secret; the `/data` volume is legacy). Deploys are
-  **CI/CD** — a push to `main` that passes clippy + tests (incl. the Postgres
-  adapter against a CI `postgres` service) + the worker target-matrix auto-deploys
-  to Fly (`.github/workflows/ci.yml`).
+- `deploy/` — Dockerfile + fly.toml for the control plane (`auto_stop_machines =
+  "off"`); stateless on Neon (the store URL is a Fly secret; the `/data` volume is
+  legacy). `deploy/mcp/` — the hosted MCP endpoint's image + fly.toml
+  (`chuk-train-mcp.fly.dev`, scale-to-zero, zero secrets — pure bearer
+  passthrough). Deploys are **CI/CD** — a push to `main` that passes clippy +
+  tests (incl. the Postgres adapter against a CI `postgres` service) + the worker
+  target-matrix auto-deploys both apps to Fly (`.github/workflows/ci.yml`).
 
 ## Run locally
 
@@ -131,6 +162,8 @@ cargo run -p chuk-compute-worker -- \
 
 cd mcp && uv sync && CHUK_TRAIN_URL=http://127.0.0.1:8700 \
   uv run chuk-train-mcp                                      # MCP (stdio)
+# or serve MCP over HTTP at /mcp (per-caller bearer passthrough):
+#   uv run chuk-train-mcp --http --port 8710
 ```
 
 Or the one-command demo (mock workers running the stub-trainer, so the dashboard
@@ -214,7 +247,12 @@ provider API — whether or not the agent ever responded**. A reconcile loop
 lists real instances every interval and auto-kills any the registry does not
 own (a hung agent, a dead tunnel, a wedged box). An idle reaper drains and
 destroys a worker sitting idle past its threshold. Every lease and teardown
-writes a cost record; `spend_status` reads the ledger.
+writes a cost record; `spend_status(period)` reads the ledger and shows
+cap/headroom where budgets are set. `set_budget("provider:vast", 50)` caps a
+provider (or `"global"` everything): provision and extend refuse on projected
+breach — and a provision whose *actual* price breaches is destroyed rather than
+kept billing. Each provision mints a **single-use `cj_` join token** bound to
+its worker id, so the bootstrap credential can't enrol anything else.
 
 Local E2 uses the `mock` provider, which launches the agent binary as real
 processes, so provider-verified destroy is genuinely real (the OS process is
@@ -259,7 +297,10 @@ the two rules in the Cloudflare R2 dashboard.)
 
 ## Current limits (deliberate — see spec §14)
 
-No packing or budgets/caps yet; one run in flight per worker; logs/metrics are
-dropped while the control plane is dark. A dropped train run resumes from its
-last uploaded checkpoint; a dropped shell run restarts. M3 adds the packing
-scheduler; M4 adds budget caps + watchdog gates (the dashboard is done).
+No packing scheduler or `submit_batch` yet (M3 — waiting on rented-GPU
+pressure); one run in flight per worker; logs/metrics are dropped while the
+control plane is dark. A dropped train run resumes from its last uploaded
+checkpoint; a dropped shell run restarts. Budgets, gates, and sweeps are
+MCP/REST-only so far (no dashboard cards); label-scope budgets are unenforced
+(leases don't carry labels); and the E2 (live Vast) + E4 (budget/watchdog)
+proving runs are still to be run on real hardware.
