@@ -74,7 +74,7 @@ optional and gated (off unless configured), it mirrors run lifecycle + checkpoin
 artifacts) + final metrics (as results). Providers: `mock` (tested), `vast` (skeleton,
 untested against the live API). Not yet built: the packing scheduler + `submit_batch`
 (M3), the `eval` job kind / panel gates, lazarus integration, dynamics curve, Lambda
-driver (M5); budgets/gates/sweeps have no dashboard cards yet (MCP/REST only). (The R2
+driver (M5). (The R2
 lifecycle rules that expire the hot copies need an Admin R/W R2 token, or a manual
 dashboard config.)
 

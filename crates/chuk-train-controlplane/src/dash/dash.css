@@ -154,3 +154,10 @@ td .name{font-weight:600} .empty{color:var(--muted);padding:.9rem;font-size:.86r
 .keyreveal{margin:.7rem .9rem;padding:.7rem .9rem;background:#0a1a0f;border:1px solid rgba(34,180,90,.4);border-radius:8px}
 .keyreveal .k{font-family:var(--mono);font-size:.82rem;color:var(--good);word-break:break-all;user-select:all}
 .keyreveal .warn{color:var(--warning);font-size:.76rem;margin-top:.35rem}
+
+/* sweeps + money + gates (M4/M5 surfaces) */
+.chip.sweep{color:#d9c7f2;border-color:rgba(147,102,229,.45);text-decoration:none}
+.chip.sweep:hover{border-color:rgba(147,102,229,.8)}
+.capline{padding:.5rem .9rem;font-size:.8rem;color:var(--ink2);border-bottom:1px solid var(--grid)}
+.chartcard .capline{border-bottom:none;border-top:1px solid var(--grid);color:var(--muted)}
+.keyinput{background:var(--surface2);border:1px solid var(--ring);color:var(--ink);border-radius:7px;padding:.2rem .45rem;font-family:var(--mono);font-size:.76rem;width:96px}

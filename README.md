@@ -301,7 +301,6 @@ replacing them, and will self-manage once its token gains lifecycle permission.)
 No packing scheduler or `submit_batch` yet (M3 — waiting on rented-GPU
 pressure); one run in flight per worker; logs/metrics are dropped while the
 control plane is dark. A dropped train run resumes from its last uploaded
-checkpoint; a dropped shell run restarts. Budgets, gates, and sweeps are
-MCP/REST-only so far (no dashboard cards); label-scope budgets are unenforced
+checkpoint; a dropped shell run restarts. Label-scope budgets are unenforced
 (leases don't carry labels); and the E2 (live Vast) + E4 (budget/watchdog)
 proving runs are still to be run on real hardware.

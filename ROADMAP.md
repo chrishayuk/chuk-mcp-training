@@ -155,8 +155,10 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   as filler, `submit_batch` packing preview, utilization metric. Gate E3: ≥85% util.
 - ~~**M4 · budgets + watchdogs**~~ ✅ **code done (2026-07-20)** — caps enforced on
   provision/extend (abort-and-destroy on post-price breach), the watchdog trio
-  checkpoint-then-stops via the cancel path, `confirm_cost` pre-flight. Remaining: the
-  **E4 proving run** on real hardware, dashboard cards, label-scope caps.
+  checkpoint-then-stops via the cancel path, `confirm_cost` pre-flight; dashboard cards
+  done 2026-07-22 (Money/Budgets on the overview, Gates on the run view, a sweep view
+  with the cross-child band chart). Remaining: the **E4 proving run** on real hardware,
+  label-scope caps.
 - **M5 · science** — ~~sweeps~~ ✅ done 2026-07-20 (`submit_sweep` fan-out + concurrency +
   cross-seed aggregation). Remaining: panel gates evaluated from streamed metrics (needs
   the `eval` job kind), lazarus `load_checkpoint` + tokenizer-hash verification (the

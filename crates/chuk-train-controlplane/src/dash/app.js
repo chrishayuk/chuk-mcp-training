@@ -29,10 +29,11 @@ const pill=(c,l)=>`<span class="st ${c}">${esc(l)}</span>`;
 let timers=[];
 // viewSeq guards against async renders landing after the user has navigated
 // away (clicking a run from the fleet then another from the runs list, etc.).
-let viewSeq=0, fleetAll=false, runFilter="all", runLimit=30;
+let viewSeq=0, fleetAll=false, runFilter="all", runLimit=30, spendPeriod="month";
 window.setFleetAll=v=>{fleetAll=v;loadOverview();};
 window.setRunFilter=s=>{runFilter=s;loadOverview();};
 window.moreRuns=()=>{runLimit+=30;loadOverview();};
+window.setSpendPeriod=p=>{spendPeriod=p;loadOverview();};
 let me={role:"read",subject:""}, pendingReveal=null;
 const ROLES=["read","write","admin","sysadmin"];
 const isAdmin=()=>me.role==="admin"||me.role==="sysadmin";
@@ -48,8 +49,9 @@ function setClock(ok){const el=$("#clock");if(el)el.textContent=ok?("live · "+n
 /* ---------------- overview ---------------- */
 async function loadOverview(){
   const seq=viewSeq;
-  let fleet,runs,spend;
-  try{[fleet,runs,spend]=await Promise.all([api("/api/fleet"),api("/api/runs?limit="+runLimit),api("/api/spend")]);}
+  let fleet,runs,spend,budgets;
+  try{[fleet,runs,spend,budgets]=await Promise.all([api("/api/fleet"),api("/api/runs?limit="+runLimit),
+    api("/api/spend?period="+spendPeriod),api("/api/budgets").catch(()=>[])]);}
   catch(e){setClock(false);return;}
   if(seq!==viewSeq)return;
   setClock(true);
@@ -58,8 +60,9 @@ async function loadOverview(){
   const queued=runs.filter(r=>r.state==="queued").length;
   const leases=fleet.filter(w=>w.lease&&w.lease.state!=="destroyed").length;
   const tiles=[["v",conn,"Connected <b>workers</b>"],["v",running,"Running <b>runs</b>"],["v",queued,"Queued <b>runs</b>"],
-    ["v",leases,"Active <b>leases</b>"],["s","$"+fmt(spend.total_spent||0,4),"Spent <b>· ledger</b>"],
+    ["v",leases,"Active <b>leases</b>"],["s","$"+fmt(spend.total_spent||0,4),"Spent <b>· "+esc(spend.period||spendPeriod)+"</b>"],
     ["s","$"+fmt(spend.total_committed||0,4),"Committed <b>· leases</b>"]];
+  if(spend.global_headroom!=null)tiles.push(["s","$"+fmt(spend.global_headroom,2),"Headroom <b>· global cap</b>"]);
   const tilesH=tiles.map(([c,v,l])=>`<div class="tile"><div class="v ${c==='s'?'s':''}">${esc(v)}</div><div class="l">${l}</div></div>`).join("");
   // Fleet: default to active (connected or leased) so stale/disconnected
   // workers don't pile up; "all" reveals them.
@@ -78,8 +81,46 @@ async function loadOverview(){
     <section><p class="eyebrow">Health</p><div class="tiles">${tilesH}</div></section>
     <section><div class="card"><div class="hd"><h3>Fleet</h3><span class="sp"></span>${fleetCtl}<span class="tag">${shownFleet.length}/${fleet.length}</span></div>${fleetH}</div></section>
     <section><div class="card"><div class="hd"><h3>Runs</h3><span class="sp"></span>${runCtl}</div>${runsH}</div></section>
+    ${moneySection(spend,budgets)}
     <div class="foot">chuk-mcp-training · Neon · R2 hot / Drive archive</div>`;
 }
+/* Money: period-scoped spend per provider with cap/headroom where a budget
+   matches, plus budget management (admin sets/deletes; provision + extend
+   refuse on projected breach — spec §8). */
+function moneySection(spend,budgets){
+  const ctl=`<div class="filters">${["month","all"].map(p=>`<button aria-pressed="${spendPeriod===p}" onclick="setSpendPeriod('${p}')">${p}</button>`).join("")}</div>`;
+  const lines=spend.lines||[];
+  const sRows=lines.map(l=>{
+    const h=l.headroom;
+    const hcls=h==null?"mut":h<0?"bad":(l.cap&&h<l.cap*0.2)?"warn":"good";
+    return `<tr><td>${esc(l.provider)}</td><td class="num">$${fmt(l.spent,4)}</td><td class="num">$${fmt(l.committed,4)}</td>
+      <td class="num">${l.cap!=null?"$"+fmt(l.cap,2):"—"}</td>
+      <td>${h!=null?pill(hcls,"$"+fmt(h,2)):'<span class="empty" style="padding:0">—</span>'}</td></tr>`;
+  }).join("");
+  const spendT=`<div class="tblwrap"><table><thead><tr><th>provider</th><th>spent</th><th>committed</th><th>cap</th><th>headroom</th></tr></thead><tbody>${sRows||'<tr><td class="empty" colspan="5">no spend recorded yet</td></tr>'}</tbody></table></div>`;
+  const globalLine=spend.global_cap!=null
+    ?`<div class="capline">global cap <b>$${fmt(spend.global_cap,2)}</b> · headroom ${pill(spend.global_headroom<0?"bad":"good","$"+fmt(spend.global_headroom,2))} · ${esc(spend.period)}</div>`:"";
+  const bRows=(budgets||[]).map(b=>`<tr><td class="mono">${esc(b.scope)}</td><td class="num">$${fmt(b.cap,2)}</td><td>${esc(b.period)}</td>
+    <td>${isAdmin()?`<span class="rvk" onclick="rmBudget('${esc(b.scope)}')">delete</span>`:""}</td></tr>`).join("");
+  const bTable=`<div class="tblwrap"><table><thead><tr><th>scope</th><th>cap</th><th>period</th><th></th></tr></thead><tbody>${bRows||'<tr><td class="empty" colspan="4">no budgets — spending is uncapped</td></tr>'}</tbody></table></div>`;
+  const bForm=isAdmin()
+    ?`<div class="form"><input id="bScope" type="text" placeholder="global or provider:vast" list="bScopes"><datalist id="bScopes"><option value="global"><option value="provider:vast"><option value="provider:mock"><option value="provider:colab"></datalist>
+       <input id="bCap" type="number" min="0" step="0.01" placeholder="cap $" style="width:90px"><select id="bPeriod"><option>month</option><option>all</option></select><button onclick="setBudget()">set budget</button></div>`
+    :"";
+  return `<section><div class="grid2">
+    <div class="card"><div class="hd"><h3>Money</h3><span class="sp"></span>${ctl}</div>${globalLine}${spendT}</div>
+    <div class="card"><div class="hd"><h3>Budgets</h3><span class="sp"></span><span class="tag">provision / extend refuse on breach</span></div>${bTable}${bForm}</div>
+  </div></section>`;
+}
+window.setBudget=async()=>{
+  const scope=($("#bScope").value||"").trim(),cap=parseFloat($("#bCap").value),period=$("#bPeriod").value;
+  if(!scope||Number.isNaN(cap))return;
+  try{await api("/api/budgets",{method:"POST",body:JSON.stringify({scope,cap,period})});loadOverview();}
+  catch(e){alert("set budget failed: "+e.message);}};
+window.rmBudget=async scope=>{
+  if(!confirm(`Delete the ${scope} budget? Spending it capped becomes uncapped.`))return;
+  try{await api("/api/budgets?scope="+encodeURIComponent(scope),{method:"DELETE"});loadOverview();}
+  catch(e){alert("delete failed: "+e.message);}};
 function fleetRow(w){
   const cls=w.state==="connected"?"good":"bad";
   const gpu=(w.hardware&&w.hardware.gpu)||"cpu";
@@ -98,7 +139,8 @@ function fleetRow(w){
 }
 function runRow(r){
   const cls=RUN_ST[r.state]||"mut";
-  return `<tr class="click" onclick="location.hash='#/run/'+encodeURIComponent('${esc(r.id)}')"><td class="mono">${esc(r.id)}</td><td class="name">${esc(r.name)}</td><td>${esc(r.kind)}</td><td>${pill(cls,r.state)}</td><td class="mono">${esc(r.worker_id||"—")}</td><td class="num">${ago(nows()-r.updated_at)} ago</td></tr>`;
+  const sweep=r.sweep_id?` <a class="chip sweep" href="#/sweep/${encodeURIComponent(r.sweep_id)}" onclick="event.stopPropagation()" title="${esc(r.sweep_id)}">sweep</a>`:"";
+  return `<tr class="click" onclick="location.hash='#/run/'+encodeURIComponent('${esc(r.id)}')"><td class="mono">${esc(r.id)}</td><td class="name">${esc(r.name)}${sweep}</td><td>${esc(r.kind)}</td><td>${pill(cls,r.state)}</td><td class="mono">${esc(r.worker_id||"—")}</td><td class="num">${ago(nows()-r.updated_at)} ago</td></tr>`;
 }
 
 /* ---------------- run detail ---------------- */
@@ -146,6 +188,14 @@ function renderRunShell(run){
     .concat(isTrain?[["training","Training"]]:[])
     .concat([["logs","Logs"],["events","Events"],["system","System"]]);
   const tabbar=`<div class="tabs">${tabs.map(([k,l],i)=>`<button class="tab${i?"":" active"}" data-tab="${k}" onclick="showTab('${k}')">${esc(l)}</button>`).join("")}</div>`;
+  // Gates (spec §6/§8): verdicts refresh with the run poll; registering here
+  // is how a watchdog gets attached mid-run without an MCP round-trip.
+  const gatesCard=`<div class="card"><div class="hd"><h3>Gates</h3><span class="sp"></span><span class="tag" id="gcount"></span></div>
+      <div id="gates"><div class="empty">—</div></div>
+      <div class="form"><input id="gName" type="text" placeholder="name (e.g. nan-watch)" style="width:130px">
+        <input id="gExpr" type="text" placeholder="isnan(last(loss)) · no_improve(loss, 120min) · last(grad_norm) > 1e3" style="flex:1;min-width:220px">
+        <select id="gAction"><option value="record">record</option><option value="stop_run">stop run</option></select>
+        <button onclick="addGate('${esc(run.id)}')">register</button></div></div>`;
   const pOverview=`<div class="tabpanel active" data-panel="overview">
       <div class="telem" id="telem"></div>
       <div class="grid2">
@@ -158,6 +208,7 @@ function renderRunShell(run){
           <div class="card"><div class="hd"><h3>Recent logs</h3><span class="sp"></span>${drill("logs","full")}</div><div class="logs logs-mini" id="logsMini"><div class="empty">—</div></div></div>
         </div>
       </div>
+      ${gatesCard}
     </div>`;
   const pTraining=isTrain?`<div class="tabpanel" data-panel="training">
       <div class="grid2"><div class="stack">
@@ -197,13 +248,14 @@ function configBody(run){
 }
 async function refreshRun(id,first){
   const seq=viewSeq;
-  let run,metrics,logs,cks,events;
-  try{[run,metrics,logs,cks,events]=await Promise.all([
+  let run,metrics,logs,cks,events,gates;
+  try{[run,metrics,logs,cks,events,gates]=await Promise.all([
     api("/api/runs/"+encodeURIComponent(id)),
     api("/api/runs/"+encodeURIComponent(id)+"/metrics?keys="+METRICS.join(",")+"&downsample=400").catch(()=>({series:{}})),
     api("/api/runs/"+encodeURIComponent(id)+"/logs?lines=400").catch(()=>({lines:[]})),
     api("/api/runs/"+encodeURIComponent(id)+"/checkpoints").catch(()=>[]),
     api("/api/runs/"+encodeURIComponent(id)+"/events").catch(()=>[]),
+    api("/api/runs/"+encodeURIComponent(id)+"/gates").catch(()=>[]),
   ]);}catch(e){setClock(false);return;}
   if(seq!==viewSeq)return;
   setClock(true);
@@ -216,6 +268,7 @@ async function refreshRun(id,first){
   renderCks(cks,id);
   renderEvents(events);
   renderEvents(events,"#eventsMini",6);
+  renderGates(gates);
   const ls=$("#logstat");if(ls){ls.className="st "+(run.state==="running"?"run":"mut");ls.textContent=run.state==="running"?"streaming":run.state;}
   const rw=$("#rs-worker");if(rw)rw.textContent=run.worker_id?"· "+run.worker_id:"";
   // Live host telemetry (GPU/CPU/mem) for the worker running this run: detailed
@@ -367,7 +420,31 @@ window.dl=async (rid,step,file)=>{
     URL.revokeObjectURL(url);
   }catch(e){alert("download failed: "+e.message);}
 };
-const EV_CLS={running:"run",completed:"good",failed:"bad",cancelled:"bad",checkpoint:"ck"};
+/* Gates: verdict table + registration. Typing in the form survives the poll
+   because renderGates only rewrites the verdict box, never the form. */
+function renderGates(gates){
+  const box=$("#gates");if(!box)return;
+  const gc=$("#gcount");if(gc)gc.textContent=gates.length?gates.length+" registered":"";
+  if(!gates.length){box.innerHTML=`<div class="empty">no gates — register a watchdog below (action "stop run" checkpoints, then stops, on trip)</div>`;return;}
+  const rows=gates.map(g=>{
+    const v=g.tripped==null?pill("mut","not evaluated"):g.tripped?pill("bad","TRIPPED"):pill("good","ok");
+    const act=g.action==="stop_run"?`<span class="chip hot" title="trip ⇒ stop the run">watchdog</span>`:`<span class="chip">record</span>`;
+    return `<tr title="${esc(g.detail||"")}"><td>${esc(g.name)}</td><td class="mono">${esc(g.expr)}</td><td>${act}</td><td>${v}</td>
+      <td class="num">${g.last_value!=null?fmt(g.last_value,4):"—"}</td>
+      <td class="num">${g.evaluated_at?ago(nows()-g.evaluated_at)+" ago":"—"}</td></tr>`;
+  }).join("");
+  box.innerHTML=`<div class="tblwrap"><table><thead><tr><th>name</th><th>expression</th><th>action</th><th>verdict</th><th>last value</th><th>evaluated</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+window.addGate=async id=>{
+  const name=($("#gName").value||"").trim(),expr=($("#gExpr").value||"").trim(),action=$("#gAction").value;
+  if(!name||!expr)return;
+  try{
+    await api("/api/runs/"+encodeURIComponent(id)+"/gates",{method:"POST",body:JSON.stringify({name,expr,action})});
+    $("#gName").value="";$("#gExpr").value="";
+    refreshRun(id,false);
+  }catch(e){alert("register failed: "+e.message);}};
+
+const EV_CLS={running:"run",completed:"good",failed:"bad",cancelled:"bad",checkpoint:"ck",gate_evaluated:"bad"};
 function renderEvents(events,sel="#events",limit=0){
   const box=$(sel);if(!box)return;
   if(!events||!events.length){box.innerHTML=`<div class="empty" style="padding:.4rem 0">no events</div>`;return;}
@@ -378,6 +455,7 @@ function renderEvents(events,sel="#events",limit=0){
     if(d.worker)lbl+=` · <b>${esc(d.worker)}</b>`;
     if(d.step!=null)lbl+=` · step <b>${esc(d.step)}</b>`;
     if(d.exit_code!=null)lbl+=` · exit ${esc(d.exit_code)}`;
+    if(d.gate)lbl+=` · <b>${esc(d.gate)}</b>${d.action==="stop_run"?" (watchdog)":""}`;
     return `<div class="ev ${cls}"><span class="mk"></span><span class="lbl">${lbl}</span><span class="ts">${ago(nows()-e.ts)} ago</span></div>`;
   }).join("");
 }
@@ -403,6 +481,66 @@ async function resumeRun(id){
   if(!confirm(`Resume ${id}? Re-queues it; a train run resumes from its latest checkpoint.`))return;
   try{await api("/api/runs/"+encodeURIComponent(id)+"/resume",{method:"POST"});route();}
   catch(e){alert("resume failed: "+e.message);}
+}
+
+/* ---------------- sweep detail ---------------- */
+let sweepKey="loss";
+async function loadSweep(id){
+  // Don't clobber the key box mid-edit on the poll tick.
+  if(document.activeElement&&document.activeElement.id==="skey")return;
+  const seq=viewSeq;
+  let s;
+  try{s=await api("/api/sweeps/"+encodeURIComponent(id)+"?key="+encodeURIComponent(sweepKey));}
+  catch(e){if(seq!==viewSeq)return;$("#app").innerHTML=backBtn()+`<p class="err">could not load sweep: ${esc(e.message)}</p>`;return;}
+  if(seq!==viewSeq)return;
+  setClock(true);
+  const states=s.children.reduce((m,c)=>(m[c.state]=(m[c.state]||0)+1,m),{});
+  const stateSum=Object.entries(states).map(([k,v])=>`${v} ${k}`).join(" · ")||"—";
+  const kids=s.children.map(c=>{
+    const cls=RUN_ST[c.state]||"mut";
+    const asg=Object.entries(c.assignment||{}).map(([k,v])=>`${esc(k)}=${esc(JSON.stringify(v))}`).join(" · ")||"—";
+    return `<tr class="click" onclick="location.hash='#/run/'+encodeURIComponent('${esc(c.run_id)}')"><td class="mono">${esc(c.run_id)}</td><td class="mono">${asg}</td><td>${pill(cls,c.state)}</td></tr>`;
+  }).join("");
+  $("#app").innerHTML=`${backBtn()}
+    <div class="runhead" style="margin-top:.9rem"><div style="flex:1;min-width:260px">
+      <div class="runid">${esc(s.sweep_id)}</div>
+      <div class="runsub"><span class="name">${esc(s.name)}</span>
+        <span>· ${s.children.length} children (${esc(stateSum)})</span>
+        <span>· concurrency ${s.concurrency||"∞"}</span></div>
+    </div></div>
+    <div class="grid2">
+      <div class="card chartcard"><div class="hd"><h3>Cross-child · <span class="mono">${esc(s.key)}</span></h3><span class="sp"></span>
+          <input id="skey" class="keyinput" type="text" value="${esc(sweepKey)}" title="metric key" onchange="setSweepKey('${esc(id)}',this.value)"></div>
+        <div class="body"><svg class="chart" id="schart" viewBox="0 0 720 210" preserveAspectRatio="none" role="img" aria-label="cross-child aggregate"></svg></div>
+        <div class="capline">band = min–max across children · line = mean · at matched steps</div></div>
+      <div class="card"><div class="hd"><h3>Children</h3></div>
+        <div class="tblwrap"><table><thead><tr><th>run</th><th>assignment</th><th>state</th></tr></thead><tbody>${kids||'<tr><td class="empty" colspan="3">no children</td></tr>'}</tbody></table></div></div>
+    </div>`;
+  drawSweepChart(s.aggregate||[]);
+  window.scrollTo(0,0);
+}
+window.setSweepKey=(id,k)=>{sweepKey=(k||"loss").trim()||"loss";loadSweep(id);};
+function drawSweepChart(agg){
+  const svg=$("#schart");if(!svg)return;
+  if(agg.length<2){svg.innerHTML=`<text x="360" y="105" text-anchor="middle" class="axis">not enough matched steps yet</text>`;return;}
+  const W=720,H=210,pl=48,pr=14,pt=12,pb=22;
+  const xs=agg.map(p=>p.step);
+  let lo=Math.min(...agg.map(p=>p.min)),hi=Math.max(...agg.map(p=>p.max));
+  const pad=(hi-lo)*0.12||Math.abs(hi)*0.1||1;lo-=pad;hi+=pad;
+  const x0=Math.min(...xs),x1=Math.max(...xs);
+  const sx=s=>pl+(x1===x0?0:(s-x0)/(x1-x0))*(W-pl-pr);
+  const sy=v=>pt+(1-(v-lo)/(hi-lo))*(H-pt-pb);
+  const mean=agg.map(p=>`${sx(p.step).toFixed(1)},${sy(p.mean).toFixed(1)}`).join(" ");
+  const band=agg.map(p=>`${sx(p.step).toFixed(1)},${sy(p.max).toFixed(1)}`).join(" ")
+    +" "+agg.slice().reverse().map(p=>`${sx(p.step).toFixed(1)},${sy(p.min).toFixed(1)}`).join(" ");
+  let grid="",lab="";
+  for(let g=0;g<=3;g++){const v=lo+(hi-lo)*g/3,y=sy(v);
+    grid+=`<line x1="${pl}" y1="${y.toFixed(1)}" x2="${W-pr}" y2="${y.toFixed(1)}" stroke="var(--grid)"/>`;
+    lab+=`<text x="${pl-6}" y="${(y+3).toFixed(1)}" text-anchor="end" class="axis">${v.toFixed(2)}</text>`;}
+  const last=agg[agg.length-1];
+  svg.innerHTML=`${grid}<polygon points="${band}" fill="var(--accent)" opacity=".14"/>
+    <polyline points="${mean}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    ${lab}<text x="${W-pr}" y="${(sy(last.mean)-8).toFixed(1)}" text-anchor="end" class="axis" style="fill:var(--ink);font-size:11px">${last.mean.toFixed(3)} ± ${last.std.toFixed(3)} (n=${last.n})</text>`;
 }
 
 /* ---------------- access (users + api keys) ---------------- */
@@ -459,7 +597,9 @@ window.clearExpKey=async()=>{if(!confirm("Clear your linked chuk-experiments-ser
 function route(){
   clearTimers(); viewSeq++;
   const m=location.hash.match(/#\/run\/(.+)/);
+  const sm=location.hash.match(/#\/sweep\/(.+)/);
   if(m){const id=decodeURIComponent(m[1]);loadRun(id);timers.push(setInterval(()=>refreshRun(id,false),RUN_MS));}
+  else if(sm){const id=decodeURIComponent(sm[1]);loadSweep(id);timers.push(setInterval(()=>loadSweep(id),OVERVIEW_MS));}
   else if(location.hash==="#/access"){loadAccess();}
   else{loadOverview();timers.push(setInterval(loadOverview,OVERVIEW_MS));}
 }
