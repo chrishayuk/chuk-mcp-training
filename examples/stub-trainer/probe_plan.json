@@ -1,0 +1,9 @@
+{
+  "version": 3,
+  "model": { "d_model": 16, "n_layers": 3 },
+  "pulse": {
+    "every_steps": 1,
+    "metrics": ["act_norm", "grad_norm", "dead_frac", "logit_entropy"],
+    "layers": "all"
+  }
+}

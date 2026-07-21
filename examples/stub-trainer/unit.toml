@@ -3,7 +3,7 @@ version = "0.1.0"
 python = "3.11"
 
 [entrypoints]
-train = "python3 train.py"
+train = "sh run.sh"
 
 [requires]
 min_vram_gb = 0

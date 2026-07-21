@@ -4,6 +4,7 @@
 
 pub mod constants;
 pub mod domain;
+pub mod introspect;
 pub mod keys;
 pub mod lease;
 pub mod manifest;

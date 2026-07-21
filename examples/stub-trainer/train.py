@@ -9,6 +9,14 @@ $CHUK_METRICS (loss, lr, grad_norm, tokens_per_s, tflops), writes checkpoints
 resumes from $CHUK_RESUME_CKPT when set.
 
 Adopting the contract in a real trainer is these ~5 touch-points, nothing more.
+
+I0 addition (chuk-introspect spec §15 EI0): when torch + chuk_introspect are
+importable and $CHUK_PROBE_PLAN is set (run.sh sets it — CP delivery is I1),
+each step also trains a tiny real torch model inside `Introspector.pulse`, so
+real `introspect/*` pulse metrics stream beside the synthetic telemetry. With
+`poison_dead_relu` in the config the model's ReLU is born dead — the watchdog
+gate `last(introspect/dead_frac/L1) > 0.5` fires. Without torch the stub runs
+exactly as before.
 """
 
 from __future__ import annotations
@@ -17,8 +25,12 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
+
+# Vendored deps (chuk_introspect is copied in at unit-build time — see README).
+sys.path.insert(0, str(Path(__file__).parent / "vendor"))
 
 # A fixed fingerprint the harness carries into checkpoint lineage; lazarus would
 # verify it against the local tokenizer at load time (spec §10).
@@ -73,6 +85,46 @@ def telemetry(step: int, total: int, rng: random.Random) -> dict:
     }
 
 
+def build_pulse(config: dict):
+    """Optional real-model pulse rig: (introspector, model, step_fn) or None.
+
+    Degrades gracefully — no torch, no chuk_introspect, or no probe plan all
+    mean the stub behaves exactly as it did before I0.
+    """
+    try:
+        import torch
+        from torch import nn
+
+        from chuk_introspect import Introspector
+    except ImportError as err:
+        print(f"[stub-trainer] introspection off ({err})", flush=True)
+        return None
+
+    intr = Introspector.from_env()
+    if not intr.enabled:
+        print("[stub-trainer] introspection off (no $CHUK_PROBE_PLAN)", flush=True)
+        return None
+
+    torch.manual_seed(int(os.environ.get("CHUK_SEED", "0") or 0))
+    # Shape must match probe_plan.json's model block: 3 modules -> L0..L2.
+    model = nn.Sequential(nn.Linear(16, 32), nn.ReLU(), nn.Linear(32, 16))
+    if config.get("poison_dead_relu"):
+        with torch.no_grad():
+            model[0].weight.zero_()
+            model[0].bias.fill_(-1.0)  # every pre-activation negative -> dead ReLU
+        print("[stub-trainer] POISONED: ReLU born dead (EI0 gate proof)", flush=True)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-2)
+
+    def step_fn() -> None:
+        out = model(torch.randn(8, 16))
+        out.pow(2).mean().backward()
+        opt.step()
+        opt.zero_grad()
+
+    print("[stub-trainer] introspection ON (pulse tier)", flush=True)
+    return intr, model, step_fn
+
+
 def write_checkpoint(ckpt_dir: Path, step: int, arch: str) -> None:
     step_dir = ckpt_dir / f"step_{step}"
     step_dir.mkdir(parents=True, exist_ok=True)
@@ -106,8 +158,14 @@ def main() -> None:
     print(f"[stub-trainer] device=cuda:0 · {arch} · seq256 · bs64 · seed={seed}", flush=True)
     print(f"[stub-trainer] resume_step={start} · total_steps={total_steps} · ckpt_every={checkpoint_every}", flush=True)
 
+    pulse_rig = build_pulse(config)
+
     with metrics.open("a") as m:
         for step in range(start + 1, total_steps + 1):
+            if pulse_rig is not None:
+                intr, model, step_fn = pulse_rig
+                with intr.pulse(model, step):
+                    step_fn()
             t = telemetry(step, total_steps, rng)
             m.write(json.dumps(t) + "\n")
             m.flush()

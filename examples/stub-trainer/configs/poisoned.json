@@ -1,0 +1,7 @@
+{
+  "total_steps": 40,
+  "checkpoint_every": 10,
+  "step_delay_s": 0.4,
+  "arch": "stub-net-v0",
+  "poison_dead_relu": true
+}

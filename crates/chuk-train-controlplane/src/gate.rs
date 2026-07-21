@@ -255,6 +255,15 @@ mod tests {
             parse("last(val/acc) <= 0.5").unwrap(),
             GateExpr::Threshold { key: "val/acc".into(), op: CmpOp::Le, value: 0.5 }
         );
+        // introspect/* keys (chuk-introspect spec §6) parse with zero grammar changes.
+        assert_eq!(
+            parse("last(introspect/dead_frac/L12) > 0.5").unwrap(),
+            GateExpr::Threshold {
+                key: "introspect/dead_frac/L12".into(),
+                op: CmpOp::Gt,
+                value: 0.5
+            }
+        );
         for bad in [
             "loss > 3",                    // bare key: not a form
             "last(loss) == 3",             // unsupported operator

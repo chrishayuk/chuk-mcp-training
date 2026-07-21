@@ -185,7 +185,7 @@ function renderRunShell(run){
   // with a per-metric graph (GPU/VRAM/temp/power/CPU/RAM). Every panel renders so
   // the refresh loop keeps filling them; showTab just toggles which is visible.
   const tabs=[["overview","Overview"]]
-    .concat(isTrain?[["training","Training"]]:[])
+    .concat(isTrain?[["training","Training"],["introspect","Introspection"]]:[])
     .concat([["logs","Logs"],["events","Events"],["system","System"]]);
   const tabbar=`<div class="tabs">${tabs.map(([k,l],i)=>`<button class="tab${i?"":" active"}" data-tab="${k}" onclick="showTab('${k}')">${esc(l)}</button>`).join("")}</div>`;
   // Gates (spec §6/§8): verdicts refresh with the run poll; registering here
@@ -227,7 +227,14 @@ function renderRunShell(run){
       <div class="card"><div class="hd"><h3>System · host telemetry</h3><span class="sp"></span><span class="tag" id="sysage"></span></div>
         <div class="sysgrid" id="sys"><div class="empty">—</div></div></div>
     </div>`;
-  $("#app").innerHTML=head+tabbar+pOverview+pTraining+pLogs+pEvents+pSystem;
+  // Introspection (chuk-introspect spec §11): pulse curves per introspect/*
+  // key, reusing the System tab's card+chart machinery. Layer×step heatmaps
+  // arrive with I2's CP-side reduction; I0 renders per-key line charts.
+  const pIntrospect=isTrain?`<div class="tabpanel" data-panel="introspect">
+      <div class="card"><div class="hd"><h3>Introspection · pulse metrics</h3><span class="sp"></span><span class="tag" id="incount"></span></div>
+        <div class="sysgrid" id="introspect"><div class="empty">—</div></div></div>
+    </div>`:"";
+  $("#app").innerHTML=head+tabbar+pOverview+pTraining+pIntrospect+pLogs+pEvents+pSystem;
   window.scrollTo(0,0);
 }
 window.showTab=function(name){
@@ -249,9 +256,13 @@ function configBody(run){
 async function refreshRun(id,first){
   const seq=viewSeq;
   let run,metrics,logs,cks,events,gates;
-  try{[run,metrics,logs,cks,events,gates]=await Promise.all([
+  let intro;
+  try{[run,metrics,intro,logs,cks,events,gates]=await Promise.all([
     api("/api/runs/"+encodeURIComponent(id)),
     api("/api/runs/"+encodeURIComponent(id)+"/metrics?keys="+METRICS.join(",")+"&downsample=400").catch(()=>({series:{}})),
+    // No keys filter: introspect/* keys are per-layer and unknown up front;
+    // the endpoint returns every key and we filter by prefix client-side.
+    api("/api/runs/"+encodeURIComponent(id)+"/metrics?downsample=200").catch(()=>({series:{}})),
     api("/api/runs/"+encodeURIComponent(id)+"/logs?lines=400").catch(()=>({lines:[]})),
     api("/api/runs/"+encodeURIComponent(id)+"/checkpoints").catch(()=>[]),
     api("/api/runs/"+encodeURIComponent(id)+"/events").catch(()=>[]),
@@ -269,6 +280,7 @@ async function refreshRun(id,first){
   renderEvents(events);
   renderEvents(events,"#eventsMini",6);
   renderGates(gates);
+  renderIntrospect(intro&&intro.series||{});
   const ls=$("#logstat");if(ls){ls.className="st "+(run.state==="running"?"run":"mut");ls.textContent=run.state==="running"?"streaming":run.state;}
   const rw=$("#rs-worker");if(rw)rw.textContent=run.worker_id?"· "+run.worker_id:"";
   // Live host telemetry (GPU/CPU/mem) for the worker running this run: detailed
@@ -315,6 +327,21 @@ function renderSys(t){
   }).join("");
   el.innerHTML=cards||`<div class="empty">no telemetry yet</div>`;
   if(age)age.textContent=t.sampled_at?ago(nows()-t.sampled_at)+" ago":"";
+}
+// Introspection tab: one card per introspect/* key (chuk-introspect spec §5.1
+// key grammar: introspect/<family>[/<qualifier>]/L{i}[@<corpus>]). Sorted so a
+// family's layers sit together; latest value in the card header.
+const INTROSPECT_PREFIX="introspect/";
+function introFmt(v){const a=Math.abs(v);return a>=100?v.toFixed(0):a>=1?v.toFixed(2):v.toFixed(4);}
+function renderIntrospect(series){
+  const el=$("#introspect");if(!el)return;
+  const keys=Object.keys(series).filter(k=>k.startsWith(INTROSPECT_PREFIX)&&series[k].length).sort();
+  const count=$("#incount");if(count)count.textContent=keys.length?keys.length+" keys":"";
+  if(!keys.length){el.innerHTML=`<div class="empty">no introspection metrics — runs stream them when the trainer has a ProbePlan (docs/specs/chuk-introspect-spec.md)</div>`;return;}
+  el.innerHTML=keys.map(k=>{
+    const pts=series[k],last=pts[pts.length-1];
+    return `<div class="syscard"><div class="sysch"><span class="syscl">${esc(k.slice(INTROSPECT_PREFIX.length))}</span><span class="syscv">${introFmt(last.value)}</span></div>${sysChart(pts)}</div>`;
+  }).join("");
 }
 // Compact gauges for the Overview summary card.
 function renderSysMini(t){

@@ -1102,6 +1102,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn introspect_namespace_metrics_are_gateable_end_to_end() {
+        // chuk-introspect I0 (spec §5.1/§6): `introspect/*` keys ride the
+        // ordinary append_metrics + gate path with zero new machinery. This is
+        // the CP half of the EI0 proof — the dead-ReLU watchdog.
+        use chuk_train_proto::introspect::{layer_key, FAMILY_DEAD_FRAC};
+
+        let hub = test_hub().await;
+        let run = hub.submit("r", &shell_run(), None, None).await.unwrap();
+        let key = layer_key(FAMILY_DEAD_FRAC, 1);
+        hub.store
+            .register_gate(
+                GATE_SCOPE_RUN,
+                &run.0,
+                "dead-relu",
+                &format!("last({key}) > 0.5"),
+                GateAction::StopRun,
+            )
+            .await
+            .unwrap();
+
+        // Healthy pulse: gate evaluates clean.
+        let healthy = std::collections::BTreeMap::from([(key.clone(), 0.05)]);
+        hub.store.append_metrics(&run, 1, &healthy).await.unwrap();
+        let gates = hub.evaluate_gates(&run).await.unwrap();
+        assert_eq!(gates[0].tripped, Some(false));
+
+        // Poisoned pulse (dead_frac = 1.0): the watchdog stops the run.
+        let poisoned = std::collections::BTreeMap::from([(key.clone(), 1.0)]);
+        hub.store.append_metrics(&run, 2, &poisoned).await.unwrap();
+        let gates = hub.evaluate_gates(&run).await.unwrap();
+        assert_eq!(gates[0].tripped, Some(true));
+        let rec = hub.store.run(&run).await.unwrap().unwrap();
+        assert_eq!(rec.summary.state, RunState::Cancelled);
+
+        // And the series read returns the introspect key like any other.
+        let series = hub
+            .store
+            .metric_series(&run, None, 0, 0)
+            .await
+            .unwrap();
+        assert!(series.series.contains_key(&key));
+    }
+
+    #[tokio::test]
     async fn record_gate_observes_without_stopping() {
         let hub = test_hub().await;
         let run = hub.submit("r", &shell_run(), None, None).await.unwrap();

@@ -1,0 +1,24 @@
+[project]
+name = "chuk-introspect"
+version = "0.1.0"
+description = "On-GPU training introspection for the chuk training harness — pulse hooks now, snapshot capture later (docs/specs/chuk-introspect-spec.md)"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.1",
+    "pydantic>=2.7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chuk_introspect"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
