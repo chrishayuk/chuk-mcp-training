@@ -137,7 +137,14 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
    reconnect-readmitted / legacy-dev-join all behave as designed.
 9. **Live Vast E2** — rent 15 min, hang the agent, prove provider-verified destroy.
 10. **M3 packing** when there's rented-GPU pressure.
-11. **R2 lifecycle permission** (see backlog) so the R2 hot copies actually auto-expire.
+11. ~~**R2 lifecycle permission**~~ ✅ **done (2026-07-21).** The two expiry rules are live
+    on the `chuk-train` bucket (set via wrangler's OAuth session — `ckpt-hot/` 1 day,
+    `ckpt-final/` 30 days — verified on the bucket alongside R2's default
+    multipart-abort rule). The CP's boot-time `apply_lifecycle` now **merges** with the
+    bucket's existing rules instead of replacing the whole config, so when the S3 token
+    is eventually upgraded it converges on the same rules without clobbering foreign
+    ones. The token itself still lacks lifecycle permission (boot logs a warning,
+    harmless); upgrading it stays on the hardening list.
 
 *(E0 and E1 are done — both proven on a real Colab T4, including E1's resume test.)*
 
@@ -343,11 +350,12 @@ unmistakable — the harness reports **observations, never conclusions**.*
 
 Things we've hit or know are soft, roughly by priority:
 
-- **R2 lifecycle permission** — the archive tier applies expiry rules on boot, but the
-  current R2 token lacks bucket-lifecycle permission (AccessDenied). Recreate the token
-  with **Admin Read & Write**, or set the rules in the Cloudflare dashboard (`ckpt-hot/`
-  expire 1 day, `ckpt-final/` 30 days). Until then checkpoints archive to Drive fine but
-  the R2 copies don't auto-expire.
+- ~~**R2 lifecycle rules**~~ ✅ set on the bucket (2026-07-21, via wrangler): `ckpt-hot/`
+  expires 1 day, `ckpt-final/` 30 days — hot copies now genuinely auto-expire. Remaining
+  nit: the CP's own S3 token still lacks bucket-lifecycle permission, so the boot-time
+  apply warns AccessDenied (harmless — the rules are already live, and the apply now
+  merges rather than replaces). Recreate the token with **Admin Read & Write** whenever
+  convenient to let the CP self-manage them.
 - **Code-unit build workflow** — `build_code_unit(local path)` only works against a local
   control plane (the deployed one can't see local files and has no git). Today's Colab
   path builds against a local CP pointed at the same R2 + Neon, then submits the sha. Add

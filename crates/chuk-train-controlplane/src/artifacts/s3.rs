@@ -209,7 +209,26 @@ impl ArtifactStore for S3ArtifactStore {
             BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
             LifecycleRuleFilter,
         };
-        let mut built = Vec::with_capacity(rules.len());
+        // PutBucketLifecycleConfiguration replaces the bucket's WHOLE config,
+        // so merge with whatever already exists (R2's default multipart-abort
+        // rule, rules set by hand in the dashboard/wrangler): keep every
+        // foreign rule whose prefix isn't ours, then append ours. No existing
+        // config (or no read permission) merges as empty.
+        let ours: Vec<&str> = rules.iter().map(|(prefix, _)| prefix.as_str()).collect();
+        let mut built: Vec<LifecycleRule> = self
+            .client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map(|existing| existing.rules.unwrap_or_default())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|rule| {
+                let prefix = rule.filter().and_then(|f| f.prefix()).unwrap_or_default();
+                prefix.is_empty() || !ours.contains(&prefix)
+            })
+            .collect();
         for (prefix, days) in rules {
             built.push(
                 LifecycleRule::builder()
