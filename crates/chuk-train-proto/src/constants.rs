@@ -114,6 +114,13 @@ pub const API_KEY_PREFIX: &str = "ck_";
 /// Prefix on generated persistent worker tokens (chuk-compute M3.1), so they're
 /// recognisable and distinct from `ck_` user/MCP keys.
 pub const WORKER_TOKEN_PREFIX: &str = "cw_";
+/// Prefix on single-use provision join tokens (spec §12): minted per
+/// provision / Colab cell, bound to that worker id, consumed on first join.
+pub const JOIN_TOKEN_PREFIX: &str = "cj_";
+/// Boot window for a join token's *first* use — minted at provision, it must
+/// enrol within this window. After first use it only ever readmits its own
+/// bound worker id (reconnects); the lease wall governs lifetime from there.
+pub const JOIN_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// chuk-experiments-server reporting mirror (spec §11.6) — the default
 /// programme/experiment harness runs report into. Optional and gated: the whole

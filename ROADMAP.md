@@ -125,9 +125,16 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
    chuk-experiments-server (its artifact/pin/lineage system is the system of record); the
    harness keeps only `artifact_url` + checkpoint tools and reports artifacts through the
    mirror.
-8. **Single-use, per-provision join tokens** — the spec wants tokens minted per provision and
-   bound to a worker id + lease; today a single static config token lets any holder join as any
-   worker forever. Mint a one-time token in `provision`, bind + expire on first use.
+8. ~~**Single-use, per-provision join tokens**~~ ✅ **done (2026-07-21).** `provision` and
+   `colab_cell` now mint a `cj_` token (hashed at rest) bound to the freshly-chosen worker
+   id — never the shared config token. First use must land inside a 30-min boot window and
+   atomically consumes the token; after that it only ever *readmits its own bound id* on
+   reconnect — it can never enrol a second worker or claim a different identity (the old
+   hole: the static token honoured any `resume` claim, forever). The Colab cell now pins
+   `--worker-id` so reconnects resume the bound identity. The legacy static token remains
+   accepted for local-dev/manual joins only; production paths no longer hand it out.
+   Verified live over the real websocket: enrol / reuse-refused / impersonation-refused /
+   reconnect-readmitted / legacy-dev-join all behave as designed.
 9. **Live Vast E2** — rent 15 min, hang the agent, prove provider-verified destroy.
 10. **M3 packing** when there's rented-GPU pressure.
 11. **R2 lifecycle permission** (see backlog) so the R2 hot copies actually auto-expire.
@@ -348,9 +355,16 @@ Things we've hit or know are soft, roughly by priority:
   the CP), but the fs fallback, code-unit puts, and Drive proxy reads should stream.
 - **Live provider validation** — run the real Vast E2 (rent 15 min, hang the agent, prove
   destroy) and confirm the Vast driver against the live API.
-- **Auth hardening** — RBAC (users/roles/teams + self-service scoped API keys) done.
-  Remaining: periodic join/API token rotation; optional Cloudflare Access as an outer
-  layer; scope upload grants tighter.
+- **Auth hardening** — RBAC (users/roles/teams + self-service scoped API keys) done;
+  single-use provision join tokens done (2026-07-21). Remaining: periodic API-token
+  rotation; retire the legacy static join token once dev flows use minted tokens;
+  optional Cloudflare Access as an outer layer; scope upload grants tighter.
+- **Local debug worker rustls panic** (found 2026-07-21) — a locally-launched debug
+  `chuk-compute-worker` panics at startup ("Could not automatically determine the
+  process-level CryptoProvider"): rustls feature unification (ring vs aws-lc-rs) in the
+  workspace debug build. Distributed/CI binaries are unaffected, but `demo.sh`'s mock
+  workers won't boot until it's pinned (install a default provider at worker startup, or
+  unify the feature).
 - **Observability** — structured request logging, a `/metrics` endpoint, orphan/gate
   alerting beyond log lines.
 - **Tests** — integration tests for the agent↔CP protocol and the lease state machine;

@@ -179,6 +179,14 @@ CREATE TABLE IF NOT EXISTS worker_tokens (
   last_used_at REAL,
   revoked_at   REAL
 );
+CREATE TABLE IF NOT EXISTS join_tokens (
+  id           TEXT PRIMARY KEY,
+  worker_id    TEXT NOT NULL,
+  token_hash   TEXT NOT NULL,
+  created_at   REAL NOT NULL,
+  expires_at   REAL NOT NULL,
+  used_at      REAL
+);
 CREATE TABLE IF NOT EXISTS counters (
   name         TEXT PRIMARY KEY,
   value        INTEGER NOT NULL
@@ -196,6 +204,7 @@ CREATE TABLE IF NOT EXISTS experiments_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_apikeys_hash ON api_keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_worker_tokens_hash ON worker_tokens (token_hash);
+CREATE INDEX IF NOT EXISTS idx_join_tokens_hash ON join_tokens (token_hash);
 CREATE INDEX IF NOT EXISTS idx_runs_state   ON runs (state, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_run   ON run_events (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_metrics_run  ON metrics (run_id, key, step);
@@ -763,6 +772,31 @@ mod tests {
         );
         store.create_run("r2", &shell_spec(), None, None, None).await.expect("run2");
         assert_eq!(store.runs(&Default::default(), 10).await.expect("runs").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn join_tokens_consume_once_then_readmit_bound_id_only() {
+        let store = mem_store().await;
+        let bound = WorkerId("vast-w1".into());
+        store
+            .create_join_token("jt-1", &bound, "hash1", now() + 60.0)
+            .await
+            .expect("create");
+        // First use consumes it.
+        let (id, first) = store.resolve_join_token("hash1", now()).await.expect("q").expect("some");
+        assert_eq!((id, first), (bound.clone(), true));
+        // Later uses resolve to the bound id, flagged as not-first (the ws
+        // layer only admits those as reconnects of that id).
+        let (id, first) = store.resolve_join_token("hash1", now()).await.expect("q").expect("some");
+        assert_eq!((id, first), (bound.clone(), false));
+        // Unknown hash: nothing.
+        assert!(store.resolve_join_token("nope", now()).await.expect("q").is_none());
+        // An unused token past its boot window can never be consumed.
+        store
+            .create_join_token("jt-2", &bound, "hash2", now() - 1.0)
+            .await
+            .expect("create");
+        assert!(store.resolve_join_token("hash2", now()).await.expect("q").is_none());
     }
 
     #[tokio::test]

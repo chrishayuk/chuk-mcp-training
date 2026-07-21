@@ -93,9 +93,12 @@ impl LeaseManager {
             req.provider,
             &Uuid::new_v4().simple().to_string()[..8]
         ));
+        // Single-use enrolment credential (spec §12): bound to this worker id,
+        // consumed on first join — never the shared config token.
+        let join_token = crate::apikey::mint_join_token(self.hub.store.as_ref(), &worker_id).await?;
         let ctx = ProvisionContext {
             ws_url: self.config.agent_ws_url.clone(),
-            join_token: self.config.join_token.clone(),
+            join_token,
             worker_id: worker_id.0.clone(),
             drain_window_min: self.config.drain_window_min,
         };

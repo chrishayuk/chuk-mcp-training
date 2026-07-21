@@ -121,8 +121,13 @@ pub struct ColabCellParams {
 
 const DEFAULT_COLAB_LABELS: &str = "colab,t4";
 
+/// Worker-id prefix for Colab joins enrolled via a generated cell.
+const COLAB_WORKER_ID_PREFIX: &str = "colab-";
+
 /// Generate a ready-to-paste Colab bootstrap cell (spec §6). The control plane
-/// fills in its own public URL + join token, so there is nothing to hand-edit.
+/// fills in its own public URL + a **single-use join token** (spec §12) bound
+/// to a freshly-minted worker id — never the shared config token — so a
+/// leaked cell can only ever enrol/readmit that one identity.
 pub async fn colab_cell(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ColabCellParams>,
@@ -130,6 +135,14 @@ pub async fn colab_cell(
     let labels = params
         .labels
         .unwrap_or_else(|| DEFAULT_COLAB_LABELS.to_owned());
+    let worker_id = chuk_train_proto::WorkerId(format!(
+        "{COLAB_WORKER_ID_PREFIX}{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let token = match crate::apikey::mint_join_token(state.hub.store.as_ref(), &worker_id).await {
+        Ok(token) => token,
+        Err(error) => return internal(error),
+    };
     // Optional lease flags: passing lease_min makes the worker self-drain at
     // T-drain (belt) matching the control plane's window.
     let lease_flags = match params.lease_min {
@@ -140,21 +153,24 @@ pub async fn colab_cell(
         None => String::new(),
     };
     // Bootstrap through install.sh (uname → target triple → download + verify →
-    // exec), so the cell never hardcodes a per-target agent path.
+    // exec), so the cell never hardcodes a per-target agent path. --worker-id
+    // makes reconnects resume the token's bound identity.
     let cell = format!(
         r#"# chuk-train · Colab worker — paste into ONE cell (Runtime → T4 GPU), then run.
 CP_URL = "{url}"
 JOIN_TOKEN = "{token}"
+WORKER_ID = "{worker}"
 LABELS = "{labels}"
 
 import subprocess
 cmd = ("curl -fsSL " + CP_URL + "/install.sh | sh -s -- "
-       "--cp " + CP_URL + " --token " + JOIN_TOKEN + " --labels " + LABELS + "{lease_flags}")
+       "--cp " + CP_URL + " --token " + JOIN_TOKEN + " --worker-id " + WORKER_ID
+       + " --labels " + LABELS + "{lease_flags}")
 print("[chuk-train] bootstrapping worker via install.sh …")
 subprocess.run(cmd, shell=True, check=False)
 "#,
         url = state.config.public_url,
-        token = state.config.join_token,
+        worker = worker_id.0,
     );
     Json(chuk_train_proto::ColabCell { cell }).into_response()
 }

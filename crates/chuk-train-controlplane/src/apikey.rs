@@ -5,7 +5,9 @@
 //! A bearer token is resolved to an [`AuthContext`] (role + team) by hashing it
 //! and looking the hash up in `api_keys` (or matching the legacy master token).
 
-use chuk_train_proto::{Role, API_KEY_PREFIX, WORKER_TOKEN_PREFIX};
+use chuk_train_proto::{
+    Role, WorkerId, API_KEY_PREFIX, JOIN_TOKEN_PREFIX, JOIN_TOKEN_TTL, WORKER_TOKEN_PREFIX,
+};
 use sha2::{Digest, Sha256};
 
 /// Generate a token of `<prefix><random>`, returning
@@ -33,6 +35,36 @@ pub fn generate() -> (String, String, String) {
 /// `(plaintext, display_prefix, sha256_hex_hash)`.
 pub fn generate_worker_token() -> (String, String, String) {
     generate_with_prefix(WORKER_TOKEN_PREFIX)
+}
+
+/// Generate a new single-use provision join token (spec §12):
+/// `(plaintext, display_prefix, sha256_hex_hash)`.
+pub fn generate_join_token() -> (String, String, String) {
+    generate_with_prefix(JOIN_TOKEN_PREFIX)
+}
+
+/// Mint + persist a join token bound to `worker_id`, returning the plaintext
+/// (handed to the provider bootstrap / Colab cell, never stored). The stored
+/// hash expires for *first* use after [`JOIN_TOKEN_TTL`]; once consumed it
+/// only ever readmits its own bound worker id.
+pub async fn mint_join_token(
+    store: &dyn crate::store::Store,
+    worker_id: &WorkerId,
+) -> anyhow::Result<String> {
+    let (plaintext, _display_prefix, hash) = generate_join_token();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs_f64();
+    store
+        .create_join_token(
+            &uuid::Uuid::new_v4().simple().to_string(),
+            worker_id,
+            &hash,
+            now + JOIN_TOKEN_TTL.as_secs_f64(),
+        )
+        .await?;
+    Ok(plaintext)
 }
 
 /// `AuthContext.owner_email`'s value for the shared legacy master token — it

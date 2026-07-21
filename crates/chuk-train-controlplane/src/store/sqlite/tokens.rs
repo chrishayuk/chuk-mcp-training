@@ -68,4 +68,54 @@ impl WorkerTokenStore for SqliteStore {
             .await?;
         Ok(())
     }
+
+    async fn create_join_token(
+        &self,
+        id: &str,
+        worker_id: &WorkerId,
+        token_hash: &str,
+        expires_at: UnixSeconds,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO join_tokens (id, worker_id, token_hash, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(id)
+        .bind(&worker_id.0)
+        .bind(token_hash)
+        .bind(now())
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn resolve_join_token(
+        &self,
+        token_hash: &str,
+        at: UnixSeconds,
+    ) -> Result<Option<(WorkerId, bool)>> {
+        // First use: atomically consume an unused, unexpired token.
+        let consumed = sqlx::query(
+            "UPDATE join_tokens SET used_at = ?2
+             WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2
+             RETURNING worker_id",
+        )
+        .bind(token_hash)
+        .bind(at)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = consumed {
+            return Ok(Some((WorkerId(row.get("worker_id")), true)));
+        }
+        // Already consumed: a reconnect candidate for its bound id only. An
+        // unused-but-expired token has used_at NULL and lands on None here.
+        let row = sqlx::query(
+            "SELECT worker_id FROM join_tokens WHERE token_hash = ?1 AND used_at IS NOT NULL",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (WorkerId(r.get("worker_id")), false)))
+    }
 }

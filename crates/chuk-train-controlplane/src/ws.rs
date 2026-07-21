@@ -154,14 +154,28 @@ async fn version_reject(
 }
 
 /// Resolve a `Hello` token to `(worker id, class)`, or `None` for a bad token.
-/// The shared join token enrols a fresh **leased** worker; a **persistent**
-/// worker token (spec §5, M3) resolves to its bound, stable id — so the machine
-/// keeps the same identity across reconnects and restarts.
+/// A single-use `cj_` provision join token (spec §12) enrols exactly the
+/// **leased** worker it was minted for; a **persistent** worker token (spec §5,
+/// M3) resolves to its bound, stable id; the legacy shared join token stays
+/// accepted for local dev / manual joins — production provisioning no longer
+/// hands it out.
 async fn resolve_join(
     state: &AppState,
     token: &str,
     resume: Option<wire::Resume>,
 ) -> Option<(WorkerId, wire::WorkerClass)> {
+    if token.starts_with(chuk_train_proto::JOIN_TOKEN_PREFIX) {
+        // Never fall through to the other token kinds: a cj_ token is either
+        // valid for its bound identity or rejected.
+        let resolved = state
+            .hub
+            .store
+            .resolve_join_token(&apikey::hash_token(token), now())
+            .await
+            .ok()
+            .flatten();
+        return admit_join_token(resolved, resume.as_ref());
+    }
     if token == state.config.join_token {
         // The wire and control-plane WorkerId are distinct types; convert across.
         let worker_id = resume
@@ -179,6 +193,25 @@ async fn resolve_join(
         return Some((info.worker_id, wire::WorkerClass::Persistent));
     }
     None
+}
+
+/// The single-use admission rule, pure for testability: first use enrols the
+/// token's bound identity (whatever the Hello claims); a consumed token
+/// readmits ONLY a reconnect of that same bound id — it can never enrol a
+/// second worker or claim a different identity.
+fn admit_join_token(
+    resolved: Option<(WorkerId, bool)>,
+    resume: Option<&wire::Resume>,
+) -> Option<(WorkerId, wire::WorkerClass)> {
+    match resolved {
+        Some((worker_id, true)) => Some((worker_id, wire::WorkerClass::Leased)),
+        Some((worker_id, false))
+            if resume.is_some_and(|r| r.worker_id.0 == worker_id.0) =>
+        {
+            Some((worker_id, wire::WorkerClass::Leased))
+        }
+        _ => None,
+    }
 }
 
 fn now() -> f64 {
@@ -258,6 +291,36 @@ fn short_id() -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn join_token_admission_is_single_identity() {
+        let bound = WorkerId("vast-abc123".into());
+        let resume_bound = wire::Resume {
+            worker_id: wire::WorkerId::from(bound.0.clone()),
+            running_jobs: Vec::new(),
+            high_water: 0,
+        };
+        let resume_other = wire::Resume {
+            worker_id: wire::WorkerId::from("vast-other"),
+            running_jobs: Vec::new(),
+            high_water: 0,
+        };
+        // First use enrols the bound identity.
+        assert_eq!(
+            admit_join_token(Some((bound.clone(), true)), None),
+            Some((bound.clone(), wire::WorkerClass::Leased))
+        );
+        // A consumed token readmits only its own bound id (reconnect)...
+        assert_eq!(
+            admit_join_token(Some((bound.clone(), false)), Some(&resume_bound)),
+            Some((bound.clone(), wire::WorkerClass::Leased))
+        );
+        // ...never a different claimed identity, and never a fresh enrol.
+        assert_eq!(admit_join_token(Some((bound.clone(), false)), Some(&resume_other)), None);
+        assert_eq!(admit_join_token(Some((bound, false)), None), None);
+        // Unknown/expired token: rejected outright.
+        assert_eq!(admit_join_token(None, Some(&resume_bound)), None);
+    }
 
     fn caps(accelerator: wire::Accelerator, labels: BTreeMap<String, String>) -> wire::Capabilities {
         wire::Capabilities {

@@ -433,6 +433,27 @@ pub trait WorkerTokenStore: Send + Sync {
     async fn revoke_worker_token(&self, id: &str) -> Result<bool>;
 
     async fn touch_worker_token(&self, id: &str, at: UnixSeconds) -> Result<()>;
+
+    /// Mint a single-use provision join token (spec §12), bound to the
+    /// provisioned worker id, hashed at rest, expiring for first use.
+    async fn create_join_token(
+        &self,
+        id: &str,
+        worker_id: &WorkerId,
+        token_hash: &str,
+        expires_at: UnixSeconds,
+    ) -> Result<()>;
+
+    /// Resolve a presented join token. An unused, unexpired token is
+    /// atomically consumed → `(bound_worker_id, first_use = true)`. An
+    /// already-consumed token → `(bound_worker_id, false)`; the ws layer
+    /// admits that only as a reconnect of the same bound id. Unknown, or
+    /// unused-but-expired → `None`.
+    async fn resolve_join_token(
+        &self,
+        token_hash: &str,
+        at: UnixSeconds,
+    ) -> Result<Option<(WorkerId, bool)>>;
 }
 
 /// The full store surface — the union of every domain trait.

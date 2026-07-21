@@ -199,6 +199,14 @@ CREATE TABLE IF NOT EXISTS worker_tokens (
   last_used_at double precision,
   revoked_at   double precision
 );
+CREATE TABLE IF NOT EXISTS join_tokens (
+  id           text PRIMARY KEY,
+  worker_id    text NOT NULL,
+  token_hash   text NOT NULL,
+  created_at   double precision NOT NULL,
+  expires_at   double precision NOT NULL,
+  used_at      double precision
+);
 CREATE TABLE IF NOT EXISTS experiments_outbox (
   id               bigserial PRIMARY KEY,
   run_id           text NOT NULL,
@@ -212,6 +220,7 @@ CREATE TABLE IF NOT EXISTS experiments_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_apikeys_hash ON api_keys (key_hash);
 CREATE INDEX IF NOT EXISTS idx_worker_tokens_hash ON worker_tokens (token_hash);
+CREATE INDEX IF NOT EXISTS idx_join_tokens_hash ON join_tokens (token_hash);
 CREATE INDEX IF NOT EXISTS idx_runs_state   ON runs (state, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_run   ON run_events (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_metrics_run  ON metrics (run_id, key, step);
@@ -431,6 +440,7 @@ mod pg_live {
             "DELETE FROM workers WHERE id LIKE 'pgtest-%'",
             "DELETE FROM leases  WHERE worker_id LIKE 'pgtest-%'",
             "DELETE FROM ledger  WHERE worker_id LIKE 'pgtest-%'",
+            "DELETE FROM join_tokens WHERE worker_id LIKE 'pgtest-%'",
         ] {
             let _ = sqlx::query(stmt).execute(&purge).await;
         }
@@ -555,6 +565,25 @@ mod pg_live {
         let gates = store.gates("run", &run_id.0).await.expect("gates");
         assert_eq!(gates[0].tripped, None, "re-register clears the verdict");
         assert!(!store.metric_history(&run_id, "loss").await.expect("history").is_empty());
+
+        // join tokens: atomic consume-once, then readmit-bound-id-only
+        let jt_hash = format!("pgtest-jt-{}", wid.0);
+        store
+            .create_join_token(&format!("jt-{}", wid.0), &wid, &jt_hash, now() + 60.0)
+            .await
+            .expect("create_join_token");
+        let (jid, first) = store
+            .resolve_join_token(&jt_hash, now())
+            .await
+            .expect("resolve_join_token")
+            .expect("some");
+        assert_eq!((jid, first), (wid.clone(), true));
+        let (jid, first) = store
+            .resolve_join_token(&jt_hash, now())
+            .await
+            .expect("resolve_join_token")
+            .expect("some");
+        assert_eq!((jid, first), (wid.clone(), false));
 
         // budgets: upsert-by-scope, list, delete
         let scope = format!("provider:pgtest-{}", wid.0);
