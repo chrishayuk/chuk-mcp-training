@@ -73,7 +73,15 @@ impl HttpClient {
     /// Upload a blob into the grant's run tree (a checkpoint file).
     pub async fn upload(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         let plan = self.blob_url(BlobMethod::Put, key).await?;
-        let mut req = self.http.put(&plan.url).body(bytes);
+        // Explicit Content-Length: for an EMPTY body hyper omits the header,
+        // and S3/R2 answer a presigned PUT without it with 411 Length
+        // Required — first seen live on a checkpoint's zero-byte `.ready`
+        // marker. Harmless for non-empty bodies (same value hyper would set).
+        let mut req = self
+            .http
+            .put(&plan.url)
+            .header(reqwest::header::CONTENT_LENGTH, bytes.len())
+            .body(bytes);
         if plan.requires_grant_header {
             req = req.header(reqwest::header::AUTHORIZATION, self.bearer());
         }
