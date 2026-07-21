@@ -161,3 +161,5 @@ td .name{font-weight:600} .empty{color:var(--muted);padding:.9rem;font-size:.86r
 .capline{padding:.5rem .9rem;font-size:.8rem;color:var(--ink2);border-bottom:1px solid var(--grid)}
 .chartcard .capline{border-bottom:none;border-top:1px solid var(--grid);color:var(--muted)}
 .keyinput{background:var(--surface2);border:1px solid var(--ring);color:var(--ink);border-radius:7px;padding:.2rem .45rem;font-family:var(--mono);font-size:.76rem;width:96px}
+.cellpre{margin:0;padding:.8rem .9rem;font-family:var(--mono);font-size:.76rem;line-height:1.5;color:var(--ink2);overflow-x:auto;user-select:all;white-space:pre}
+.form label.mut{color:var(--muted);font-size:.76rem}

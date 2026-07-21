@@ -570,6 +570,65 @@ function drawSweepChart(agg){
     ${lab}<text x="${W-pr}" y="${(sy(last.mean)-8).toFixed(1)}" text-anchor="end" class="axis" style="fill:var(--ink);font-size:11px">${last.mean.toFixed(3)} ± ${last.std.toFixed(3)} (n=${last.n})</text>`;
 }
 
+/* ---------------- join a worker (Colab cell) ---------------- */
+// Mint-a-cell screen: the CP fills its URL + a single-use cj_ join token bound
+// to a fresh worker id (spec §12); we then watch the fleet until that id dials
+// home. The credential lives only in this page + the pasted notebook.
+let joinState={cell:null,worker:null,timer:null};
+function loadJoin(){
+  if(joinState.timer){clearInterval(joinState.timer);joinState.timer=null;}
+  joinState={cell:null,worker:null,timer:null};
+  $("#app").innerHTML=`${backBtn()}
+    <div class="runhead" style="margin-top:.9rem"><div style="flex:1">
+      <div class="runid">Join a worker</div>
+      <div class="runsub">Generate a paste-ready Colab cell. The cell carries a <b>single-use</b> join
+        token bound to one fresh worker id — first use consumes it; afterwards it only ever
+        readmits that same worker. 30-minute boot window.</div></div></div>
+    <div class="card"><div class="hd"><h3>Colab bootstrap cell</h3><span class="sp"></span><span id="joinStatus"></span></div>
+      <div class="form" style="border-top:none;border-bottom:1px solid var(--grid)">
+        <label class="mut">lease&nbsp;min</label><input id="jLease" type="number" min="1" placeholder="none (persistent tab)" style="width:150px">
+        <label class="mut">labels</label><input id="jLabels" type="text" value="colab,t4" style="width:120px">
+        <button onclick="mintCell()">generate cell</button>
+        <button id="jCopy" class="hidden" onclick="copyCell()">copy</button></div>
+      <div id="cellBox"><div class="empty">Runtime → Change runtime type → T4 GPU, then paste the generated cell and run it.</div></div></div>`;
+  window.scrollTo(0,0);
+}
+window.mintCell=async()=>{
+  const lease=($("#jLease").value||"").trim(),labels=($("#jLabels").value||"colab,t4").trim();
+  let q="?labels="+encodeURIComponent(labels);
+  if(lease)q+="&lease_min="+encodeURIComponent(lease);
+  try{
+    const r=await api("/api/colab_cell"+q);
+    joinState.cell=r.cell;
+    const m=r.cell.match(/WORKER_ID = "([^"]+)"/);
+    joinState.worker=m?m[1]:null;
+    $("#cellBox").innerHTML=`<pre class="cellpre" id="cellPre">${esc(r.cell)}</pre>`;
+    $("#jCopy").classList.remove("hidden");
+    watchJoin();
+  }catch(e){alert("mint failed: "+e.message);}
+};
+window.copyCell=()=>{navigator.clipboard.writeText(joinState.cell||"").then(()=>{const b=$("#jCopy");b.textContent="copied ✓";setTimeout(()=>b.textContent="copy",1500);});};
+function watchJoin(){
+  const st=$("#joinStatus");
+  const wid=joinState.worker;
+  if(!wid){if(st)st.textContent="";return;}
+  if(joinState.timer)clearInterval(joinState.timer);
+  const seq=viewSeq;
+  const tick=async()=>{
+    if(seq!==viewSeq){clearInterval(joinState.timer);return;}
+    let fleet=[];try{fleet=await api("/api/fleet");}catch(e){return;}
+    const w=fleet.find(x=>x.id===wid);
+    const el=$("#joinStatus");if(!el)return;
+    if(w&&w.state==="connected"){
+      el.innerHTML=`${pill("good","connected")} <a href="#/" style="margin-left:.4rem">→ fleet</a>`;
+      clearInterval(joinState.timer);joinState.timer=null;
+    }else{
+      el.innerHTML=pill("mut",`waiting for ${wid}…`);
+    }
+  };
+  tick();joinState.timer=setInterval(tick,5000);timers.push(joinState.timer);
+}
+
 /* ---------------- access (users + api keys) ---------------- */
 async function loadAccess(){
   const seq=viewSeq, admin=isAdmin();
@@ -627,6 +686,7 @@ function route(){
   const sm=location.hash.match(/#\/sweep\/(.+)/);
   if(m){const id=decodeURIComponent(m[1]);loadRun(id);timers.push(setInterval(()=>refreshRun(id,false),RUN_MS));}
   else if(sm){const id=decodeURIComponent(sm[1]);loadSweep(id);timers.push(setInterval(()=>loadSweep(id),OVERVIEW_MS));}
+  else if(location.hash==="#/join"){loadJoin();}
   else if(location.hash==="#/access"){loadAccess();}
   else{loadOverview();timers.push(setInterval(loadOverview,OVERVIEW_MS));}
 }
