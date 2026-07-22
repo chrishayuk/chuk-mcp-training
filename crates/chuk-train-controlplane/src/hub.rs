@@ -778,7 +778,20 @@ impl Hub {
                         }),
                     )
                     .await?;
-                if info.action == GateAction::StopRun {
+            }
+            // The event fires only on a verdict flip, but a stop must CONVERGE,
+            // not fire once: a run resurrected after a lost kill report (a
+            // flapped link replaying JobStarted — observed on Colab during EI0)
+            // would otherwise outlive its verdict forever, because the latch
+            // never flips again. Re-stop on every evaluation while tripped; the
+            // state check keeps it quiet once the run is actually terminal.
+            if verdict.tripped && info.action == GateAction::StopRun {
+                let live = self
+                    .store
+                    .run(run_id)
+                    .await?
+                    .is_some_and(|run| !run.summary.state.is_terminal());
+                if live {
                     warn!(run = %run_id.0, gate = %info.name, detail = %verdict.detail,
                           "watchdog tripped; stopping run");
                     if let Err(error) = self.stop_run(run_id).await {
@@ -1094,8 +1107,39 @@ mod tests {
         let rec = hub.store.run(&run).await.unwrap().unwrap();
         assert_eq!(rec.summary.state, RunState::Cancelled);
 
-        // Re-evaluating while still tripped neither re-stops nor re-events.
+        // Re-evaluating while still tripped re-events nothing (the flip fired
+        // once) and leaves the terminal run untouched.
         hub.evaluate_gates(&run).await.unwrap();
+        let events = hub.store.events(&run).await.unwrap();
+        let flips = events.iter().filter(|e| e.event == EventKind::GateEvaluated).count();
+        assert_eq!(flips, 1);
+    }
+
+    #[tokio::test]
+    async fn tripped_stop_gate_converges_on_a_resurrected_run() {
+        // EI0's Colab lesson: a lost JobKilled + replayed JobStarted can bring
+        // a watchdog-stopped run back to life. The stop must re-fire on the
+        // next evaluation while the verdict holds — without a second flip event.
+        let hub = test_hub().await;
+        let run = hub.submit("r", &shell_run(), None, None).await.unwrap();
+        hub.store
+            .register_gate(GATE_SCOPE_RUN, &run.0, "grad-blowup", "last(grad_norm) > 1e3", GateAction::StopRun)
+            .await
+            .unwrap();
+        let blowup = std::collections::BTreeMap::from([("grad_norm".to_owned(), 5e3)]);
+        hub.store.append_metrics(&run, 1, &blowup).await.unwrap();
+        hub.evaluate_gates(&run).await.unwrap();
+        assert_eq!(hub.store.run(&run).await.unwrap().unwrap().summary.state, RunState::Cancelled);
+
+        // Resurrect (stands in for the replayed-JobStarted zombie).
+        hub.resume_run(&run).await.unwrap();
+        assert_eq!(hub.store.run(&run).await.unwrap().unwrap().summary.state, RunState::Queued);
+
+        // Still-tripped verdict re-stops the resurrected run...
+        let gates = hub.evaluate_gates(&run).await.unwrap();
+        assert_eq!(gates[0].tripped, Some(true));
+        assert_eq!(hub.store.run(&run).await.unwrap().unwrap().summary.state, RunState::Cancelled);
+        // ...but the flip event stays singular.
         let events = hub.store.events(&run).await.unwrap();
         let flips = events.iter().filter(|e| e.event == EventKind::GateEvaluated).count();
         assert_eq!(flips, 1);

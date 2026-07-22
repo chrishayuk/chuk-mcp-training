@@ -434,6 +434,19 @@ async fn run_session(
                             job_id: killed,
                             reason: KillReason::Cancel,
                         });
+                    } else {
+                        // Cancel with an empty slot: the job already ended here
+                        // but the report may have been lost on a flapped link —
+                        // and the control plane is waiting on it to finalise.
+                        // Re-report so a retried cancel always converges; the
+                        // control plane's transition is idempotent on a run
+                        // that is already terminal.
+                        info!(job = %job_id, "cancel for empty slot; re-reporting killed");
+                        let _ = job_tx.send(WorkerToCp::JobKilled {
+                            seq: seq.next(),
+                            job_id,
+                            reason: KillReason::Cancel,
+                        });
                     }
                 }
                 Some(CpToWorker::Drain { deadline }) => {
