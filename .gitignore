@@ -13,3 +13,5 @@
 .env.*
 !.env.example
 .wrangler/
+# vendored at code-unit build time (stub-trainer README)
+examples/stub-trainer/vendor/

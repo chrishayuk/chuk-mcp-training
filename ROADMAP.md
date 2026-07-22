@@ -40,8 +40,11 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   dashboard **Access** screen, admins manage the whole team; per-endpoint role
   enforcement. `read`/`write`/`admin` mirror chuk-experiments-server; `sysadmin` is the
   extra platform tier the legacy master token resolves to.
-- **chuk-experiments-server reporting mirror** (§11.6) — optional + gated (off unless
-  `CHUK_EXPERIMENTS_URL` + a WRITE key are set): the CP creates the run there (our id as
+- **chuk-experiments-server reporting mirror** (§11.6) — **live in prod since 2026-07-22**
+  (dedicated `harness-mirror` write key via Fly secrets; proven on a real Colab T4:
+  registry run → `submit_run_from_experiment` → trained with introspection → final
+  metrics incl. `introspect/*` as results + checkpoints as artifacts, into the registry
+  run). Optional + gated (off unless `CHUK_EXPERIMENTS_URL` + a WRITE key are set): the CP creates the run there (our id as
   `slug`/`harness_session_id`), PATCHes lifecycle, registers checkpoints as artifacts, and
   submits final metrics as results — every event persists to a durable outbox before the
   first delivery attempt and retries with capped backoff on failure, never silently dropped
@@ -238,12 +241,14 @@ candidate *Requirements-aware assignment* / *generalized bootstrap* items feed i
   config_hash)` so packing's fit rule is real (§16 open question; skip gpu-class first).
 
 **Operational hardening**
-- **Outbox delivery is at-least-once, not idempotent** (S–M, 2026-07-19 review finding) —
-  the durable outbox retries a failed attempt, but if the experiments-server actually
-  committed the write and only the HTTP response was lost, the retry can duplicate a
-  result row, or (for `create`) hit a slug conflict that `try_create` currently treats as
-  just another failure rather than looking up the existing run and completing the
-  attachment. Needs a stable per-event id carried in the outbox row and either a
+- **Outbox delivery is at-least-once, not idempotent** (S–M, 2026-07-19 review finding;
+  **observed live 2026-07-22**: the first mirrored Colab run landed duplicate
+  `introspect/act_norm/L0` result rows and a duplicate step-10 checkpoint artifact in the
+  registry) — the durable outbox retries a failed attempt, but if the experiments-server
+  actually committed the write and only the HTTP response was lost, the retry can
+  duplicate a result row, or (for `create`) hit a slug conflict that `try_create`
+  currently treats as just another failure rather than looking up the existing run and
+  completing the attachment. Needs a stable per-event id carried in the outbox row and either a
   fetch-existing-on-conflict path for `create`, or an idempotency key the
   experiments-server dedups results/checkpoints against.
 - **Multi-machine story** (L) — live agent sockets, the grant table, and idle timers are all
