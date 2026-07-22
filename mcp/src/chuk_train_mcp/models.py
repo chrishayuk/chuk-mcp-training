@@ -7,7 +7,7 @@ REST boundary so the MCP tools never hand raw dicts to the model.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -310,7 +310,9 @@ class RunSummary(BaseModel):
 
 
 class RunRecord(RunSummary):
-    spec: ShellSpec
+    # Discriminated on spec.kind — a run is a train OR a shell run (mirrors
+    # the Rust RunSpec enum; spec: ShellSpec alone rejected every train run).
+    spec: Annotated[TrainSpec | ShellSpec, Field(discriminator="kind")]
 
 
 class RunEvent(BaseModel):
