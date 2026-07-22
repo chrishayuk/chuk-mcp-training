@@ -70,7 +70,7 @@ GPU, not just Mac-side reads of finished checkpoints.
 
 | Milestone | State | Gate | Proven |
 |-----------|-------|------|--------|
-| **I0** pulse metrics: `introspect/*` namespace end-to-end (trainer → metrics → dashboard → gates) | 🟨 built — proto key grammar, `chuk-introspect` pulse tier (17 tests), stub-trainer rig, dashboard tab; local e2e green (10 pulse keys via REST, dead-ReLU stop gate trips) | EI0 | ⬜ awaiting Colab T4 run |
+| **I0** pulse metrics: `introspect/*` namespace end-to-end (trainer → metrics → dashboard → gates) | ✅ done — proto key grammar, `chuk-introspect` pulse tier (17 tests), stub-trainer rig, dashboard tab; local e2e green (10 pulse keys via REST, dead-ReLU stop gate trips) | EI0 | ✅ **real Colab T4 (2026-07-22)** — 10 pulse keys streamed live (per-layer act/dead/grad, logit entropy) at ~3% steady-state overhead, rendered on the Introspection tab, final values mirrored into the experiments registry as results |
 | **I1** probe plan + snapshot artifacts: `ProbePlan` contract, `$CHUK_PROBE_PLAN`/`$CHUK_PROBE_DIR`, `introspection` artifact class, two-pass step-indexed capture on the probe corpus | ⬜ not started | EI1 | — |
 | **I2** control-plane reduction (Rust): PR / overlap / drift / whitened-alignment computed server-side from snapshot artifacts; Introspection dashboard tab | ⬜ not started | EI2 | — |
 | **I3** lazarus attach: `attach_run` remote mode — lazarus analysis math over harness-captured artifacts, step axis in results | ⬜ not started | EI3 | — |

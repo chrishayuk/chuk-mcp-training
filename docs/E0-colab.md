@@ -52,9 +52,10 @@ Read the two secret values back for the next steps:
 
 ## 2 · Join a Colab T4
 
-The easy path: call the **`colab_cell`** MCP tool — the control plane returns a
-ready-to-paste cell with its own URL and a **single-use `cj_` join token**
-(spec §12) already filled in, bound to a fresh worker id. Paste it into one
+The easy path: the dashboard's **Join** screen (`/#/join`) — or the
+**`colab_cell`** MCP tool — mints a ready-to-paste cell with the control plane's
+URL and a **single-use `cj_` join token** (spec §12) already filled in, bound to
+a fresh worker id; the Join screen then watches until that worker dials home. Paste it into one
 cell of a T4 notebook (Runtime → Change runtime type → **T4 GPU**) and run it.
 
 Manual fallback (`bootstrap/colab_cell.py`):

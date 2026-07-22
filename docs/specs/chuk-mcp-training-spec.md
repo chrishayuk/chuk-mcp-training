@@ -69,9 +69,11 @@ dashboard's Access screen, and **single-use `cj_` join tokens** minted per provi
 Colab cell (the shared static join token survives only for local dev). The MCP surface is
 hosted at **`chuk-train-mcp.fly.dev/mcp`** (its own Fly app, CI-deployed) as a
 zero-credential per-caller bearer proxy, alongside local stdio. The
-**chuk-experiments-server reporting mirror** (§11.6) is built and verified end-to-end —
-optional and gated (off unless configured), it mirrors run lifecycle + checkpoints (as
-artifacts) + final metrics (as results). Providers: `mock` (tested), `vast` (skeleton,
+**chuk-experiments-server reporting mirror** (§11.6) is **live in prod** (2026-07-22,
+dedicated write key) and proven on a real Colab T4: a registry run dispatched via
+`submit_run_from_experiment` trained with chuk-introspect pulse metrics and reported
+final metrics (incl. `introspect/*`) as results + checkpoints as artifacts back into the
+registry run. Still optional + gated for other deployments. Providers: `mock` (tested), `vast` (skeleton,
 untested against the live API). Not yet built: the packing scheduler + `submit_batch`
 (M3), the `eval` job kind / panel gates, lazarus integration, dynamics curve, Lambda
 driver (M5). (The R2

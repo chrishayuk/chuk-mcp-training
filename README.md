@@ -14,12 +14,21 @@ checkpoints upload directly to R2, and the resume test passes — bounce the Col
 cell mid-run and it resumes from the R2 checkpoint). **M2** (leases, drain,
 provider-verified destroy, reconcile / orphan-kill, ledger) is verified locally
 via a mock provider; live Vast E2 and the E4 budget/watchdog proving run pending.
+Newest proof (2026-07-22): the **full registry loop ran on a live Colab T4** — an
+experiments-server run dispatched with `submit_run_from_experiment`, joined via a
+dashboard-minted single-use token, trained with **chuk-introspect pulse metrics**
+(10 `introspect/*` keys at ~3% overhead — spec `docs/specs/chuk-introspect-spec.md`),
+uploaded lineage checkpoints to R2, and mirrored results + artifacts back into the
+registry.
 
 Beyond the milestones, the harness now has a **full Google-authed operator
 dashboard** — a tabbed per-run view (a light **Overview** that drills into
-dedicated **Training** / **Logs** / **Events** / **System** screens, the System
-tab graphing live GPU/VRAM/temp/power/CPU/memory from the worker running the run)
-plus fleet/runs filters, pagination, and per-worker live GPU-util; **real-time
+dedicated **Training** / **Introspection** / **Logs** / **Events** / **System**
+screens — the System tab graphing live GPU/VRAM/temp/power/CPU/memory from the
+worker running the run, the Introspection tab charting live `introspect/*` pulse
+metrics) plus fleet/runs filters, pagination, per-worker live GPU-util, Money/
+Budgets and Gates cards, per-sweep views, and a **Join** screen that mints a
+paste-ready Colab cell (single-use token) and watches for the worker to dial home; **real-time
 host telemetry** (connected workers stream `sys/*` every few seconds — chuk-compute
 M4); a complete **Drive cold-archive tier** (completed runs auto-tier
 their final checkpoint + logs to Drive, R2 lifecycle expires the hot copies,
@@ -123,6 +132,10 @@ control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
   reconnects with backoff. Domain-free: the training-ness (code units, resume,
   checkpoint lineage) is expressed by the control plane in the job it sends.
   Builds to a static musl binary workers download.
+- `introspect/` — the `chuk_introspect` Python capture library (pulse tier:
+  ProbePlan → per-layer torch hooks → `introspect/*` metrics on the existing
+  metric channel; vendored into code units at build time — see
+  `examples/stub-trainer/README.md` and `docs/specs/chuk-introspect-spec.md`).
 - `mcp/` — `chuk-train-mcp` Python package: 34 tools across identity (`whoami`),
   fleet (`fleet`, `worker_telemetry`), runs (`submit_shell`, `build_code_unit`,
   `submit_run`, `submit_run_from_experiment`, `list_runs`, `run_status`,

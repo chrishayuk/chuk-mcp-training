@@ -79,6 +79,17 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   via the ambient ASGI scope, the CP enforces RBAC per caller, and a tokenless call gets
   the CP's 401 in the tool envelope — the proxy never substitutes its own key (it has
   none). stdio mode keeps the env-token fallback for local use.
+- **chuk-introspect I0 + live EI0** (2026-07-22, spec `docs/specs/chuk-introspect-spec.md`) —
+  the introspection foundation: the normative `introspect/*` key grammar in
+  `chuk-train-proto`, the `chuk_introspect` Python pulse-capture library (`introspect/`,
+  vendored into code units at build time), stub-trainer probe wiring, gates accepting
+  introspect keys unchanged, and a dashboard **Introspection** tab. **EI0 proven on a real
+  Colab T4**: 10 pulse keys streamed at ~3% steady-state overhead and mirrored into the
+  registry as results.
+- **Dashboard Join screen** (2026-07-22) — `#/join` mints a paste-ready Colab cell in the
+  browser (single-use `cj_` token bound to a fresh worker id, lease/labels inputs, copy
+  button) and watches the fleet until that id dials home. Proven same-day: a real T4
+  joined from a screen-minted cell.
 - **Agent-first MCP surface** (2026-07-20, patterns borrowed from chuk-experiments-server's
   tool design) — `whoami` (role/team/experiments-key-linked, so an agent can predict 403s
   instead of debugging them) and `worker_telemetry` (live `sys/*` sample per worker) expose
@@ -138,9 +149,13 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
    accepted for local-dev/manual joins only; production paths no longer hand it out.
    Verified live over the real websocket: enrol / reuse-refused / impersonation-refused /
    reconnect-readmitted / legacy-dev-join all behave as designed.
-9. **Live Vast E2** — rent 15 min, hang the agent, prove provider-verified destroy.
-10. **M3 packing** when there's rented-GPU pressure.
-11. ~~**R2 lifecycle permission**~~ ✅ **done (2026-07-21).** The two expiry rules are live
+9. **Outbox idempotency** (promoted from hardening, 2026-07-22 — now evidence-backed:
+   the first live mirrored run landed duplicate result rows + a duplicate checkpoint
+   artifact in the registry). Stable per-event ids carried in the outbox + dedup/upsert
+   on the experiments-server side, and a fetch-existing-on-conflict path for `create`.
+10. **Live Vast E2** — rent 15 min, hang the agent, prove provider-verified destroy.
+11. **M3 packing** when there's rented-GPU pressure.
+12. ~~**R2 lifecycle permission**~~ ✅ **done (2026-07-21).** The two expiry rules are live
     on the `chuk-train` bucket (set via wrangler's OAuth session — `ckpt-hot/` 1 day,
     `ckpt-final/` 30 days — verified on the bucket alongside R2's default
     multipart-abort rule). The CP's boot-time `apply_lifecycle` now **merges** with the
