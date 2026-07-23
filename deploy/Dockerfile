@@ -17,7 +17,12 @@ RUN cargo build --release -p chuk-train-controlplane
 RUN cargo build --release -p chuk-compute-worker --target x86_64-unknown-linux-musl
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# git is required at runtime: build_code_unit's git-URL path (codeunit.rs)
+# shells out to `git clone` for any repo that isn't already a local directory
+# on this container -- i.e. every real caller. Without it here, every non-local
+# build_code_unit call fails at process-spawn time with a misleading
+# "running git (is it installed?)" error, indistinguishable from a bad repo/commit.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/chuk-train-controlplane /usr/local/bin/chuk-train-controlplane
 # Per-target worker binaries the control plane serves at /agent/<triple>
