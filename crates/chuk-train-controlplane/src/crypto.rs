@@ -69,6 +69,14 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_empty_plaintext() {
+        // Not a realistic key value, but the cipher/format shouldn't care.
+        let key = test_key();
+        let ciphertext = encrypt(&key, "");
+        assert_eq!(decrypt(&key, &ciphertext).unwrap(), "");
+    }
+
+    #[test]
     fn wrong_key_fails() {
         let ciphertext = encrypt(&test_key(), "secret");
         let wrong = [9u8; 32];
@@ -78,5 +86,57 @@ mod tests {
     #[test]
     fn corrupt_ciphertext_fails() {
         assert!(decrypt(&test_key(), "not-valid-base64!!!").is_err());
+    }
+
+    #[test]
+    fn truncated_ciphertext_too_short_for_a_nonce_fails() {
+        // Valid base64, but decodes to fewer than the 12 nonce bytes `decrypt`
+        // requires before it even tries to split out a ciphertext.
+        let blob = STANDARD.encode([1u8, 2, 3]);
+        let err = decrypt(&test_key(), &blob).unwrap_err();
+        assert!(err.to_string().contains("too short"));
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails_the_aead_tag_check() {
+        let key = test_key();
+        let ciphertext = encrypt(&key, "secret");
+        let mut raw = STANDARD.decode(ciphertext).unwrap();
+        // Flip a byte in the ciphertext body (past the 12-byte nonce prefix)
+        // so the AEAD authentication tag no longer matches.
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+        let tampered = STANDARD.encode(raw);
+        assert!(decrypt(&key, &tampered).is_err());
+    }
+
+    /// Exercises `key_from_env` end to end (found + decodes to 32 bytes,
+    /// missing, and present-but-malformed) via the real env var it reads.
+    /// Runs the three cases serially inside one test (rather than three
+    /// `#[test]`s) so no other test can observe a torn `set_var`/`remove_var`
+    /// window on this process-global variable — this crate has no
+    /// `serial_test` dependency to isolate them the usual way.
+    #[test]
+    fn key_from_env_reads_decodes_and_rejects_bad_config() {
+        let var = env::EXPERIMENTS_KEY_ENCRYPTION_KEY;
+        let saved = std::env::var(var).ok();
+
+        std::env::remove_var(var);
+        assert_eq!(key_from_env(), None, "unset: feature is off, not an error");
+
+        let key = [4u8; 32];
+        std::env::set_var(var, STANDARD.encode(key));
+        assert_eq!(key_from_env(), Some(key));
+
+        std::env::set_var(var, "not-valid-base64!!!");
+        assert_eq!(key_from_env(), None, "undecodable base64 is also just \"off\"");
+
+        std::env::set_var(var, STANDARD.encode([4u8; 16]));
+        assert_eq!(key_from_env(), None, "decodes fine but isn't 32 bytes");
+
+        match saved {
+            Some(v) => std::env::set_var(var, v),
+            None => std::env::remove_var(var),
+        }
     }
 }

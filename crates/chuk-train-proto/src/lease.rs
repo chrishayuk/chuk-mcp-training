@@ -180,3 +180,92 @@ pub struct TeardownResult {
     pub destroyed: bool,
     pub status: InstanceStatus,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lease(granted_min: f64, drain_window_min: f64, extensions: Vec<LeaseExtension>) -> Lease {
+        Lease {
+            worker_id: WorkerId("w-1".into()),
+            provider: "vast".into(),
+            instance_id: "i-1".into(),
+            price_hr: 2.0,
+            granted_min,
+            drain_window_min,
+            started_at: 1_000.0,
+            state: LeaseState::Active,
+            extensions,
+        }
+    }
+
+    #[test]
+    fn lease_state_as_str_covers_every_variant() {
+        let pairs = [
+            (LeaseState::Active, "active"),
+            (LeaseState::Draining, "draining"),
+            (LeaseState::Destroyed, "destroyed"),
+        ];
+        for (state, expected) in pairs {
+            assert_eq!(state.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn total_granted_min_sums_the_base_grant_and_every_extension() {
+        let l = lease(
+            60.0,
+            5.0,
+            vec![
+                LeaseExtension { minutes: 10.0, at: 1_500.0, reason: "checkpoint slow".into() },
+                LeaseExtension { minutes: 5.0, at: 1_800.0, reason: String::new() },
+            ],
+        );
+        assert_eq!(l.total_granted_min(), 75.0);
+        // No extensions: total is just the base grant.
+        assert_eq!(lease(60.0, 5.0, Vec::new()).total_granted_min(), 60.0);
+    }
+
+    #[test]
+    fn wall_and_drain_secs_derive_from_total_granted_minutes() {
+        let l = lease(
+            60.0,
+            5.0,
+            vec![LeaseExtension { minutes: 10.0, at: 1_500.0, reason: String::new() }],
+        );
+        // total granted = 70 min → wall = 4200s.
+        assert_eq!(l.wall_secs(), 4_200.0);
+        // drain = wall - drain_window(5 min = 300s) = 3900s.
+        assert_eq!(l.drain_secs(), 3_900.0);
+    }
+
+    #[test]
+    fn drain_secs_floors_at_zero_when_the_drain_window_exceeds_the_wall() {
+        // 10 min granted but a 30 min drain window: would go negative unclamped.
+        let l = lease(10.0, 30.0, Vec::new());
+        assert_eq!(l.drain_secs(), 0.0);
+    }
+
+    #[test]
+    fn remaining_min_counts_down_from_the_wall_as_time_passes() {
+        let l = lease(60.0, 5.0, Vec::new());
+        // At start: the full wall is remaining, in minutes.
+        assert_eq!(l.remaining_min(l.started_at), 60.0);
+        // Halfway through the 60 minute wall (30 min = 1800s later).
+        assert_eq!(l.remaining_min(l.started_at + 1_800.0), 30.0);
+        // Past T-0: remaining goes negative (callers compare against 0/T-drain
+        // themselves; this method does not clamp).
+        assert_eq!(l.remaining_min(l.started_at + 4_200.0), -10.0);
+    }
+
+    #[test]
+    fn projected_cost_prices_total_granted_minutes_at_the_hourly_rate() {
+        let l = lease(
+            30.0,
+            5.0,
+            vec![LeaseExtension { minutes: 30.0, at: 1_500.0, reason: String::new() }],
+        );
+        // 60 total min at $2/hr = $2.00.
+        assert_eq!(l.projected_cost(), 2.0);
+    }
+}

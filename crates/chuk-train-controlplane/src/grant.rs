@@ -130,4 +130,67 @@ mod tests {
         assert!(g.may_read("artifacts/code/unit/abc123/unit.tar.zst"));
         assert!(!g.may_write("artifacts/code/unit/abc123/unit.tar.zst"));
     }
+
+    #[test]
+    fn may_read_also_refuses_unsafe_keys() {
+        // `may_write` short-circuits on an unsafe key via the same
+        // `keys::is_safe_key` guard; `may_read` must too, even for a
+        // traversal that would otherwise land inside the run's own tree.
+        let g = grant("RUN-1");
+        assert!(!g.may_read("runs/RUN-1/../../etc/passwd"));
+    }
+
+    #[test]
+    fn is_valid_reflects_the_expiry_deadline() {
+        let live = grant("RUN-1");
+        assert!(live.is_valid());
+
+        let mut expired = grant("RUN-1");
+        expired.expires = Instant::now() - std::time::Duration::from_secs(1);
+        assert!(!expired.is_valid());
+    }
+
+    #[test]
+    fn mint_then_resolve_round_trips_the_run_and_code() {
+        let table = GrantTable::default();
+        let code = CodeRef { name: "unit".into(), sha: "deadbeef".into() };
+        let token = table.mint(RunId("RUN-1".into()), code.clone());
+
+        let resolved = table.resolve(&token).expect("freshly minted grant resolves");
+        assert_eq!(resolved.run_id, RunId("RUN-1".into()));
+        assert_eq!(resolved.code, code);
+    }
+
+    #[test]
+    fn resolve_returns_none_for_an_unknown_token() {
+        let table = GrantTable::default();
+        assert!(table.resolve("grant-does-not-exist").is_none());
+    }
+
+    #[test]
+    fn resolve_evicts_and_refuses_an_expired_grant() {
+        let table = GrantTable::default();
+        // Insert directly (rather than via `mint`, which always sets a live
+        // TTL) so expiry can be tested without sleeping.
+        let mut expired = grant("RUN-1");
+        expired.expires = Instant::now() - std::time::Duration::from_secs(1);
+        table.grants.lock().unwrap().insert("grant-expired".into(), expired);
+
+        assert!(table.resolve("grant-expired").is_none());
+        // The lookup also swept the dead entry out of the table.
+        assert!(!table.grants.lock().unwrap().contains_key("grant-expired"));
+    }
+
+    #[test]
+    fn revoke_run_drops_only_that_runs_grants() {
+        let table = GrantTable::default();
+        let code = CodeRef { name: "unit".into(), sha: "abc123".into() };
+        let a = table.mint(RunId("RUN-A".into()), code.clone());
+        let b = table.mint(RunId("RUN-B".into()), code);
+
+        table.revoke_run(&RunId("RUN-A".into()));
+
+        assert!(table.resolve(&a).is_none(), "RUN-A's grant must be gone");
+        assert!(table.resolve(&b).is_some(), "RUN-B's grant must be untouched");
+    }
 }
