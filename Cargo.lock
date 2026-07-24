@@ -762,6 +762,7 @@ dependencies = [
  "sqlx",
  "tar",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "toml",
  "tracing",
  "tracing-subscriber",

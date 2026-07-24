@@ -130,11 +130,12 @@ fn merge_lifecycle_rules(
 
 #[cfg(test)]
 impl S3ArtifactStore {
-    /// Test-only constructor: builds a client from fixed, fake config
-    /// (never resolved over the network — see the presigning tests below),
-    /// bypassing `from_env` so URI/presigning tests don't have to touch the
-    /// process-global S3 env vars that `from_env`'s own test does.
-    fn for_test(bucket: &str) -> Self {
+    /// Test-only constructor: builds a client from fixed, fake config against
+    /// `endpoint`, bypassing `from_env` so tests don't have to touch the
+    /// process-global S3 env vars that `from_env`'s own test does. Pointed at
+    /// an unroutable host for the presigning tests (which never transmit) and
+    /// at a loopback fake S3 for the request-shape tests.
+    fn for_test_at(endpoint: &str, bucket: &str) -> Self {
         let creds = Credentials::new(
             "test-access-key",
             "test-secret-key",
@@ -145,14 +146,23 @@ impl S3ArtifactStore {
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(DEFAULT_REGION))
-            .endpoint_url("https://example.r2.cloudflarestorage.com")
+            .endpoint_url(endpoint)
             .credentials_provider(creds)
             .force_path_style(true)
+            // Match from_env: R2 rejects trailing-checksum trailers, and the
+            // fake bucket below asserts on the request bodies we really send.
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
             .build();
         Self {
             client: Client::from_conf(config),
             bucket: bucket.to_owned(),
         }
+    }
+
+    fn for_test(bucket: &str) -> Self {
+        Self::for_test_at("https://example.r2.cloudflarestorage.com", bucket)
     }
 }
 
@@ -270,6 +280,7 @@ mod tests {
     use chuk_train_proto::env;
 
     use super::*;
+    use crate::fakehttp::{FakeHttp, Reply};
 
     // -- uri() / presigning: fully local, no network (see `for_test`) -------
 
@@ -437,51 +448,175 @@ mod tests {
         let built = merge_lifecycle_rules(Vec::new(), &[("ckpt-hot/".to_owned(), 1)]).unwrap();
         assert_eq!(built[0].id(), Some("expire-ckpt-hot"));
     }
-}
 
-/// Live check that R2 accepts + persists our lifecycle rules. Ignored by
-/// default; run with `.env` sourced:
-///   cargo test -p chuk-train-controlplane artifacts::s3::live::lifecycle_round_trip -- --ignored --nocapture
-#[cfg(test)]
-mod live {
-    use super::*;
+    // -- the object operations, against a loopback fake bucket ---------------
+    //
+    // A live R2 endpoint is the only way to prove the *bucket's* behaviour, but
+    // it is not the only way to prove ours: pointed at `fakehttp`, the real
+    // aws-sdk-s3 client signs and sends real requests, so these assert the
+    // request shape we actually put on the wire (verb, path-style key, body,
+    // copy-source header, merged lifecycle XML) and how we read the response
+    // back. The live round-trip stays in `s3/tests.rs`.
 
-    #[ignore]
+    const S3_ERROR_XML: &str =
+        r#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>no</Message></Error>"#;
+
+    /// A bucket that answers every object request successfully: GET serves
+    /// `body`, everything else is an empty 2xx (CopyObject needs its result
+    /// element, which S3 sends as a 200 body).
+    fn fake_bucket(body: &'static str) -> FakeHttp {
+        FakeHttp::start(move |req, _| match req.method.as_str() {
+            "GET" => Reply::ok(body),
+            "PUT" if !req.header("x-amz-copy-source").is_empty() => Reply::ok(
+                r#"<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"e"</ETag></CopyObjectResult>"#,
+            ),
+            "DELETE" => Reply::new(204, Vec::new()),
+            _ => Reply::ok(Vec::new()),
+        })
+    }
+
     #[tokio::test]
-    async fn lifecycle_round_trip() {
-        let bucket =
-            std::env::var("CHUK_TRAIN_S3_BUCKET").unwrap_or_else(|_| "chuk-train".to_owned());
-        let Ok(store) = S3ArtifactStore::from_env(&bucket) else {
-            eprintln!("skip: no S3/R2 env");
-            return;
-        };
-        if let Err(e) = store
+    async fn put_sends_the_bytes_path_style_and_returns_the_object_uri() {
+        let bucket = fake_bucket("");
+        let store = S3ArtifactStore::for_test_at(&bucket.origin, "my-bucket");
+        let uri = store.put("ckpt-hot/r1/model.bin", b"weights".to_vec()).await.unwrap();
+
+        assert_eq!(uri, "s3://my-bucket/ckpt-hot/r1/model.bin");
+        let req = &bucket.requests()[0];
+        assert_eq!(req.method, "PUT");
+        assert_eq!(req.path(), "/my-bucket/ckpt-hot/r1/model.bin");
+        assert_eq!(req.body, b"weights");
+        assert!(req.header("authorization").starts_with("AWS4-HMAC-SHA256"));
+    }
+
+    #[tokio::test]
+    async fn get_returns_the_object_body() {
+        let bucket = fake_bucket("weights");
+        let store = S3ArtifactStore::for_test_at(&bucket.origin, "my-bucket");
+        let got = store.get("ckpt-hot/r1/model.bin").await.unwrap();
+
+        assert_eq!(got, b"weights");
+        assert_eq!(bucket.requests()[0].method, "GET");
+        assert_eq!(bucket.requests()[0].path(), "/my-bucket/ckpt-hot/r1/model.bin");
+    }
+
+    #[tokio::test]
+    async fn exists_heads_the_key_and_maps_a_miss_to_false() {
+        // One bucket, two keys: `there` heads 200, anything else 404.
+        let bucket = FakeHttp::start(|req, _| match req.path() {
+            "/my-bucket/there" => Reply::ok(Vec::new()),
+            _ => Reply::new(404, Vec::new()),
+        });
+        let store = S3ArtifactStore::for_test_at(&bucket.origin, "my-bucket");
+
+        assert!(store.exists("there").await.unwrap());
+        assert!(!store.exists("gone").await.unwrap());
+        assert_eq!(bucket.requests()[0].method, "HEAD");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_key() {
+        let bucket = fake_bucket("");
+        let store = S3ArtifactStore::for_test_at(&bucket.origin, "my-bucket");
+        store.delete("ckpt-hot/r1/model.bin").await.unwrap();
+
+        assert_eq!(bucket.requests()[0].method, "DELETE");
+        assert_eq!(bucket.requests()[0].path(), "/my-bucket/ckpt-hot/r1/model.bin");
+    }
+
+    #[tokio::test]
+    async fn copy_names_the_source_bucket_qualified_and_the_destination_as_the_key() {
+        let bucket = fake_bucket("");
+        let store = S3ArtifactStore::for_test_at(&bucket.origin, "my-bucket");
+        store.copy("ckpt-hot/r1/model.bin", "ckpt-final/r1/model.bin").await.unwrap();
+
+        let req = &bucket.requests()[0];
+        assert_eq!(req.method, "PUT");
+        assert_eq!(req.path(), "/my-bucket/ckpt-final/r1/model.bin");
+        assert_eq!(req.header("x-amz-copy-source"), "my-bucket/ckpt-hot/r1/model.bin");
+    }
+
+    #[tokio::test]
+    async fn a_failing_operation_names_the_key_in_the_error_context() {
+        let bucket = FakeHttp::start(|_, _| Reply::new(403, S3_ERROR_XML));
+        let store = S3ArtifactStore::for_test_at(&bucket.origin, "my-bucket");
+
+        let err = store.put("ckpt-hot/r1/model.bin", b"weights".to_vec()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("s3 put ckpt-hot/r1/model.bin"),
+            "unexpected error: {err}"
+        );
+        let err = store.get("ckpt-hot/r1/model.bin").await.unwrap_err();
+        assert!(err.to_string().contains("s3 get"), "unexpected error: {err}");
+        let err = store.delete("ckpt-hot/r1/model.bin").await.unwrap_err();
+        assert!(err.to_string().contains("s3 delete"), "unexpected error: {err}");
+        let err = store.copy("a", "b").await.unwrap_err();
+        assert!(err.to_string().contains("s3 copy a -> b"), "unexpected error: {err}");
+    }
+
+    /// What S3/R2 returns for a bucket that already has one foreign rule.
+    const EXISTING_LIFECYCLE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule><ID>foreign</ID><Filter><Prefix>other-app/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>7</Days></Expiration></Rule>
+</LifecycleConfiguration>"#;
+
+    #[tokio::test]
+    async fn apply_lifecycle_reads_the_bucket_config_and_puts_back_the_merge() {
+        let bucket = FakeHttp::start(|req, _| match req.method.as_str() {
+            "GET" => Reply::ok(EXISTING_LIFECYCLE_XML),
+            _ => Reply::ok(Vec::new()),
+        });
+        let store = S3ArtifactStore::for_test_at(&bucket.origin, "my-bucket");
+        store
             .apply_lifecycle(&[("ckpt-hot/".to_owned(), 1), ("ckpt-final/".to_owned(), 30)])
             .await
-        {
-            let msg = e.to_string();
-            if msg.contains("AccessDenied") || msg.contains("Access Denied") {
-                eprintln!("skip: R2 token lacks lifecycle permission — set the rules in the Cloudflare dashboard or use an Admin R/W token");
-                return;
-            }
-            panic!("apply lifecycle: {e}");
-        }
-        let got = store
-            .client
-            .get_bucket_lifecycle_configuration()
-            .bucket(&bucket)
-            .send()
-            .await
-            .expect("get lifecycle");
-        let rules = got.rules();
-        for r in rules {
-            eprintln!(
-                "rule id={:?} status={:?} days={:?}",
-                r.id(),
-                r.status(),
-                r.expiration().and_then(|e| e.days())
-            );
-        }
-        assert!(rules.len() >= 2, "expected our two rules");
+            .unwrap();
+
+        let requests = bucket.requests();
+        assert_eq!(requests[0].method, "GET", "reads the current config first");
+        assert!(requests[0].target.contains("lifecycle"), "unexpected target: {}", requests[0].target);
+        let put = String::from_utf8(requests[1].body.clone()).unwrap();
+        assert_eq!(requests[1].method, "PUT");
+        // The foreign rule survives; ours are appended with our ids + days.
+        assert!(put.contains("<ID>foreign</ID>"), "foreign rule dropped: {put}");
+        assert!(put.contains("<ID>expire-ckpt-hot</ID>"), "missing our rule: {put}");
+        assert!(put.contains("<ID>expire-ckpt-final</ID>"), "missing our rule: {put}");
+        assert!(put.contains("<Days>30</Days>"), "missing our expiry: {put}");
+    }
+
+    #[tokio::test]
+    async fn apply_lifecycle_treats_an_unreadable_existing_config_as_empty() {
+        // A token without lifecycle-read permission (or a bucket with no config
+        // at all) must not stop us setting ours.
+        let bucket = FakeHttp::start(|req, _| match req.method.as_str() {
+            "GET" => Reply::new(403, S3_ERROR_XML),
+            _ => Reply::ok(Vec::new()),
+        });
+        let store = S3ArtifactStore::for_test_at(&bucket.origin, "my-bucket");
+        store.apply_lifecycle(&[("ckpt-hot/".to_owned(), 1)]).await.unwrap();
+
+        let put = String::from_utf8(bucket.requests()[1].body.clone()).unwrap();
+        assert!(put.contains("<ID>expire-ckpt-hot</ID>"), "unexpected body: {put}");
+    }
+
+    #[tokio::test]
+    async fn apply_lifecycle_surfaces_a_refused_put() {
+        let bucket = FakeHttp::start(|_, _| Reply::new(403, S3_ERROR_XML));
+        let store = S3ArtifactStore::for_test_at(&bucket.origin, "my-bucket");
+
+        let err = store.apply_lifecycle(&[("ckpt-hot/".to_owned(), 1)]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("put lifecycle on bucket my-bucket"),
+            "unexpected error: {err}"
+        );
     }
 }
+
+/// Live check that R2 accepts + persists our lifecycle rules — see
+/// `s3/tests.rs`. Kept in a `tests.rs` sibling because it is `#[ignore]`d and
+/// can never run in CI (it needs real R2 credentials): the coverage gate
+/// excludes `tests.rs` files, so permanently-unrunnable lines don't count
+/// against this module's coverage. Same reason as `hub/tests.rs`.
+#[cfg(test)]
+#[path = "s3/tests.rs"]
+mod live;

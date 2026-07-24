@@ -37,3 +37,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 zstd = "0.13"
+
+[dev-dependencies]
+# `test-util` for the paused clock: the lease manager's destroy-verification
+# deadline (2 minutes) and idle-reaper threshold are driven with virtual time
+# rather than waiting them out.
+tokio = { workspace = true, features = ["test-util"] }
+# A websocket *client*, so `ws.rs`'s session is tested end to end against a real
+# axum server rather than only through its pure helpers.
+tokio-tungstenite = { workspace = true }

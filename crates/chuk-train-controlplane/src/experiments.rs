@@ -46,6 +46,21 @@ const OUTBOX_SWEEP_BATCH: i64 = 20;
 /// Retry backoff for a failed outbox event: `BASE * 2^attempts`, capped at MAX.
 const OUTBOX_BASE_BACKOFF_SECS: u64 = 30;
 const OUTBOX_MAX_BACKOFF_SECS: u64 = 3_600;
+/// The shared default bearer a test client reports with (see [`Experiments::at`]).
+#[cfg(test)]
+const SHARED_KEY: &str = "shared-write-key";
+
+/// Serializes every test in this crate that mutates the process-global
+/// `CHUK_EXPERIMENTS_*` env vars — `from_env`'s own test here, and
+/// `hub::tests`'s mirror test, which sets them just long enough to construct a
+/// client. Without it `cargo test`'s default parallelism interleaves the two
+/// and one reads an env the other is halfway through changing. Same convention
+/// (and the same poison-recovering std `Mutex`) as `artifacts`'s S3 env lock.
+#[cfg(test)]
+pub(crate) fn lock_experiments_env() -> std::sync::MutexGuard<'static, ()> {
+    static EXPERIMENTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    EXPERIMENTS_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Reporting client for one experiments-server + default programme/experiment.
 pub struct Experiments {
@@ -101,6 +116,31 @@ impl Experiments {
             ensured: AtomicBool::new(false),
             key_encryption_key: crate::crypto::key_from_env(),
         }))
+    }
+
+    /// A client pointed at a fake experiments-server on `base`, bypassing the
+    /// env gating — for tests that spin one up (mirrors `datasets.rs`'s
+    /// `Datasets::at`). `key_encryption_key` turns the per-user-key feature on.
+    #[cfg(test)]
+    pub(crate) fn at(
+        base: &str,
+        store: Arc<dyn Store>,
+        public_url: &str,
+        key_encryption_key: Option<[u8; 32]>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            http: Client::new(),
+            base: base.trim_end_matches('/').to_owned(),
+            key: SHARED_KEY.to_owned(),
+            programme: DEFAULT_EXPERIMENTS_PROGRAMME.to_owned(),
+            programme_title: DEFAULT_EXPERIMENTS_PROGRAMME_TITLE.to_owned(),
+            experiment: DEFAULT_EXPERIMENTS_EXPERIMENT.to_owned(),
+            experiment_title: DEFAULT_EXPERIMENTS_EXPERIMENT_TITLE.to_owned(),
+            public_url: public_url.trim_end_matches('/').to_owned(),
+            store,
+            ensured: AtomicBool::new(false),
+            key_encryption_key,
+        })
     }
 
     /// Resolve which bearer token to use for chuk-experiments-server calls
@@ -843,221 +883,758 @@ mod tests {
         let err = train_spec_from_experiments_run(&run).unwrap_err();
         assert!(err.to_string().contains("code reference"), "unexpected error: {err}");
     }
-}
 
-/// Live proof that the outbox actually recovers from a real failure, not just
-/// a simulated one. Ignored by default; run in isolation (it mutates the
-/// process-wide `CHUK_EXPERIMENTS_URL` env var) against a real local
-/// chuk-experiments-server:
-///   CHUK_EXPERIMENTS_URL=http://localhost:8123 CHUK_EXPERIMENTS_API_KEY=<a real write key> \
-///   cargo test -p chuk-train-controlplane experiments::live::outbox_recovers_after_experiments_server_was_unreachable -- --ignored --nocapture
-#[cfg(test)]
-mod live {
-    use super::*;
+    // -- the mirror itself, against a loopback experiments-server ------------
+    //
+    // Everything below drives the real reporting path (ensure, create/attach,
+    // state, checkpoint, result, and the durable outbox's retry) against
+    // `fakehttp`, asserting the REST calls we actually make and — the property
+    // that matters most here — that a failed report is never silently lost and
+    // never blocks the run. The live checks against a real chuk-experiments-
+    // server stay in `experiments/tests.rs`.
+
+    use std::collections::BTreeMap;
+
+    use chuk_train_proto::{OutboxRow, Role};
+
+    use crate::fakehttp::{FakeHttp, Received, Reply, REFUSED_ORIGIN};
     use crate::store::SqliteStore;
 
-    #[ignore]
-    #[tokio::test]
-    async fn outbox_recovers_after_experiments_server_was_unreachable() {
-        let base = std::env::var(env::EXPERIMENTS_URL).unwrap_or_default();
-        let key = std::env::var(env::EXPERIMENTS_API_KEY).unwrap_or_default();
-        if base.is_empty() || key.is_empty() {
-            eprintln!(
-                "skip: need {} + {} pointed at a real local chuk-experiments-server",
-                env::EXPERIMENTS_URL,
-                env::EXPERIMENTS_API_KEY
-            );
-            return;
-        }
+    const PUBLIC_URL: &str = "https://cp.example.com";
+    const EXT_RUN: &str = "RUN-20260724-0001";
 
-        let store: Arc<dyn Store> = Arc::new(SqliteStore::open(":memory:").await.expect("store"));
-        let train: TrainSpec = serde_json::from_value(json!({
-            "code": { "name": "outbox-smoke-test", "sha": "0000000000000000000000000000000000000000" },
-            "entrypoint": "true",
-        }))
-        .expect("valid TrainSpec");
-        let spec = RunSpec::Train(Box::new(train));
-        // A real `runs` row, exactly as Hub::submit creates before mirroring —
-        // set_experiments_run_id later needs a matching row to update.
-        let run_id = store
-            .create_run("outbox-smoke-test", &spec, None, None, None)
-            .await
-            .expect("create_run");
-
-        // Phase 1: nothing listens here -- the create must fail and land
-        // durably in the outbox rather than being silently dropped.
-        std::env::set_var(env::EXPERIMENTS_URL, "http://127.0.0.1:1");
-        let down = Experiments::from_env(store.clone(), "http://localhost:9").expect("down client");
-        down.report_created(run_id.clone(), spec, None).await;
-
-        assert!(
-            store.experiments_run_id(&run_id).await.unwrap().is_none(),
-            "must not be marked mirrored -- the create never actually landed"
-        );
-        let pending = store
-            .due_outbox_events(now_secs() + 3_700.0, 10) // past the max backoff, just to introspect the row
-            .await
-            .expect("due");
-        assert_eq!(pending.len(), 1, "the failed create must be sitting in the outbox, not lost");
-        assert_eq!(pending[0].attempts, 1);
-
-        // Phase 2: replay it against a client pointed at the real, healthy
-        // server -- proves the *outbox row*, not the client, is what makes
-        // this durable (a fresh client + the same store recovers it).
-        std::env::set_var(env::EXPERIMENTS_URL, &base);
-        let up = Experiments::from_env(store.clone(), "http://localhost:9").expect("up client");
-        let event: OutboxEvent = serde_json::from_str(&pending[0].payload).expect("payload");
-        let delivered = up.attempt(pending[0].id, &run_id, event, pending[0].attempts).await;
-        assert!(delivered, "retry against the real, now-healthy server must succeed");
-        assert!(
-            store.experiments_run_id(&run_id).await.unwrap().is_some(),
-            "now genuinely mirrored on the real server"
-        );
-
-        std::env::remove_var(env::EXPERIMENTS_URL); // don't leak into other tests
+    async fn store() -> Arc<dyn Store> {
+        Arc::new(SqliteStore::open(":memory:").await.expect("store"))
     }
 
-    /// Live proof that `bearer_for` really *prefers* a linked personal key —
-    /// not just that each half works in isolation. The shared default stays
-    /// valid (so `ensure()`, which always uses it, still succeeds); the
-    /// user's *linked* key is deliberately garbage. If resolution ever fell
-    /// back to the working shared default instead of genuinely preferring the
-    /// (here broken) personal key, this mirror call would succeed — it must
-    /// not.
-    ///   CHUK_EXPERIMENTS_URL=http://localhost:8123 CHUK_EXPERIMENTS_API_KEY=<a real write key> \
-    ///   cargo test -p chuk-train-controlplane experiments::live::bearer_for_prefers_the_submitting_users_own_linked_key -- --ignored --nocapture
-    #[ignore]
-    #[tokio::test]
-    async fn bearer_for_prefers_the_submitting_users_own_linked_key() {
-        use base64::engine::general_purpose::STANDARD;
-        use base64::Engine;
-        use chuk_train_proto::Role;
-
-        let base = std::env::var(env::EXPERIMENTS_URL).unwrap_or_default();
-        let real_key = std::env::var(env::EXPERIMENTS_API_KEY).unwrap_or_default();
-        if base.is_empty() || real_key.is_empty() {
-            eprintln!(
-                "skip: need {} + {} pointed at a real local chuk-experiments-server",
-                env::EXPERIMENTS_URL,
-                env::EXPERIMENTS_API_KEY
-            );
-            return;
-        }
-        let _ = real_key; // the shared default stays valid throughout this test
-
-        let store: Arc<dyn Store> = Arc::new(SqliteStore::open(":memory:").await.expect("store"));
-        let email = "personal-key-test@example.com";
-        store
-            .upsert_user(email, "default", Role::Write)
-            .await
-            .expect("upsert user");
-
-        let encryption_key = [3u8; 32];
-        let encrypted = crate::crypto::encrypt(&encryption_key, "deliberately-invalid-personal-key");
-        store
-            .set_user_experiments_key(email, Some(&encrypted))
-            .await
-            .expect("link key");
-        std::env::set_var(env::EXPERIMENTS_KEY_ENCRYPTION_KEY, STANDARD.encode(encryption_key));
-
-        let exp = Experiments::from_env(store.clone(), "http://localhost:9").expect("client");
-        let train: TrainSpec = serde_json::from_value(json!({
-            "code": { "name": "bearer-for-test", "sha": "1111111111111111111111111111111111111111" },
-            "entrypoint": "true",
+    fn train_spec() -> TrainSpec {
+        serde_json::from_value(json!({
+            "code": { "name": "gpt-nano", "sha": "abc123" },
+            "entrypoint": "train",
+            "config": "configs/base.yaml",
+            "seed": 42,
         }))
-        .expect("valid TrainSpec");
-        let spec = RunSpec::Train(Box::new(train));
+        .expect("valid TrainSpec")
+    }
+
+    /// A real queued run row, as `Hub::submit` would have created before the
+    /// mirror ever sees it (`set_experiments_run_id` needs a row to update).
+    async fn queued_run(store: &Arc<dyn Store>, created_by: Option<&str>) -> (RunId, RunSpec) {
+        let spec = RunSpec::Train(Box::new(train_spec()));
         let run_id = store
-            .create_run("bearer-for-test", &spec, None, Some(email), None)
+            .create_run("mirror-test", &spec, None, created_by, None)
             .await
             .expect("create_run");
+        (run_id, spec)
+    }
+
+    /// An experiments-server that accepts everything: the experiment ensure,
+    /// run creates (minting [`EXT_RUN`]), patches, artifacts and results.
+    fn accepting_server() -> FakeHttp {
+        FakeHttp::start(|_, _| Reply::ok(format!(r#"{{"id":"{EXT_RUN}"}}"#)))
+    }
+
+    fn paths(server: &FakeHttp) -> Vec<String> {
+        server
+            .requests()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path()))
+            .collect()
+    }
+
+    fn body_of_request(server: &FakeHttp, method: &str, path: &str) -> Value {
+        server
+            .requests()
+            .iter()
+            .find(|r| r.method == method && r.path() == path)
+            .map(Received::json)
+            .unwrap_or_else(|| panic!("no {method} {path} in {:?}", paths(server)))
+    }
+
+    async fn pending(store: &Arc<dyn Store>) -> Vec<OutboxRow> {
+        // Far enough in the future to see rows whatever backoff they carry.
+        store
+            .due_outbox_events(now_secs() + OUTBOX_MAX_BACKOFF_SECS as f64 + 1.0, 50)
+            .await
+            .expect("due outbox events")
+    }
+
+    // -- ensure --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ensure_creates_the_default_experiment_once_and_treats_409_as_done() {
+        let server = accepting_server();
+        let store = store().await;
+        let exp = Experiments::at(&server.origin, store, PUBLIC_URL, None);
+
+        exp.ensure().await.expect("ensure");
+        exp.ensure().await.expect("already ensured");
+        assert_eq!(server.hits(), 1, "the default experiment is ensured exactly once");
+        let body = body_of_request(&server, "POST", "/v1/experiments");
+        assert_eq!(body["programme"], DEFAULT_EXPERIMENTS_PROGRAMME);
+        assert_eq!(body["slug"], DEFAULT_EXPERIMENTS_EXPERIMENT);
+        assert_eq!(server.requests()[0].header("authorization"), format!("Bearer {SHARED_KEY}"));
+
+        // A 409 means someone else already created it — equally ensured.
+        let conflicting = FakeHttp::start(|_, _| Reply::new(409, "already exists"));
+        let exp = Experiments::at(&conflicting.origin, store2().await, PUBLIC_URL, None);
+        exp.ensure().await.expect("409 is success");
+    }
+
+    async fn store2() -> Arc<dyn Store> {
+        store().await
+    }
+
+    #[tokio::test]
+    async fn ensure_surfaces_a_refusal_with_the_servers_own_body() {
+        let server = FakeHttp::start(|_, _| Reply::new(500, "boom"));
+        let exp = Experiments::at(&server.origin, store().await, PUBLIC_URL, None);
+        let error = exp.ensure().await.unwrap_err();
+        assert!(error.to_string().contains("ensure experiment"), "unexpected error: {error}");
+        assert!(error.to_string().contains("boom"), "the body must survive: {error}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_a_transport_error_on_ensure() {
+        let exp = Experiments::at(REFUSED_ORIGIN, store().await, PUBLIC_URL, None);
+        let error = exp.ensure().await.unwrap_err();
+        assert!(error.to_string().contains("/v1/experiments"), "unexpected error: {error}");
+    }
+
+    // -- report_created ------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_shell_run_is_never_mirrored() {
+        let server = accepting_server();
+        let store = store().await;
+        let spec: RunSpec = serde_json::from_value(json!({ "kind": "shell", "command": "true" }))
+            .expect("valid shell spec");
+        let run_id = store.create_run("probe", &spec, None, None, None).await.expect("run");
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
+
+        exp.report_created(run_id.clone(), spec, None).await;
+        assert_eq!(server.hits(), 0, "shell probes are not research runs");
+        assert!(pending(&store).await.is_empty(), "and nothing is queued for retry");
+    }
+
+    #[tokio::test]
+    async fn an_unattached_run_creates_a_run_on_their_side_and_records_the_minted_id() {
+        let server = accepting_server();
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
 
         exp.report_created(run_id.clone(), spec, None).await;
 
+        assert_eq!(
+            store.experiments_run_id(&run_id).await.unwrap().as_deref(),
+            Some(EXT_RUN)
+        );
+        let created = body_of_request(
+            &server,
+            "POST",
+            &format!("/v1/experiments/{DEFAULT_EXPERIMENTS_EXPERIMENT}/runs"),
+        );
+        assert_eq!(created["slug"], run_id.0, "our id is the primary link");
+        assert_eq!(created["status"], "queued");
+        assert_eq!(created["config"]["entrypoint"], "train");
+        assert_eq!(created["config"]["seed"], 42);
+        assert_eq!(created["workspec"]["code"]["sha"], "abc123");
+        // ...and the linkback patch carries our execution id back to them.
+        let patch = body_of_request(&server, "PATCH", &format!("/v1/runs/{EXT_RUN}"));
+        assert_eq!(patch["harness_session_id"], run_id.0);
+        assert!(pending(&store).await.is_empty(), "delivered, so nothing is left pending");
+    }
+
+    #[tokio::test]
+    async fn a_failed_linkback_patch_still_records_the_run_as_mirrored() {
+        // The run really was created; the patch is best-effort decoration.
+        let server = FakeHttp::start(|req, _| match req.method.as_str() {
+            "PATCH" => Reply::new(500, "patch failed"),
+            _ => Reply::ok(format!(r#"{{"id":"{EXT_RUN}"}}"#)),
+        });
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
+
+        exp.report_created(run_id.clone(), spec, None).await;
+        assert_eq!(
+            store.experiments_run_id(&run_id).await.unwrap().as_deref(),
+            Some(EXT_RUN),
+            "the create landed, so the mapping stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attached_run_patches_the_existing_logical_run_instead_of_minting_one() {
+        let server = accepting_server();
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
+
+        exp.report_created(run_id.clone(), spec, Some(EXT_RUN.to_owned())).await;
+
+        assert_eq!(
+            store.experiments_run_id(&run_id).await.unwrap().as_deref(),
+            Some(EXT_RUN)
+        );
+        assert_eq!(
+            paths(&server),
+            vec![format!("PATCH /v1/runs/{EXT_RUN}")],
+            "no second run is ever minted for the same intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attach_to_a_ref_that_does_not_exist_is_not_recorded_and_stays_pending() {
+        let server = FakeHttp::start(|_, _| Reply::new(404, "no such run"));
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
+
+        exp.report_created(run_id.clone(), spec, Some("RUN-does-not-exist".into())).await;
+
         assert!(
             store.experiments_run_id(&run_id).await.unwrap().is_none(),
-            "must have failed using the user's own (deliberately invalid) linked key, \
-             not silently succeeded by falling back to the still-valid shared default"
+            "never commit to a bad ref"
         );
-        let pending = store
-            .due_outbox_events(now_secs() + 3_700.0, 10)
+        let rows = pending(&store).await;
+        assert_eq!(rows.len(), 1, "the observation is durable, not dropped");
+        assert_eq!(rows[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_created_report_that_cannot_be_delivered_waits_in_the_outbox() {
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        let exp = Experiments::at(REFUSED_ORIGIN, store.clone(), PUBLIC_URL, None);
+
+        exp.report_created(run_id.clone(), spec, None).await;
+
+        assert!(store.experiments_run_id(&run_id).await.unwrap().is_none());
+        let rows = pending(&store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "created");
+    }
+
+    // -- report_state / report_checkpoint / results --------------------------
+
+    /// Report a create against `server` and return the mirrored run id.
+    async fn mirrored(server: &FakeHttp, store: &Arc<dyn Store>) -> (Arc<Experiments>, RunId) {
+        let (run_id, spec) = queued_run(store, None).await;
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
+        exp.report_created(run_id.clone(), spec, None).await;
+        (exp, run_id)
+    }
+
+    #[tokio::test]
+    async fn a_running_transition_patches_status_and_a_start_time() {
+        let server = accepting_server();
+        let store = store().await;
+        let (exp, run_id) = mirrored(&server, &store).await;
+
+        exp.report_state(run_id, RunState::Running).await;
+        let patches: Vec<Value> = server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PATCH")
+            .map(Received::json)
+            .collect();
+        let state = patches.last().expect("a state patch");
+        assert_eq!(state["status"], "running");
+        assert!(state["started_at"].as_str().expect("started_at").ends_with('Z'));
+        assert!(state.get("ended_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_terminal_transition_patches_an_end_time() {
+        let server = accepting_server();
+        let store = store().await;
+        let (exp, run_id) = mirrored(&server, &store).await;
+
+        exp.report_state(run_id, RunState::Failed).await;
+        let state = server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PATCH")
+            .map(Received::json)
+            .next_back()
+            .expect("a state patch");
+        assert_eq!(state["status"], "failed");
+        assert!(state["ended_at"].as_str().expect("ended_at").ends_with('Z'));
+    }
+
+    #[tokio::test]
+    async fn a_state_their_queue_owns_is_delivered_without_a_patch() {
+        let server = accepting_server();
+        let store = store().await;
+        let (exp, run_id) = mirrored(&server, &store).await;
+        let before = server.hits();
+
+        exp.report_state(run_id, RunState::Assigned).await;
+        assert_eq!(server.hits(), before, "assigned/queued are theirs to track");
+        assert!(pending(&store).await.is_empty(), "and the event is still marked delivered");
+    }
+
+    #[tokio::test]
+    async fn completion_also_reports_each_final_metric_as_a_result() {
+        let server = accepting_server();
+        let store = store().await;
+        let (exp, run_id) = mirrored(&server, &store).await;
+        for (step, loss) in [(1u64, 2.5), (2, 1.25)] {
+            store
+                .append_metrics(&run_id, step, &BTreeMap::from([("loss".to_owned(), loss)]))
+                .await
+                .expect("append metrics");
+        }
+
+        exp.report_state(run_id.clone(), RunState::Completed).await;
+
+        let result = body_of_request(&server, "POST", &format!("/v1/runs/{EXT_RUN}/results"));
+        assert_eq!(result["name"], "loss");
+        assert_eq!(result["value"], 1.25, "the final value, not the first");
+    }
+
+    #[tokio::test]
+    async fn a_state_report_for_a_run_that_is_not_mirrored_yet_stays_pending() {
+        // Its `created` event is still in flight: the state event must wait for
+        // it rather than be marked delivered without ever being sent.
+        let server = accepting_server();
+        let store = store().await;
+        let (run_id, _spec) = queued_run(&store, None).await;
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
+
+        exp.report_state(run_id, RunState::Running).await;
+        let rows = pending(&store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "state");
+        assert_eq!(rows[0].attempts, 1, "attempted once, and kept for the next sweep");
+    }
+
+    fn checkpoint_meta() -> CheckpointMeta {
+        serde_json::from_value(json!({
+            "run_id": "EXEC-1",
+            "step": 500,
+            "arch": "gpt-nano",
+        }))
+        .expect("valid CheckpointMeta")
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_is_registered_as_an_artifact_at_our_own_resolver_url() {
+        let server = accepting_server();
+        let store = store().await;
+        let (exp, run_id) = mirrored(&server, &store).await;
+
+        exp.report_checkpoint(run_id.clone(), 500, "s3://bucket/k".into(), checkpoint_meta())
+            .await;
+
+        let artifact = body_of_request(&server, "POST", &format!("/v1/runs/{EXT_RUN}/artifacts"));
+        assert_eq!(artifact["kind"], "checkpoint");
+        assert_eq!(artifact["role"], "produced");
+        assert_eq!(artifact["name"], "gpt-nano", "versions group by arch");
+        assert_eq!(
+            artifact["uri"],
+            format!("{PUBLIC_URL}{API_PREFIX}/checkpoint/{}/500/{CHECKPOINT_MODEL_FILE}", run_id.0),
+            "our stable resolver url survives R2 lifecycle expiry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_artifact_registration_stays_pending() {
+        let server = FakeHttp::start(|req, _| match req.path() {
+            p if p.ends_with("/artifacts") => Reply::new(400, "bad uri scheme"),
+            _ => Reply::ok(format!(r#"{{"id":"{EXT_RUN}"}}"#)),
+        });
+        let store = store().await;
+        let (exp, run_id) = mirrored(&server, &store).await;
+
+        exp.report_checkpoint(run_id, 500, "s3://bucket/k".into(), checkpoint_meta()).await;
+        let rows = pending(&store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "checkpoint");
+        assert_eq!(rows[0].attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_with_no_acceptable_uri_is_reported_as_undeliverable() {
+        // No http(s) public base and a bare file:// recorded uri: there is
+        // nothing the experiments-server would accept.
+        let server = accepting_server();
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        let exp = Experiments::at(&server.origin, store.clone(), "file:///var/artifacts", None);
+        exp.report_created(run_id.clone(), spec, None).await;
+
+        exp.report_checkpoint(run_id, 500, "file:///var/artifacts/k".into(), checkpoint_meta())
+            .await;
+        let rows = pending(&store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "checkpoint", "undeliverable, but never silently dropped");
+    }
+
+    #[tokio::test]
+    async fn a_recorded_s3_uri_is_used_when_we_have_no_public_http_base() {
+        let server = accepting_server();
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        let exp = Experiments::at(&server.origin, store.clone(), "file:///var/artifacts", None);
+        exp.report_created(run_id.clone(), spec, None).await;
+
+        exp.report_checkpoint(run_id, 500, "s3://bucket/k".into(), checkpoint_meta()).await;
+        let artifact = body_of_request(&server, "POST", &format!("/v1/runs/{EXT_RUN}/artifacts"));
+        assert_eq!(artifact["uri"], "s3://bucket/k");
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_without_an_arch_falls_back_to_the_code_unit_then_the_run() {
+        let server = accepting_server();
+        let store = store().await;
+        let (exp, run_id) = mirrored(&server, &store).await;
+
+        let by_code: CheckpointMeta = serde_json::from_value(json!({
+            "run_id": "EXEC-1",
+            "step": 1,
+            "code": { "name": "tok-v12", "sha": "abc123" },
+        }))
+        .expect("valid CheckpointMeta");
+        exp.report_checkpoint(run_id.clone(), 1, "s3://b/k".into(), by_code).await;
+        assert_eq!(
+            body_of_request(&server, "POST", &format!("/v1/runs/{EXT_RUN}/artifacts"))["name"],
+            "tok-v12"
+        );
+
+        let bare: CheckpointMeta =
+            serde_json::from_value(json!({ "run_id": "EXEC-1", "step": 2 })).expect("valid meta");
+        exp.report_checkpoint(run_id.clone(), 2, "s3://b/k".into(), bare).await;
+        let names: Vec<String> = server
+            .requests()
+            .iter()
+            .filter(|r| r.path().ends_with("/artifacts"))
+            .map(|r| r.json()["name"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(names.last().map(String::as_str), Some(run_id.0.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_refused_result_stays_pending() {
+        let server = FakeHttp::start(|req, _| match req.path() {
+            p if p.ends_with("/results") => Reply::new(422, "no such metric"),
+            _ => Reply::ok(format!(r#"{{"id":"{EXT_RUN}"}}"#)),
+        });
+        let store = store().await;
+        let (exp, run_id) = mirrored(&server, &store).await;
+        store
+            .append_metrics(&run_id, 1, &BTreeMap::from([("loss".to_owned(), 0.5)]))
+            .await
+            .expect("append metrics");
+
+        exp.report_state(run_id, RunState::Completed).await;
+        let rows = pending(&store).await;
+        assert!(rows.iter().any(|r| r.kind == "result"), "the result is retried, not lost");
+    }
+
+    // -- the outbox ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_sweep_delivers_what_the_first_attempt_could_not() {
+        // Down when the run was created, up by the time the sweep runs — the
+        // durable row, not the client, is what makes the observation survive.
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        Experiments::at(REFUSED_ORIGIN, store.clone(), PUBLIC_URL, None)
+            .report_created(run_id.clone(), spec, None)
+            .await;
+        assert_eq!(pending(&store).await.len(), 1);
+
+        let server = accepting_server();
+        let up = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
+        // The row's own backoff has not elapsed, so sweep from a later "now".
+        let due = store
+            .due_outbox_events(now_secs() + 120.0, OUTBOX_SWEEP_BATCH)
             .await
             .expect("due");
-        assert_eq!(pending.len(), 1, "the failed create must be sitting in the outbox");
-
-        std::env::remove_var(env::EXPERIMENTS_KEY_ENCRYPTION_KEY);
+        let event: OutboxEvent = serde_json::from_str(&due[0].payload).expect("payload");
+        assert!(up.attempt(due[0].id, &run_id, event, due[0].attempts).await);
+        assert_eq!(
+            store.experiments_run_id(&run_id).await.unwrap().as_deref(),
+            Some(EXT_RUN)
+        );
+        assert!(pending(&store).await.is_empty(), "delivered rows are marked done");
     }
 
-    /// Live proof of the actual feature: seed a queued run directly on a real
-    /// chuk-experiments-server (exactly as `enqueue_run` would), submit it via
-    /// `Hub::submit_from_experiment`, and confirm the harness execution
-    /// *attaches* to that seeded run (via the store's local
-    /// `experiments_run_id` mapping, the same thing `try_attach` sets) rather
-    /// than a second, unrelated run being minted.
-    ///   CHUK_EXPERIMENTS_URL=http://localhost:8123 CHUK_EXPERIMENTS_API_KEY=<a real write key> \
-    ///   cargo test -p chuk-train-controlplane experiments::live::submit_from_experiment_attaches_to_an_existing_queued_run -- --ignored --nocapture
-    #[ignore]
     #[tokio::test]
-    async fn submit_from_experiment_attaches_to_an_existing_queued_run() {
-        let base = std::env::var(env::EXPERIMENTS_URL).unwrap_or_default();
-        let key = std::env::var(env::EXPERIMENTS_API_KEY).unwrap_or_default();
-        if base.is_empty() || key.is_empty() {
-            eprintln!(
-                "skip: need {} + {} pointed at a real local chuk-experiments-server",
-                env::EXPERIMENTS_URL,
-                env::EXPERIMENTS_API_KEY
-            );
-            return;
-        }
-
-        let store: Arc<dyn Store> = Arc::new(SqliteStore::open(":memory:").await.expect("store"));
-        let exp = Experiments::from_env(store.clone(), "http://localhost:9").expect("client");
-        exp.ensure().await.expect("ensure default experiment");
-
-        // Seed a queued run directly via REST, exactly as an external caller
-        // (e.g. chuk-experiments-server's own `enqueue_run`) would.
-        let http = reqwest::Client::new();
-        let resp = http
-            .post(format!("{base}/v1/experiments/{DEFAULT_EXPERIMENTS_EXPERIMENT}/runs"))
-            .bearer_auth(&key)
-            .json(&json!({
-                "slug": format!("submit-from-experiment-smoke-{}", now_secs() as i64),
-                "config": {
-                    "entrypoint": "true",
-                    "code": { "name": "submit-from-experiment-smoke", "sha": "0000000000000000000000000000000000000000" },
-                },
-                "status": "queued",
-            }))
-            .send()
+    async fn a_sweep_pass_drops_a_row_it_could_never_replay() {
+        let server = accepting_server();
+        let store = store().await;
+        let (run_id, _spec) = queued_run(&store, None).await;
+        store
+            .enqueue_outbox_event(&run_id, "created", "{not json", now_secs() - 1.0)
             .await
-            .expect("seed run");
-        assert!(resp.status().is_success(), "seed run: {}", resp.status());
-        let created: Value = resp.json().await.expect("parse seeded run");
-        let ext_id = created["id"].as_str().expect("id").to_owned();
+            .expect("enqueue corrupt row");
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
 
-        let artifacts: Arc<dyn crate::artifacts::ArtifactStore> =
-            Arc::new(crate::artifacts::FsArtifactStore::new(std::env::temp_dir()));
-        let hub = crate::hub::Hub::new(store.clone(), artifacts, Some(exp), None);
-
-        let run_id = hub
-            .submit_from_experiment(&ext_id, None, None)
-            .await
-            .expect("submit_from_experiment");
-
-        // mirror_created spawns the attach call rather than awaiting it
-        // inline, so poll the store's local mapping instead of a blind sleep.
-        let mut attached = None;
-        for _ in 0..50 {
-            if let Ok(Some(got)) = store.experiments_run_id(&run_id).await {
-                attached = Some(got);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert_eq!(
-            attached.as_deref(),
-            Some(ext_id.as_str()),
-            "must attach to the seeded run, not mint or point at a different one"
+        assert_eq!(exp.sweep_outbox_once().await.expect("sweep"), 0);
+        assert!(
+            pending(&store).await.is_empty(),
+            "a payload that can never parse is dropped, not retried forever"
         );
     }
+
+    #[tokio::test]
+    async fn a_sweep_pass_delivers_every_due_row_and_reports_how_many() {
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        Experiments::at(REFUSED_ORIGIN, store.clone(), PUBLIC_URL, None)
+            .report_created(run_id.clone(), spec, None)
+            .await;
+
+        let server = accepting_server();
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
+        // Nothing is due yet (the failed row is backed off), then it is.
+        assert_eq!(exp.sweep_outbox_once().await.expect("early sweep"), 0);
+        store
+            .mark_outbox_event_failed(pending(&store).await[0].id, "retry now", now_secs() - 1.0)
+            .await
+            .expect("make it due");
+        assert_eq!(exp.sweep_outbox_once().await.expect("sweep"), 1);
+        assert!(pending(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_outbox_loop_keeps_retrying_until_the_event_lands() {
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        Experiments::at(REFUSED_ORIGIN, store.clone(), PUBLIC_URL, None)
+            .report_created(run_id.clone(), spec, None)
+            .await;
+        // Make the row due immediately so the first tick picks it up.
+        store
+            .mark_outbox_event_failed(pending(&store).await[0].id, "retry now", now_secs() - 1.0)
+            .await
+            .expect("make it due");
+
+        let server = accepting_server();
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, None);
+        let loop_task = tokio::spawn(exp.run_outbox_loop(Duration::from_millis(10)));
+        let mut mirrored = false;
+        for _ in 0..100 {
+            if store.experiments_run_id(&run_id).await.unwrap().is_some() {
+                mirrored = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        loop_task.abort();
+        assert!(mirrored, "the loop must deliver the pending create on its own");
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_records_the_error_and_backs_off() {
+        let store = store().await;
+        let (run_id, spec) = queued_run(&store, None).await;
+        let exp = Experiments::at(REFUSED_ORIGIN, store.clone(), PUBLIC_URL, None);
+        exp.report_created(run_id.clone(), spec, None).await;
+
+        assert_eq!(pending(&store).await[0].attempts, 1);
+        assert!(
+            store.due_outbox_events(now_secs(), 50).await.unwrap().is_empty(),
+            "a failed event backs off rather than retrying in a hot loop"
+        );
+        assert!(
+            !store
+                .due_outbox_events(now_secs() + OUTBOX_BASE_BACKOFF_SECS as f64 + 1.0, 50)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and comes due again one backoff later"
+        );
+    }
+
+    // -- fetch_run -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn fetch_run_returns_the_snapshot_submit_from_experiment_builds_on() {
+        let server = FakeHttp::start(|_, _| {
+            Reply::ok(
+                json!({
+                    "status": "queued",
+                    "config": { "entrypoint": "train", "code": { "name": "n", "sha": "s" } },
+                    "budget_seconds": 60,
+                    "unknown_field": "tolerated",
+                })
+                .to_string(),
+            )
+        });
+        let exp = Experiments::at(&server.origin, store().await, PUBLIC_URL, None);
+
+        let snapshot = exp.fetch_run(EXT_RUN, None).await.expect("fetch");
+        assert_eq!(snapshot.status, "queued");
+        assert_eq!(snapshot.budget_seconds, Some(60));
+        assert_eq!(server.requests()[0].path(), format!("/v1/runs/{EXT_RUN}"));
+    }
+
+    #[tokio::test]
+    async fn fetch_run_surfaces_a_miss_with_the_servers_body() {
+        let server = FakeHttp::start(|_, _| Reply::new(404, "no such run"));
+        let exp = Experiments::at(&server.origin, store().await, PUBLIC_URL, None);
+        let error = exp.fetch_run("RUN-nope", None).await.unwrap_err();
+        assert!(error.to_string().contains("fetch run"), "unexpected error: {error}");
+        assert!(error.to_string().contains("no such run"), "unexpected error: {error}");
+    }
+
+    // -- per-user keys -------------------------------------------------------
+
+    const ENCRYPTION_KEY: [u8; 32] = [7u8; 32];
+    const EMAIL: &str = "researcher@example.com";
+
+    async fn user_with_linked_key(store: &Arc<dyn Store>, personal: &str) {
+        store
+            .upsert_user(EMAIL, chuk_train_proto::DEFAULT_TEAM_ID, Role::Write)
+            .await
+            .expect("upsert user");
+        let encrypted = crate::crypto::encrypt(&ENCRYPTION_KEY, personal);
+        store
+            .set_user_experiments_key(EMAIL, Some(&encrypted))
+            .await
+            .expect("link key");
+    }
+
+    #[tokio::test]
+    async fn a_users_own_linked_key_is_preferred_over_the_shared_default() {
+        let server = accepting_server();
+        let store = store().await;
+        user_with_linked_key(&store, "personal-key").await;
+        let (run_id, spec) = queued_run(&store, Some(EMAIL)).await;
+        let exp = Experiments::at(&server.origin, store.clone(), PUBLIC_URL, Some(ENCRYPTION_KEY));
+
+        exp.report_created(run_id, spec, None).await;
+
+        // The ensure always uses the shared default; the run's own reports use
+        // the submitting user's key.
+        let created = server
+            .requests()
+            .into_iter()
+            .find(|r| r.path().ends_with("/runs"))
+            .expect("the create");
+        assert_eq!(created.header("authorization"), "Bearer personal-key");
+        assert_eq!(server.requests()[0].header("authorization"), format!("Bearer {SHARED_KEY}"));
+    }
+
+    #[tokio::test]
+    async fn key_resolution_falls_back_to_the_shared_default_at_every_missing_link() {
+        let store = store().await;
+        let exp = Experiments::at("http://unused", store.clone(), PUBLIC_URL, Some(ENCRYPTION_KEY));
+
+        assert_eq!(exp.bearer_for_email(None).await, SHARED_KEY, "no email");
+        assert_eq!(
+            exp.bearer_for_email(Some("stranger@example.com")).await,
+            SHARED_KEY,
+            "no linked key"
+        );
+        assert_eq!(
+            exp.bearer_for(&RunId("EXEC-nope".into())).await,
+            SHARED_KEY,
+            "no such run"
+        );
+
+        // A linked key that doesn't decrypt with our key (rotated, corrupt)
+        // must not fail the report — it falls back too.
+        store
+            .upsert_user(EMAIL, chuk_train_proto::DEFAULT_TEAM_ID, Role::Write)
+            .await
+            .expect("upsert user");
+        store
+            .set_user_experiments_key(EMAIL, Some("not-even-base64"))
+            .await
+            .expect("link key");
+        assert_eq!(exp.bearer_for_email(Some(EMAIL)).await, SHARED_KEY, "undecryptable");
+    }
+
+    #[tokio::test]
+    async fn the_shared_default_is_used_wholesale_when_per_user_keys_are_off() {
+        let store = store().await;
+        user_with_linked_key(&store, "personal-key").await;
+        let (run_id, _spec) = queued_run(&store, Some(EMAIL)).await;
+        let exp = Experiments::at("http://unused", store.clone(), PUBLIC_URL, None);
+
+        assert_eq!(exp.bearer_for(&run_id).await, SHARED_KEY);
+        assert_eq!(exp.bearer_for_email(Some(EMAIL)).await, SHARED_KEY);
+    }
+
+    // -- from_env ------------------------------------------------------------
+
+    /// Touches the process-global experiments env vars, so it is one test
+    /// rather than several that could interleave, and it takes the shared lock
+    /// against `hub::tests`'s mirror test. The store is built first so the
+    /// guard is never held across an await.
+    #[tokio::test]
+    async fn from_env_is_off_unless_both_the_url_and_a_key_are_set() {
+        let store = store().await;
+        let vars = [
+            env::EXPERIMENTS_URL,
+            env::EXPERIMENTS_API_KEY,
+            env::EXPERIMENTS_PROGRAMME,
+            env::EXPERIMENTS_EXPERIMENT,
+        ];
+        let _guard = lock_experiments_env();
+        let restore: Vec<(&str, Option<String>)> =
+            vars.iter().map(|v| (*v, std::env::var(v).ok())).collect();
+        for var in vars {
+            std::env::remove_var(var);
+        }
+
+        assert!(Experiments::from_env(store.clone(), PUBLIC_URL).is_none(), "nothing set");
+        std::env::set_var(env::EXPERIMENTS_URL, "https://exp.example.com/");
+        assert!(
+            Experiments::from_env(store.clone(), PUBLIC_URL).is_none(),
+            "a url alone is not enough"
+        );
+        std::env::set_var(env::EXPERIMENTS_API_KEY, "write-key");
+        let exp = Experiments::from_env(store.clone(), &format!("{PUBLIC_URL}/")).expect("configured");
+        assert_eq!(exp.base, "https://exp.example.com", "trailing slash trimmed");
+        assert_eq!(exp.public_url, PUBLIC_URL);
+        assert_eq!(exp.programme, DEFAULT_EXPERIMENTS_PROGRAMME);
+        assert_eq!(exp.experiment, DEFAULT_EXPERIMENTS_EXPERIMENT);
+
+        // Explicit programme/experiment slugs override the defaults; blank ones
+        // fall back rather than naming an empty slug.
+        std::env::set_var(env::EXPERIMENTS_PROGRAMME, "  ");
+        std::env::set_var(env::EXPERIMENTS_EXPERIMENT, " my-experiment ");
+        let exp = Experiments::from_env(store, PUBLIC_URL).expect("configured");
+        assert_eq!(exp.programme, DEFAULT_EXPERIMENTS_PROGRAMME);
+        assert_eq!(exp.experiment, "my-experiment");
+
+        for (var, value) in restore {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
+    }
+
+    #[test]
+    fn every_outbox_event_carries_its_own_label() {
+        let meta = Box::new(checkpoint_meta());
+        assert_eq!(
+            OutboxEvent::Created { spec: RunSpec::Train(Box::new(train_spec())), experiment_ref: None }
+                .kind_label(),
+            "created"
+        );
+        assert_eq!(OutboxEvent::State { state: RunState::Running }.kind_label(), "state");
+        assert_eq!(
+            OutboxEvent::Checkpoint { step: 1, uri: "s3://b/k".into(), meta }.kind_label(),
+            "checkpoint"
+        );
+        assert_eq!(OutboxEvent::Result { name: "loss".into(), value: 1.0 }.kind_label(), "result");
+    }
 }
+
+/// Live proof against a real chuk-experiments-server — see
+/// `experiments/tests.rs`. Kept in a `tests.rs` sibling because those checks
+/// are `#[ignore]`d and can never run in CI (they need a real server and a real
+/// write key): the coverage gate excludes `tests.rs` files, so
+/// permanently-unrunnable lines don't count against this module's coverage.
+#[cfg(test)]
+#[path = "experiments/tests.rs"]
+mod live;

@@ -20,6 +20,10 @@ mod datasets;
 mod drive;
 mod gate;
 mod experiments;
+/// Loopback HTTP server shared by the tests of every module that talks to a
+/// remote service (drive, experiments, artifacts::s3, auth).
+#[cfg(test)]
+mod fakehttp;
 mod grant;
 mod hub;
 mod jobspec;

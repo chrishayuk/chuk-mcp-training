@@ -63,7 +63,7 @@ jobs:
         run: cargo test -p chuk-train-controlplane pg_live -- --ignored
 
   coverage:
-    name: coverage (≥90% lines per file, gated + a bootstrap allowlist)
+    name: coverage (≥90% lines, every file)
     runs-on: ubuntu-latest
     # Postgres so the pg adapter's coverage is real, not 0% — the pg_live
     # round-trip is merged into the same coverage run. Mirrors
@@ -97,9 +97,8 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      # Per-file gate (scripts/check_coverage.py): every non-bootstrap-excluded
-      # file >= 90% lines. The bootstrap list (2026-07-24) covers files that
-      # predate this gate and have no tests yet — shrink it, don't grow it.
+      # Per-file gate (scripts/check_coverage.py): every file >= 90% lines, with
+      # no allowlist — see that script for the two structural exclusions.
       - name: Coverage
         run: |
           cargo llvm-cov --no-report --workspace

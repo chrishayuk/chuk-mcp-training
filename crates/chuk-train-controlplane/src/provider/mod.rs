@@ -70,6 +70,20 @@ impl Providers {
         self.map.get(name).cloned()
     }
 
+    /// A registry over drivers supplied directly, keyed by their own `name()`.
+    /// For tests that need a scriptable provider — one that fails a destroy,
+    /// reports an instance the registry doesn't own, or holds a status the
+    /// verification loop must wait out — which `build_providers` cannot make.
+    #[cfg(test)]
+    pub(crate) fn of(drivers: impl IntoIterator<Item = Arc<dyn Provider>>) -> Self {
+        Providers {
+            map: drivers
+                .into_iter()
+                .map(|driver| (driver.name().to_owned(), driver))
+                .collect(),
+        }
+    }
+
     pub fn all(&self) -> impl Iterator<Item = &Arc<dyn Provider>> {
         self.map.values()
     }
