@@ -90,6 +90,38 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   browser (single-use `cj_` token bound to a fresh worker id, lease/labels inputs, copy
   button) and watches the fleet until that id dials home. Proven same-day: a real T4
   joined from a screen-minted cell.
+- **chuk-datasets integration** (2026-07-24, spec `chuk-datasets-spec.md`
+  §6/§7.3/§8.4, cross-repo with the sibling `chuk-datasets-server`) —
+  `TrainSpec.data: Option<DataRef>` (`chuk-train-proto/src/domain.rs`);
+  `assemble_train_job` resolves it dispatch-time via a new `Datasets` client
+  (`chuk-train-controlplane/src/datasets.rs`), gated on
+  `CHUK_DATASETS_URL`/`CHUK_DATASETS_API_KEY` — unlike the best-effort
+  chuk-experiments-server mirror, a run declaring `data:` with no configured
+  client **fails to dispatch** rather than degrading, since the data is
+  required to run at all. Each manifest shard stages as a
+  `wire::InputArtifact` (hash-verified on fetch, the same contract code
+  units already use); `CHUK_DATASET`/`CHUK_PLAN` join the script-env
+  contract. `CheckpointMeta.dataset_sha`/`plan_sha` are new, and
+  `complete_meta` populates them plus the long-dormant `datasets` field
+  from the *resolved* identity, not a trainer-supplied
+  guess — proven by a hub-level test that round-trips a real HTTP resolve
+  call through to checkpoint meta. The worker links `chuk-datasets-client`
+  directly (`chuk-compute-worker/src/inputs.rs`): any input carrying a
+  sha256 (dataset shards) checks the hash-keyed local cache before any
+  network fetch and populates it after a verified one — `CHUK_TRAIN_CACHE`
+  (a long-reserved, previously-unused constant) is now live. Fully backward
+  compatible: `data` is optional and additive. **Cross-repo build fix same
+  day**: `chuk-datasets-client`'s relative path dependency into the sibling
+  repo only resolves when both repos sit as local siblings, which broke CI
+  (clippy/test + the worker build matrix) and
+  would have broken the Fly deploy the same way — fixed by cloning the
+  sibling repo into every CI job that touches the Rust workspace and
+  widening the Fly deploy's Docker build context to the parent directory;
+  verified against the real x86_64 CI runner and Fly's remote builder.
+  **chuk-datasets's Gate G1** (one run end-to-end with `data:` resolution +
+  meta stamped) is code-complete and unit/integration-tested against a mock
+  resolve server, plus the CI/deploy path is proven — not yet run against
+  the live `chuk-datasets-server` deployment with a real worker.
 - **Agent-first MCP surface** (2026-07-20, patterns borrowed from chuk-experiments-server's
   tool design) — `whoami` (role/team/experiments-key-linked, so an agent can predict 403s
   instead of debugging them) and `worker_telemetry` (live `sys/*` sample per worker) expose

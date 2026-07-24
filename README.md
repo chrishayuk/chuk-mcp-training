@@ -65,6 +65,20 @@ and no chuk-experiments-server (reporting mirror off). The harness's own Neon/
 SQLite store + queue are always the source of truth; nothing outside is a hard
 dependency.
 
+**chuk-datasets integration (2026-07-24, cross-repo with the sibling
+[chuk-datasets-server](../chuk-datasets-server)).** A `TrainSpec` can carry a
+`data:` block naming a content-addressed, fingerprinted dataset + batch plan;
+`assemble_train_job` resolves it dispatch-time against chuk-datasets-server
+and stages each manifest shard as a hash-verified input, the same contract
+code units already use. Unlike the other integrations above this one is
+**not** best-effort once opted into: a run that declares `data:` with no
+`CHUK_DATASETS_URL`/`CHUK_DATASETS_API_KEY` configured fails to dispatch
+rather than silently training on nothing. `CheckpointMeta.dataset_sha`/
+`plan_sha` record the resolved (not trainer-claimed) identity. The worker
+links `chuk-datasets-client` directly and caches fetched shards locally by
+hash. Gate G1 (one live end-to-end run) is the remaining proof; see
+`ROADMAP.md`.
+
 **chuk-compute substrate (M1–M4 done).** Underneath the training-first control
 plane the rig is being factored into a **compute fabric**: a permanently
 compute-generic worker + wire protocol (spec `docs/specs/chuk-compute-spec.md`).
@@ -121,7 +135,9 @@ control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
   registry (`mock`, `vast` skeleton). Modules include `store` (SQLite + Postgres
   adapters, each split into per-domain files behind 10 cohesive sub-traits —
   `WorkerStore`/`RunStore`/…), `archive` (Drive tiering + backstop sweep), `drive`
-  (Drive v3 client), `apikey` (RBAC keys + bearer→role resolution), and `dash` (the
+  (Drive v3 client), `apikey` (RBAC keys + bearer→role resolution), `datasets`
+  (the chuk-datasets-server resolve client a `TrainSpec.data:` block dispatches
+  through — gated on `CHUK_DATASETS_URL`/`CHUK_DATASETS_API_KEY`), and `dash` (the
   dashboard — a thin Rust handler inlining `dash/{index.html,dash.css,app.js}`). Builds code units, mints run-scoped upload grants, ingests metrics
   + checkpoints, resumes, auto-archives completed runs, and runs the lease clock
   + reconcile loop that enforce the wall and kill orphans.
