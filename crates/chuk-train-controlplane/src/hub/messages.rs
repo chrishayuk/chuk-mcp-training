@@ -69,16 +69,15 @@ impl Hub {
                 // watchdog convergence note in control.rs::evaluate_gates).
                 // seq dedup only catches replays at-or-below the high-water;
                 // a genuinely new JobStarted for an already-terminal run must
-                // not resurrect it.
-                let live = self
+                // not resurrect it. A separate read-then-transition here would
+                // leave a window where a concurrent JobExited/JobKilled lands
+                // between the two, so the liveness check and the write must be
+                // one atomic store operation (transition_if_live), not two.
+                if self
                     .store
-                    .run(&run_id)
+                    .transition_if_live(&run_id, RunState::Running, Some(worker_id))
                     .await?
-                    .is_some_and(|run| !run.summary.state.is_terminal());
-                if live {
-                    self.store
-                        .transition(&run_id, RunState::Running, Some(worker_id), None, Value::Null)
-                        .await?;
+                {
                     self.mirror_state(&run_id, RunState::Running);
                 } else {
                     warn!(run = %run_id.0, %worker_id, "JobStarted for terminal run; ignoring (stale/replayed)");

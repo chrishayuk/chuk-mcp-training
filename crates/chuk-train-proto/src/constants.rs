@@ -49,6 +49,14 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 pub const HEARTBEAT_PREEMPT_TIMEOUT: Duration = Duration::from_secs(600);
 /// How often the control plane sweeps the fleet for heartbeat-lost workers.
 pub const HEARTBEAT_REAP_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a run may sit `Assigned` without a `JobStarted` confirmation
+/// before the control plane gives up on that dispatch and requeues it.
+/// Backstops a link that looks open (the worker's outbound channel accepted
+/// the `AssignJob` write) but has actually gone stale underneath, so the
+/// worker never received it and nothing would otherwise move the run again.
+/// Comfortably longer than any real assign round trip, far shorter than
+/// [`HEARTBEAT_PREEMPT_TIMEOUT`] since this backstops a different failure.
+pub const ASSIGNMENT_STUCK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the control plane retains a worker's host-telemetry samples
 /// (chuk-compute M4) — the sparkline window; older samples are pruned on write.
 pub const WORKER_SAMPLE_RETENTION: Duration = Duration::from_secs(15 * 60);

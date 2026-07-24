@@ -156,6 +156,54 @@ impl Hub {
         ))
     }
 
+    /// Requeue any run stuck in `Assigned` past [`chuk_train_proto::ASSIGNMENT_STUCK_TIMEOUT`]
+    /// without a `JobStarted` confirmation. `Hub::send_to` only confirms that
+    /// the worker's local outbound channel accepted the write, not that the
+    /// websocket actually delivered it — a link that still looks open in
+    /// `links` can have gone stale underneath, silently swallowing an
+    /// `AssignJob` with nothing else left to ever move the run off `Assigned`
+    /// (live-observed: a throwaway probe run sat `Assigned` well past its own
+    /// job timeout while the worker's heartbeat stayed fresh). Same backstop
+    /// shape as `reap_stale_workers`, for this different failure mode.
+    pub async fn reap_stuck_assignments(&self) -> Result<()> {
+        self.reap_stuck_assignments_older_than(ASSIGNMENT_STUCK_TIMEOUT.as_secs_f64())
+            .await
+    }
+
+    /// Test seam for [`Self::reap_stuck_assignments`]: takes the max age
+    /// directly so a test can force an immediate sweep instead of waiting out
+    /// the real timeout.
+    pub(super) async fn reap_stuck_assignments_older_than(&self, max_age_s: f64) -> Result<()> {
+        let assigned = crate::store::RunQuery {
+            state: Some(RunState::Assigned),
+            ..Default::default()
+        };
+        let cutoff = now() - max_age_s;
+        for summary in self.store.runs(&assigned, QUEUE_SCAN_LIMIT).await? {
+            if summary.updated_at > cutoff {
+                continue;
+            }
+            warn!(
+                run = %summary.id.0, worker = ?summary.worker_id,
+                "assignment never confirmed; requeueing"
+            );
+            self.grants.revoke_run(&summary.id);
+            if let Some(worker_id) = &summary.worker_id {
+                self.store.set_worker_run(worker_id, None).await?;
+            }
+            self.store
+                .transition(
+                    &summary.id,
+                    RunState::Queued,
+                    None,
+                    None,
+                    serde_json::json!({ "reason": "assignment_timed_out" }),
+                )
+                .await?;
+        }
+        self.pump().await
+    }
+
     /// Dispatch-time `data:` resolution (spec §6/§7.3): pre-warm the resolve
     /// call the worker's own client would otherwise make on first fetch, so
     /// the common case never blocks on the chuk-datasets server. Records the
@@ -221,4 +269,11 @@ pub(super) fn dataset_label(asked: &str, content_sha: &str) -> String {
         Some((name, _)) => format!("{name}@sha256:{content_sha}"),
         None => format!("sha256:{content_sha}"),
     }
+}
+
+fn now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs_f64()
 }

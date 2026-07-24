@@ -145,6 +145,19 @@ pub trait RunStore: Send + Sync {
         detail: serde_json::Value,
     ) -> Result<()>;
 
+    /// Like [`Self::transition`], but the liveness check and the write are one
+    /// atomic operation: it only applies if the run is not already in a
+    /// terminal state, and reports whether it did. Use this instead of a
+    /// separate read-then-`transition` when the caller cannot tolerate a
+    /// concurrent finalisation (e.g. a `JobExited`/`JobKilled` landing between
+    /// the read and the write) resurrecting an already-terminal run.
+    async fn transition_if_live(
+        &self,
+        run_id: &RunId,
+        state: RunState,
+        worker_id: Option<&WorkerId>,
+    ) -> Result<bool>;
+
     async fn next_queued(&self) -> Result<Option<RunRecord>>;
 
     async fn run(&self, run_id: &RunId) -> Result<Option<RunRecord>>;
@@ -514,4 +527,84 @@ pub async fn open_store(spec: &str) -> Result<Box<dyn Store>> {
         anyhow::bail!("redis store backend is reserved for M2+; use sqlite or postgres for now");
     }
     Ok(Box::new(SqliteStore::open(spec).await?))
+}
+
+#[cfg(test)]
+mod open_store_tests {
+    use super::*;
+
+    /// `sqlite:` explicit scheme: the prefix is stripped and the remainder
+    /// handed to the SQLite backend verbatim, so `sqlite::memory:` opens a
+    /// private in-memory db (the sqlite adapter's own `mem_store()` helper
+    /// uses the same `:memory:` path, just without the scheme prefix here).
+    #[tokio::test]
+    async fn sqlite_scheme_opens_a_working_store() {
+        let store = open_store("sqlite::memory:").await.expect("open sqlite: scheme");
+        // Prove it's not just "didn't error" — the returned store is a real,
+        // usable `dyn Store` backed by a live SQLite pool.
+        let run = store
+            .create_run(
+                "r",
+                &RunSpec::Shell(chuk_train_proto::ShellSpec {
+                    command: "echo hi".into(),
+                    timeout_s: 60,
+                }),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create_run on dispatched store");
+        assert!(run.0.starts_with("EXEC-"), "{}", run.0);
+    }
+
+    /// A bare path with no recognised scheme falls back to SQLite — the
+    /// default for M0's single-machine deploy.
+    #[tokio::test]
+    async fn bare_path_falls_back_to_sqlite() {
+        let store = open_store(":memory:").await.expect("open bare path");
+        assert!(store.fleet().await.expect("fleet on fallback store").is_empty());
+    }
+
+    /// `redis:` is a reserved-but-unimplemented scheme: dispatch must refuse
+    /// it with a clear error rather than silently falling through to SQLite.
+    #[tokio::test]
+    async fn redis_scheme_is_rejected() {
+        let result = open_store("redis://localhost:6379").await;
+        let err = result.err().expect("redis backend must not be selectable yet");
+        assert!(
+            err.to_string().contains("redis"),
+            "error should name the unsupported backend: {err}"
+        );
+    }
+
+    /// `postgres:`/`postgresql:` both dispatch to the Postgres backend. We
+    /// don't have a live Postgres in this unit test, but pointing at a port
+    /// nothing listens on proves the branch was taken (it attempts — and
+    /// fails — a Postgres connection) rather than silently falling back to
+    /// SQLite or bailing on scheme detection.
+    #[tokio::test]
+    async fn postgres_scheme_dispatches_to_the_postgres_backend() {
+        // `Box<dyn Store>` isn't `Debug`, so `expect_err` can't be used on the
+        // `Result` directly — pull the error out via `.err()` instead. An
+        // out-of-range port fails `PgConnectOptions` parsing synchronously
+        // (no real connection attempt), so this stays fast and network-free
+        // while still proving dispatch reached the Postgres branch.
+        let result = open_store("postgres://user:pass@127.0.0.1:99999/nope").await;
+        let err = result
+            .err()
+            .expect("an out-of-range port must fail to parse as connect options");
+        // A dispatch bug (e.g. falling through to sqlite/redis) would produce
+        // a different failure shape than a Postgres connect-options error.
+        assert!(!err.to_string().contains("redis"));
+    }
+
+    #[tokio::test]
+    async fn postgresql_scheme_dispatches_to_the_postgres_backend() {
+        let result = open_store("postgresql://user:pass@127.0.0.1:99999/nope").await;
+        let err = result
+            .err()
+            .expect("an out-of-range port must fail to parse as connect options");
+        assert!(!err.to_string().contains("redis"));
+    }
 }

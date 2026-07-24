@@ -469,12 +469,30 @@ mod pg_live {
         let rec = store.run(&run_id).await.expect("run").expect("some");
         assert_eq!(rec.summary.name, "pg-live");
         assert!(matches!(rec.summary.state, RunState::Queued));
+        // next_queued must actually decode a genuinely queued row (not just
+        // run the query) — the scheduler's dispatch loop depends on this
+        // closure (row → RunRecord) really executing, not short-circuiting.
+        let next = store
+            .next_queued()
+            .await
+            .expect("next_queued")
+            .expect("the just-created run is queued");
+        assert_eq!(next.summary.id, run_id);
         store
             .transition(&run_id, RunState::Running, Some(&wid), None, serde_json::json!({}))
             .await
             .expect("transition");
         let rec2 = store.run(&run_id).await.expect("run").expect("some");
         assert!(matches!(rec2.summary.state, RunState::Running));
+        // transition_if_live: the liveness check and the write are one
+        // atomic UPDATE — a live (non-terminal) run accepts the transition.
+        assert!(
+            store
+                .transition_if_live(&run_id, RunState::Running, Some(&wid))
+                .await
+                .expect("transition_if_live"),
+            "a live run must accept the transition"
+        );
         assert!(store
             .runs(&Default::default(), 5)
             .await
@@ -689,6 +707,88 @@ mod pg_live {
         store.touch_worker_token(&tid, now()).await.expect("touch_wt");
         assert!(store.revoke_worker_token(&tid).await.expect("revoke_wt"));
 
+        // sweeps (store/postgres/sweeps.rs): create/read plus the
+        // active-children count the scheduler caps concurrency against —
+        // Assigned/Running children hold a slot, Queued and terminal
+        // children don't.
+        assert!(
+            store.sweep("SWEEP-does-not-exist").await.expect("sweep").is_none(),
+            "an unknown sweep id must read back as None, not an error"
+        );
+        let sweep_id = store
+            .create_sweep(
+                "pg-live-sweep",
+                r#"{"kind":"shell"}"#,
+                r#"[{"lr":0.1},{"lr":0.2}]"#,
+                2,
+                Some("chris@example.com"),
+            )
+            .await
+            .expect("create_sweep");
+        assert!(sweep_id.starts_with("SWEEP-"), "{}", sweep_id);
+        let sweep_row = store.sweep(&sweep_id).await.expect("sweep").expect("some");
+        assert_eq!(sweep_row.id, sweep_id);
+        assert_eq!(sweep_row.name, "pg-live-sweep");
+        assert_eq!(sweep_row.template, r#"{"kind":"shell"}"#);
+        assert_eq!(sweep_row.axes, r#"[{"lr":0.1},{"lr":0.2}]"#);
+        assert_eq!(sweep_row.concurrency, 2);
+        assert_eq!(sweep_row.created_by.as_deref(), Some("chris@example.com"));
+        assert_eq!(store.sweep_active_children(&sweep_id).await.expect("active"), 0);
+        let child_a = store
+            .create_run("child-a", &spec, None, None, Some(&sweep_id))
+            .await
+            .expect("child a");
+        let child_b = store
+            .create_run("child-b", &spec, None, None, Some(&sweep_id))
+            .await
+            .expect("child b");
+        let child_c = store
+            .create_run("child-c", &spec, None, None, Some(&sweep_id))
+            .await
+            .expect("child c");
+        store
+            .transition(&child_a, RunState::Assigned, None, None, serde_json::json!({}))
+            .await
+            .expect("transition a");
+        store
+            .transition(&child_b, RunState::Running, None, None, serde_json::json!({}))
+            .await
+            .expect("transition b");
+        // child_c is left Queued.
+        assert_eq!(
+            store.sweep_active_children(&sweep_id).await.expect("active"),
+            2,
+            "Assigned + Running count; Queued does not"
+        );
+        store
+            .transition(&child_a, RunState::Completed, None, Some(0), serde_json::json!({}))
+            .await
+            .expect("transition a done");
+        assert_eq!(
+            store.sweep_active_children(&sweep_id).await.expect("active"),
+            1,
+            "a completed child no longer holds a concurrency slot"
+        );
+
+        // transition_if_live must refuse to resurrect an already-terminal
+        // run — the exact race a JobExited/JobKilled landing after
+        // finalisation would otherwise open. Nothing later in this test
+        // depends on run_id staying Running, so finalise it here.
+        store
+            .transition(&run_id, RunState::Completed, None, Some(0), serde_json::json!({}))
+            .await
+            .expect("finalise run_id");
+        let resurrect_attempt = store
+            .transition_if_live(&run_id, RunState::Running, Some(&wid))
+            .await
+            .expect("transition_if_live after terminal");
+        assert!(!resurrect_attempt, "a terminal run must not be resurrected");
+        let rec_terminal = store.run(&run_id).await.expect("run").expect("some");
+        assert!(
+            matches!(rec_terminal.summary.state, RunState::Completed),
+            "state must stay terminal, not get overwritten by the refused transition"
+        );
+
         // cleanup — remove this test's rows so a shared DB stays tidy
         let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.expect("cleanup pool");
         for stmt in [
@@ -710,6 +810,11 @@ mod pg_live {
         ] {
             sqlx::query(stmt).bind(&wid.0).execute(&pool).await.expect("cleanup worker rows");
         }
+        for id in [&child_a, &child_b, &child_c] {
+            let _ = sqlx::query("DELETE FROM run_events WHERE run_id = $1").bind(&id.0).execute(&pool).await;
+            let _ = sqlx::query("DELETE FROM runs WHERE id = $1").bind(&id.0).execute(&pool).await;
+        }
+        let _ = sqlx::query("DELETE FROM sweeps WHERE id = $1").bind(&sweep_id).execute(&pool).await;
         let _ = sqlx::query("DELETE FROM code_units WHERE name = $1").bind(&cu_name).execute(&pool).await;
         let _ = sqlx::query("DELETE FROM api_keys WHERE team_id = $1").bind(&team).execute(&pool).await;
         let _ = sqlx::query("DELETE FROM users WHERE team_id = $1").bind(&team).execute(&pool).await;

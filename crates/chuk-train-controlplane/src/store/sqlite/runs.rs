@@ -178,6 +178,42 @@ impl RunStore for SqliteStore {
             .await
     }
 
+    async fn transition_if_live(
+        &self,
+        run_id: &RunId,
+        state: RunState,
+        worker_id: Option<&WorkerId>,
+    ) -> Result<bool> {
+        // The liveness check rides the UPDATE's WHERE clause, so a concurrent
+        // finalisation (JobExited/JobKilled) landing between a caller's read
+        // and write can no longer be clobbered by this write: either this
+        // UPDATE lands first and the finaliser's own WHERE-guarded write (if
+        // any) takes precedence after, or the finalisation already landed and
+        // this one simply matches zero rows.
+        let result = sqlx::query(
+            "UPDATE runs SET state = ?1, updated_at = ?2,
+               worker_id = COALESCE(?3, worker_id)
+             WHERE id = ?4 AND state NOT IN ('completed', 'failed', 'cancelled')",
+        )
+        .bind(state.as_str())
+        .bind(now())
+        .bind(worker_id.map(|w| w.0.as_str()))
+        .bind(&run_id.0)
+        .execute(&self.pool)
+        .await?;
+
+        let applied = result.rows_affected() > 0;
+        if applied {
+            let mut event_detail = serde_json::Value::Null;
+            if let Some(w) = worker_id {
+                merge_field(&mut event_detail, "worker", serde_json::json!(w.0));
+            }
+            self.add_event(run_id, EventKind::from(state), event_detail)
+                .await?;
+        }
+        Ok(applied)
+    }
+
     async fn next_queued(&self) -> Result<Option<RunRecord>> {
         let row = sqlx::query("SELECT * FROM runs WHERE state = ?1 ORDER BY created_at LIMIT 1")
             .bind(RunState::Queued.as_str())
