@@ -88,3 +88,105 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use chuk_train_proto::env;
+
+    use super::*;
+
+    // These four vars aren't read anywhere else in this crate's test suite
+    // (they're only sourced from `.env` by the `main.rs` binary entrypoint,
+    // never by `cargo test`), so a dedicated env-var mutex would be overkill
+    // for one test — same reasoning as `datasets::tests::from_env_is_none_…`.
+    fn clear_s3_env() {
+        std::env::remove_var(env::S3_ENDPOINT);
+        std::env::remove_var(env::S3_REGION);
+        std::env::remove_var(env::S3_ACCESS_KEY_ID);
+        std::env::remove_var(env::S3_SECRET_ACCESS_KEY);
+    }
+
+    #[test]
+    fn file_scheme_and_bare_path_both_select_the_filesystem_backend() {
+        let scheme = open_artifact_store("file:/tmp/chuk-train-artifacts").unwrap();
+        assert_eq!(
+            scheme.uri("ckpt-hot/run-1/step-10.pt"),
+            "file:///tmp/chuk-train-artifacts/ckpt-hot/run-1/step-10.pt"
+        );
+
+        // No recognised scheme at all still resolves to the filesystem
+        // backend, treating the whole spec as a root path.
+        let bare = open_artifact_store("/tmp/chuk-train-artifacts").unwrap();
+        assert_eq!(
+            bare.uri("ckpt-hot/run-1/step-10.pt"),
+            "file:///tmp/chuk-train-artifacts/ckpt-hot/run-1/step-10.pt"
+        );
+    }
+
+    // Both cases below touch the same four process-global env vars, so they
+    // live in one #[test] (run sequenced, not interleaved with a sibling
+    // test) rather than two — see `clear_s3_env`'s doc comment.
+    #[test]
+    fn s3_backend_requires_credentials_then_selects_and_strips_the_bucket() {
+        clear_s3_env();
+
+        // No credentials at all: refused, naming the missing var.
+        let result = open_artifact_store("s3://my-bucket");
+        let Err(err) = result else {
+            panic!("expected missing S3 credentials to error");
+        };
+        assert!(
+            err.to_string().contains(env::S3_ENDPOINT),
+            "expected the missing-endpoint error to name {}, got: {err}",
+            env::S3_ENDPOINT
+        );
+
+        std::env::set_var(env::S3_ENDPOINT, "https://example.r2.cloudflarestorage.com");
+        std::env::set_var(env::S3_ACCESS_KEY_ID, "test-access-key");
+        std::env::set_var(env::S3_SECRET_ACCESS_KEY, "test-secret-key");
+
+        // `s3://bucket` and `r2://bucket` both strip the leading `//` down to
+        // a bare bucket name, and both dispatch to the S3-compatible backend
+        // (R2 is just S3 with a different endpoint) — its `uri()` is always
+        // `s3://`-prefixed regardless of which scheme opened it.
+        let s3 = open_artifact_store("s3://my-bucket").unwrap();
+        assert_eq!(s3.uri("k"), "s3://my-bucket/k");
+
+        let r2 = open_artifact_store("r2://my-bucket").unwrap();
+        assert_eq!(r2.uri("k"), "s3://my-bucket/k");
+
+        clear_s3_env();
+    }
+
+    #[tokio::test]
+    async fn filesystem_backend_has_no_lifecycle_or_presigning() {
+        // The filesystem backend doesn't override the trait's defaults (only
+        // the S3/R2 backend does — it serves bytes itself, so there's no
+        // expiry timer or direct-transfer URL to hand out).
+        let store = open_artifact_store("file:/tmp/chuk-train-artifacts").unwrap();
+        store
+            .apply_lifecycle(&[("ckpt-hot/".to_owned(), 1)])
+            .await
+            .expect("apply_lifecycle is a no-op, not an error");
+        assert_eq!(
+            store.presign_get("k", Duration::from_secs(60)).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            store.presign_put("k", Duration::from_secs(60)).await.unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+}

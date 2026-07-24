@@ -112,3 +112,52 @@ pub fn build_providers(
     }
     Providers { map }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selects_known_providers_by_name() {
+        let providers = build_providers("mock,vast", None, None);
+        assert_eq!(providers.names(), vec!["mock".to_owned(), "vast".to_owned()]);
+        assert_eq!(providers.get(mock::NAME).unwrap().name(), mock::NAME);
+        assert_eq!(providers.get(vast::NAME).unwrap().name(), vast::NAME);
+        assert_eq!(providers.all().count(), 2);
+    }
+
+    #[test]
+    fn names_are_sorted_regardless_of_selection_order() {
+        // "vast" sorts after "mock" lexicographically; selecting them in the
+        // opposite order must not leak through to `names()`.
+        let providers = build_providers("vast,mock", None, None);
+        assert_eq!(providers.names(), vec!["mock".to_owned(), "vast".to_owned()]);
+    }
+
+    #[test]
+    fn trims_whitespace_and_collapses_duplicate_entries() {
+        let providers = build_providers(" mock , mock ,mock", None, None);
+        assert_eq!(providers.names(), vec!["mock".to_owned()]);
+    }
+
+    #[test]
+    fn blank_entries_between_commas_are_skipped() {
+        let providers = build_providers("mock,,", None, None);
+        assert_eq!(providers.names(), vec!["mock".to_owned()]);
+    }
+
+    #[test]
+    fn unknown_provider_name_is_skipped_not_errored() {
+        let providers = build_providers("mock,bogus", None, None);
+        assert_eq!(providers.names(), vec!["mock".to_owned()]);
+        assert!(providers.get("bogus").is_none());
+    }
+
+    #[test]
+    fn empty_selection_yields_an_empty_registry() {
+        let providers = build_providers("", None, None);
+        assert!(providers.names().is_empty());
+        assert_eq!(providers.all().count(), 0);
+        assert!(providers.get(mock::NAME).is_none());
+    }
+}

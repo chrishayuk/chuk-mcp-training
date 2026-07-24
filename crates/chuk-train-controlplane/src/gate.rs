@@ -308,4 +308,63 @@ mod tests {
         let improving = obs(&[(0.0, 2.0), (130.0, 1.5), (170.0, 1.8)]);
         assert!(!evaluate(&expr, &improving, 200.0).tripped);
     }
+
+    #[test]
+    fn threshold_supports_ge_lt_le_not_just_gt() {
+        // threshold_compares_the_latest_value only exercises `>`, and the
+        // three-forms test only parses `<=` without evaluating it — so
+        // CmpOp::apply/as_str's Ge/Lt/Le arms are otherwise never hit.
+        let ge = parse("last(loss) >= 3").unwrap();
+        assert_eq!(ge, GateExpr::Threshold { key: "loss".into(), op: CmpOp::Ge, value: 3.0 });
+        let verdict = evaluate(&ge, &obs(&[(0.0, 3.0)]), 10.0);
+        assert!(verdict.tripped);
+        assert!(verdict.detail.contains(">="));
+
+        let lt = parse("last(loss) < 3").unwrap();
+        assert_eq!(lt, GateExpr::Threshold { key: "loss".into(), op: CmpOp::Lt, value: 3.0 });
+        let verdict = evaluate(&lt, &obs(&[(0.0, 2.0)]), 10.0);
+        assert!(verdict.tripped);
+        assert!(!verdict.detail.contains("<="), "expected bare `<`, got {:?}", verdict.detail);
+
+        let le = parse("last(loss) <= 3").unwrap();
+        let verdict = evaluate(&le, &obs(&[(0.0, 3.0)]), 10.0);
+        assert!(verdict.tripped);
+        assert!(verdict.detail.contains("<="));
+
+        // The flip side of each: comparison false, verdict not tripped.
+        assert!(!evaluate(&ge, &obs(&[(0.0, 2.0)]), 10.0).tripped);
+        assert!(!evaluate(&lt, &obs(&[(0.0, 3.0)]), 10.0).tripped);
+    }
+
+    #[test]
+    fn threshold_evaluates_to_no_data_verdict_when_history_is_empty() {
+        // isnan_trips_on_non_finite_only covers the IsNan arm's empty-history
+        // path; the Threshold arm has its own `None => no_data(key)` branch.
+        let expr = parse("last(loss) > 3").unwrap();
+        let verdict = evaluate(&expr, &[], 10.0);
+        assert!(!verdict.tripped);
+        assert_eq!(verdict.last_value, None);
+        assert!(verdict.detail.contains("no observations of loss"));
+    }
+
+    #[test]
+    fn isnan_rejects_an_invalid_metric_key() {
+        assert!(parse("isnan(last(bad key!))").is_err());
+    }
+
+    #[test]
+    fn no_improve_rejects_a_missing_close_paren_and_an_invalid_key() {
+        // Starts with the no_improve prefix but never closes: the
+        // strip_suffix(")") lookup fails before the window is even parsed.
+        assert!(parse("no_improve(loss, 120min").is_err());
+        // Closes fine, but the key itself has disallowed characters.
+        assert!(parse("no_improve(bad key!, 120min)").is_err());
+    }
+
+    #[test]
+    fn threshold_rejects_an_expression_missing_last_close_paren() {
+        // Starts with the last( prefix but there's no `)` anywhere in the
+        // rest of the string, so split_once(")") fails.
+        assert!(parse("last(loss > 3").is_err());
+    }
 }
