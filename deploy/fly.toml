@@ -1,6 +1,7 @@
 # chuk-mcp-training control plane (spec §13).
-# Deploy from the repo root:
-#   fly deploy -c deploy/fly.toml --dockerfile deploy/Dockerfile
+# Deploy from the PARENT of this repo, with chuk-datasets-server checked out
+# as a sibling (chuk-datasets-client is a path dependency into it):
+#   cd .. && fly deploy -c chuk-mcp-training/deploy/fly.toml --dockerfile chuk-mcp-training/deploy/Dockerfile
 
 app = "chuk-mcp-training"
 primary_region = "lhr"
