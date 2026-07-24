@@ -62,6 +62,51 @@ jobs:
           CHUK_TRAIN_STORE: postgresql://postgres:test@localhost:5432/chuktest
         run: cargo test -p chuk-train-controlplane pg_live -- --ignored
 
+  coverage:
+    name: coverage (≥90% lines per file, gated + a bootstrap allowlist)
+    runs-on: ubuntu-latest
+    # Postgres so the pg adapter's coverage is real, not 0% — the pg_live
+    # round-trip is merged into the same coverage run. Mirrors
+    # chuk-datasets-server's coverage job.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: chuktest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout sibling chuk-datasets-server (path dependency)
+        run: git clone --depth 1 https://github.com/chrishayuk/chuk-datasets-server.git "${{ github.workspace }}/../chuk-datasets-server"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Per-file gate (scripts/check_coverage.py): every non-bootstrap-excluded
+      # file >= 90% lines. The bootstrap list (2026-07-24) covers files that
+      # predate this gate and have no tests yet — shrink it, don't grow it.
+      - name: Coverage
+        run: |
+          cargo llvm-cov --no-report --workspace
+          CHUK_TRAIN_STORE=postgresql://postgres:test@localhost:5432/chuktest \
+            cargo llvm-cov --no-report -p chuk-train-controlplane -- pg_live --ignored
+          cargo llvm-cov report --json | python3 scripts/check_coverage.py
+
   # chuk-compute M2: build the worker for every distributed target (the
   # SUPPORTED_TARGETS matrix). Linux-musl via cargo-zigbuild; darwin natively on
   # a macOS runner. Uploads each binary as an artifact for the release / image.
