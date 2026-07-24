@@ -55,6 +55,11 @@ the protocol settles); the only discipline required is that the worker's Cargo.t
 `chuk-compute-wire` alone, which keeps a later repo extraction trivial. The repo keeps its name
 — that is the product (the training rig); these crates are its substrate.
 
+Both crates carry the workspace's engineering bar: **≥90% line coverage per file**, gated in
+CI with no allowlist, plus the lexical guards below. The worker's own third-party edges (its
+HTTP client, input staging, self-update) are tested against loopback servers rather than
+mocked, so the assertions are on real requests.
+
 ## 3. Protocol, handshake, self-update
 
 Before anything else the worker sends `Hello { protocol_version, worker_semver, target_triple,

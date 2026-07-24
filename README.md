@@ -1,7 +1,7 @@
 # chuk-mcp-training
 
 MCP-controlled remote training harness for Colab and rented single GPUs.
-Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.8) · status + plan: `ROADMAP.md`.
+Spec: `docs/specs/chuk-mcp-training-spec.md` (v0.9) · status + plan: `ROADMAP.md`.
 
 Milestones **M0–M2** are built and **M4 (budgets + watchdogs)** and the first
 slice of **M5 (sweeps)** are code-complete; the control plane is deployed on Fly
@@ -171,6 +171,8 @@ control-plane side) and are mirrored in `chuk_train_mcp/constants.py` (Python).
   (loss/lr/grad_norm/tokens_per_s/tflops) + logs, writes checkpoints, resumes.
 - `scripts/demo.sh` — one-command local demo: a CP + mock workers running the
   stub-trainer so the dashboard fills with live data (isolated from prod).
+- `scripts/check_coverage.py` — the per-file coverage gate CI runs (see
+  *Tests & coverage*).
 - `scripts/authorize-drive.py` — one-time `drive.file` offline auth → refresh token.
 - `bootstrap/colab_cell.py` — the one Colab cell that joins a T4 as a worker (E0).
 - `deploy/` — Dockerfile + fly.toml for the control plane (`auto_stop_machines =
@@ -215,11 +217,18 @@ Full runbook: **[docs/E0-colab.md](docs/E0-colab.md)**. In short:
 
 ```bash
 fly launch --no-deploy --copy-config -c deploy/fly.toml
-fly volumes create chuk_train_data --size 1 -c deploy/fly.toml
 fly secrets set -c deploy/fly.toml CHUK_TRAIN_API_TOKEN=$(openssl rand -hex 24) \
                                    CHUK_TRAIN_JOIN_TOKEN=$(openssl rand -hex 24)
-fly deploy -c deploy/fly.toml --dockerfile deploy/Dockerfile
+
+# Deploy from the PARENT directory, with chuk-datasets-server checked out as a
+# sibling: chuk-datasets-client is a path dependency into it, so the Docker
+# build context spans both repos (deploy/Dockerfile). This is what CI does.
+(cd .. && fly deploy -c chuk-mcp-training/deploy/fly.toml \
+                     --dockerfile chuk-mcp-training/deploy/Dockerfile)
 ```
+
+In practice you rarely run that by hand — a green push to `main` auto-deploys
+(see *Tests & coverage* below).
 
 The Fly image builds both binaries and the **control plane serves the worker per
 target** at `/agent/{triple}` (+ `.sha256`), with a one-shot **`/install.sh`** that
@@ -326,6 +335,62 @@ per-checkpoint URL resolves R2-or-Drive. Trigger/inspect via `archive_run`,
 `archive_runs`, `archive_status`. (The two R2 lifecycle rules are live on the
 bucket; the CP's boot-time apply merges with existing rules rather than
 replacing them, and will self-manage once its token gains lifecycle permission.)
+
+## Tests & coverage
+
+```bash
+cargo test --workspace          # unit + integration; the #[ignore]d live tests stay skipped
+cargo clippy --workspace --all-targets
+```
+
+**Every file in the Rust workspace holds ≥90% line coverage** — enforced per
+file by `scripts/check_coverage.py` in CI, with **no allowlist** (2026-07-25:
+the last six exempted files were paid down). The only structural exclusions are
+`src/main.rs` (env + serve loop, no logic) and `examples/`; the reason for each
+lives in the script, not in CI config.
+
+The two Python packages are **not** gated yet: `mcp/` has no test suite at all,
+and `introspect/`'s tests exist but no CI job runs them (the workflow is
+cargo-only). That's the open gap in the house rule — see `ROADMAP.md`'s
+hardening backlog. To reproduce the Rust gate locally:
+
+```bash
+cargo llvm-cov clean --workspace        # stale profile data silently merges otherwise
+cargo llvm-cov --no-report --workspace
+# the Postgres adapter needs a real server — CI uses a service container:
+CHUK_TRAIN_STORE=postgresql://postgres:test@localhost:5432/chuktest \
+  cargo llvm-cov --no-report -p chuk-train-controlplane -- pg_live --ignored
+cargo llvm-cov report --json | python3 scripts/check_coverage.py
+```
+
+Conventions worth knowing before adding tests:
+
+- **Fakes over mocks, at the socket.** Anything that talks to a remote service
+  is tested against a loopback HTTP server (`chuk-train-controlplane/src/fakehttp.rs`,
+  test-only) rather than a mocked client: Drive, the experiments mirror, S3/R2
+  (a real `aws-sdk-s3` client pointed at a fake bucket), and Google sign-in all
+  sign and send real requests, so the tests assert the wire shape we actually
+  produce. The worker websocket is likewise driven end-to-end against a real
+  axum server over a real socket.
+- **Live tests live in `tests.rs`.** Checks that need third-party credentials
+  CI can't hold (R2, Drive, chuk-experiments-server) stay `#[ignore]`d in a
+  `tests.rs` sibling — `drive/tests.rs`, `experiments/tests.rs`,
+  `artifacts/s3/tests.rs`. cargo-llvm-cov excludes those files, so code CI can
+  never run doesn't count against a module's coverage. They still compile
+  (clippy checks them) and run with `-- --ignored` when you have the
+  credentials. The Postgres adapter is the deliberate exception: `pg_live` is
+  `#[ignore]`d but CI *does* run it against a throwaway `postgres:16` service,
+  so it stays inline and counted like any other test.
+- **Process-global env vars take a lock.** Tests that mutate shared env
+  (`CHUK_TRAIN_S3_*`, `CHUK_EXPERIMENTS_*`) go through `lock_s3_env()` /
+  `lock_experiments_env()` so cargo's default parallelism can't interleave them.
+- **Deterministic timings.** No sleeping out production constants: the lease
+  manager's destroy-verification window is injected (`VerifyPolicy`) and reaper
+  thresholds come from `Config`.
+
+CI (`.github/workflows/ci.yml`) runs clippy, the test suite (plus the Postgres
+adapter against a `postgres:16` service), the coverage gate, and the worker
+target matrix; a green push to `main` auto-deploys both Fly apps.
 
 ## Current limits (deliberate — see spec §14)
 
