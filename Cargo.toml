@@ -15,6 +15,9 @@ license = "MIT"
 [workspace.dependencies]
 chuk-compute-wire = { path = "crates/chuk-compute-wire" }
 chuk-train-proto = { path = "crates/chuk-train-proto" }
+# Sibling repo, checked out alongside this one (spec: chuk-datasets-spec.md §6) —
+# the worker-client crate the harness worker and control plane link.
+chuk-datasets-client = { path = "../chuk-datasets-server/crates/chuk-datasets-client" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"

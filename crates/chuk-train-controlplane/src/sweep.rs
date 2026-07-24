@@ -146,6 +146,7 @@ mod tests {
             config: None,
             overrides: serde_json::json!({ "lr": 0.1 }),
             artifacts_in: Vec::new(),
+            data: None,
             checkpoint: Default::default(),
             seed: None,
             arch: None,

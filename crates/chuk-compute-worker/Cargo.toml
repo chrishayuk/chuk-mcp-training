@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 chuk-compute-wire = { workspace = true }
+chuk-datasets-client = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }

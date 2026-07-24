@@ -28,6 +28,24 @@ impl CodeUnitManifest {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entrypoint_looks_up_by_name_and_misses_cleanly() {
+        let manifest = CodeUnitManifest {
+            name: "unit".into(),
+            version: "".into(),
+            entrypoints: BTreeMap::from([("train".to_owned(), "python train.py".to_owned())]),
+            python: None,
+            requires: UnitRequires::default(),
+        };
+        assert_eq!(manifest.entrypoint("train"), Some("python train.py"));
+        assert_eq!(manifest.entrypoint("missing"), None);
+    }
+}
+
 /// Default hardware requirements a unit declares (spec §11.1 `requires`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UnitRequires {
@@ -61,6 +79,15 @@ pub struct CheckpointMeta {
     pub parent_checkpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub datasets: Vec<String>,
+    /// content_sha of the dataset this checkpoint's training consumed
+    /// (spec §7.3) — sourced from the run's resolved `data:` block, not the
+    /// trainer's sidecar; the loader's `tokenizer_hash` verify-on-load is the
+    /// pattern this mirrors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_sha: Option<String>,
+    /// plan_sha of the batch plan the run used, if any (spec §7.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
     /// `[from_step, to_step]` pairs across resumes (spec §11.2 `slices`).

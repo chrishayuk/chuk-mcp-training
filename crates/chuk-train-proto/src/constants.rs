@@ -293,6 +293,13 @@ pub mod env {
     /// feature is off (set/clear routes refuse); the shared
     /// `EXPERIMENTS_API_KEY` above keeps working regardless.
     pub const EXPERIMENTS_KEY_ENCRYPTION_KEY: &str = "CHUK_EXPERIMENTS_KEY_ENCRYPTION_KEY";
+    /// chuk-datasets-server base URL (e.g. https://chuk-datasets.fly.dev).
+    /// Dispatch-time `data:` resolution (spec §6/§7.3) is off unless this and
+    /// the key are set — unlike the best-effort experiments mirror, a run that
+    /// declares a `data:` block then fails to dispatch rather than degrading.
+    pub const DATASETS_URL: &str = "CHUK_DATASETS_URL";
+    /// A read-scoped chuk-datasets-server API key (raw bearer token).
+    pub const DATASETS_API_KEY: &str = "CHUK_DATASETS_API_KEY";
 }
 
 /// Environment variables the harness exports to a train entrypoint — the
@@ -312,4 +319,8 @@ pub mod script_env {
     pub const RUN_ID: &str = "CHUK_RUN_ID";
     /// The seed for this run (from the job's seed/overrides), if any.
     pub const SEED: &str = "CHUK_SEED";
+    /// Resolved dataset content sha (empty if the run declared no `data:` block).
+    pub const DATASET: &str = "CHUK_DATASET";
+    /// Resolved batch-plan sha (empty if the run's `data:` block set no plan).
+    pub const PLAN: &str = "CHUK_PLAN";
 }

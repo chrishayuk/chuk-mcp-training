@@ -694,6 +694,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chuk-compute-wire",
+ "chuk-datasets-client",
  "clap",
  "futures-util",
  "hex",
@@ -712,6 +713,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "chuk-datasets-client"
+version = "0.1.0"
+dependencies = [
+ "chuk-datasets-core",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
+name = "chuk-datasets-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
 name = "chuk-train-controlplane"
 version = "0.1.0"
 dependencies = [
@@ -723,6 +748,7 @@ dependencies = [
  "axum",
  "base64",
  "chuk-compute-wire",
+ "chuk-datasets-client",
  "chuk-train-proto",
  "dotenvy",
  "futures-util",

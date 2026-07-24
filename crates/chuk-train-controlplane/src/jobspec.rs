@@ -39,6 +39,7 @@ const ARTIFACT_CHECKPOINT: &str = "checkpoint";
 const UNIT_SUBDIR: &str = "unit";
 const CKPT_SUBDIR: &str = "ckpt";
 const RESUME_SUBDIR: &str = "resume";
+const DATA_SUBDIR: &str = "data";
 const METRICS_FILE: &str = "metrics.jsonl";
 
 /// The resolved inputs a train job needs staged, supplied by the caller (which
@@ -52,12 +53,35 @@ pub struct TrainStaging<'a> {
     pub grant: &'a str,
     /// Present when this slice resumes from a prior checkpoint.
     pub resume: Option<ResumeStaging<'a>>,
+    /// Present when the run declared a `data:` block, already resolved
+    /// against chuk-datasets (spec §6/§7.3).
+    pub data: Option<DataStaging>,
 }
 
 /// The resolved URIs of the checkpoint a resumed slice picks up from.
 pub struct ResumeStaging<'a> {
     pub model_uri: &'a str,
     pub meta_uri: &'a str,
+}
+
+/// One dataset shard the worker fetches directly from its resolved location,
+/// same `wire::InputArtifact { uri, dest, sha256, unpack }` contract as the
+/// code unit — hash-verified on fetch (spec §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardInput {
+    pub uri: String,
+    pub sha256: String,
+}
+
+/// A run's `data:` block, resolved to a concrete identity (spec §6/§7.3): the
+/// dataset's `content_sha`, the batch plan's `plan_sha` if one was declared,
+/// and the manifest's shards pre-warmed with fetch URLs so the worker's own
+/// `chuk-datasets-client` re-resolves only on URL expiry, not on every run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataStaging {
+    pub content_sha: String,
+    pub plan_sha: Option<String>,
+    pub shards: Vec<ShardInput>,
 }
 
 /// A shell run → a batch job that runs the command under a timeout, nothing
@@ -89,7 +113,7 @@ pub fn train_job(run_id: &RunId, train: &TrainSpec, staging: &TrainStaging<'_>) 
         ],
         train.timeout_s,
     );
-    job.env = script_environment(run_id, train, staging.resume.is_some());
+    job.env = script_environment(run_id, train, staging);
     job.inputs = train_inputs(staging);
     job.outputs = vec![wire::OutputRule {
         class: wire::ArtifactClass::from(ARTIFACT_CHECKPOINT),
@@ -129,7 +153,7 @@ fn base_job(run_id: &RunId, template: &str, command: Vec<String>, timeout_s: u64
 
 /// The `$CHUK_*` script-contract environment (spec §5.1), with run-time paths as
 /// sandbox-relative placeholders.
-fn script_environment(run_id: &RunId, train: &TrainSpec, resuming: bool) -> BTreeMap<String, String> {
+fn script_environment(run_id: &RunId, train: &TrainSpec, staging: &TrainStaging<'_>) -> BTreeMap<String, String> {
     let config = train
         .config
         .as_ref()
@@ -146,11 +170,19 @@ fn script_environment(run_id: &RunId, train: &TrainSpec, resuming: bool) -> BTre
         (script_env::CKPT_DIR.to_owned(), sandboxed(CKPT_SUBDIR)),
         (
             script_env::RESUME_CKPT.to_owned(),
-            if resuming { sandboxed(RESUME_SUBDIR) } else { String::new() },
+            if staging.resume.is_some() { sandboxed(RESUME_SUBDIR) } else { String::new() },
         ),
         (
             script_env::SEED.to_owned(),
             seed.map(|s| s.to_string()).unwrap_or_default(),
+        ),
+        (
+            script_env::DATASET.to_owned(),
+            staging.data.as_ref().map(|d| d.content_sha.clone()).unwrap_or_default(),
+        ),
+        (
+            script_env::PLAN.to_owned(),
+            staging.data.as_ref().and_then(|d| d.plan_sha.clone()).unwrap_or_default(),
         ),
     ])
 }
@@ -179,6 +211,16 @@ fn train_inputs(staging: &TrainStaging<'_>) -> Vec<wire::InputArtifact> {
             sha256: None,
             unpack: false,
         });
+    }
+    if let Some(data) = &staging.data {
+        for shard in &data.shards {
+            inputs.push(wire::InputArtifact {
+                uri: shard.uri.clone(),
+                dest: sandboxed(&format!("{DATA_SUBDIR}/{}", shard.sha256)),
+                sha256: Some(shard.sha256.clone()),
+                unpack: false,
+            });
+        }
     }
     inputs
 }
@@ -235,6 +277,7 @@ mod tests {
             code_unit_uri: "https://store/code",
             grant: "tok",
             resume: None,
+            data: None,
         };
         let job = train_job(&RunId::from("RUN-2"), &train_spec(), &staging);
         assert_eq!(job.template.as_str(), TEMPLATE_TRAIN);
@@ -254,6 +297,7 @@ mod tests {
             code_unit_uri: "u",
             grant: "g",
             resume: None,
+            data: None,
         };
         let job = train_job(&RunId::from("RUN-3"), &train_spec(), &staging);
         let env = &job.env;
@@ -275,6 +319,7 @@ mod tests {
             code_unit_uri: "https://store/code",
             grant: "g",
             resume: None,
+            data: None,
         };
         let job = train_job(&RunId::from("RUN-4"), &train_spec(), &staging);
         assert_eq!(job.inputs.len(), 1);
@@ -303,6 +348,7 @@ mod tests {
                 model_uri: "https://store/ckpt/model",
                 meta_uri: "https://store/ckpt/meta",
             }),
+            data: None,
         };
         let job = train_job(&RunId::from("RUN-5"), &train_spec(), &staging);
         assert_eq!(job.env[script_env::RESUME_CKPT], "${SANDBOX}/resume");
@@ -311,6 +357,42 @@ mod tests {
         assert_eq!(job.inputs[1].dest, "${SANDBOX}/resume/model.safetensors");
         assert_eq!(job.inputs[2].dest, "${SANDBOX}/resume/meta.json");
         assert!(!job.inputs[1].unpack && !job.inputs[2].unpack);
+    }
+
+    #[test]
+    fn data_stages_shards_and_sets_the_dataset_plan_env() {
+        let staging = TrainStaging {
+            entrypoint_cmd: "run",
+            code_unit_uri: "u",
+            grant: "g",
+            resume: None,
+            data: Some(DataStaging {
+                content_sha: "dsha".into(),
+                plan_sha: Some("psha".into()),
+                shards: vec![
+                    ShardInput { uri: "https://store/shards/a".into(), sha256: "a".into() },
+                    ShardInput { uri: "https://store/shards/b".into(), sha256: "b".into() },
+                ],
+            }),
+        };
+        let job = train_job(&RunId::from("RUN-7"), &train_spec(), &staging);
+        assert_eq!(job.env[script_env::DATASET], "dsha");
+        assert_eq!(job.env[script_env::PLAN], "psha");
+        // unit + two shards, hash-verified and never unpacked.
+        assert_eq!(job.inputs.len(), 3);
+        assert_eq!(job.inputs[1].dest, "${SANDBOX}/data/a");
+        assert_eq!(job.inputs[1].sha256.as_deref(), Some("a"));
+        assert!(!job.inputs[1].unpack);
+        assert_eq!(job.inputs[2].dest, "${SANDBOX}/data/b");
+        assert_eq!(job.inputs[2].sha256.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn data_env_is_empty_without_a_data_block() {
+        let staging = TrainStaging { entrypoint_cmd: "e", code_unit_uri: "u", grant: "g", resume: None, data: None };
+        let job = train_job(&RunId::from("RUN-8"), &train_spec(), &staging);
+        assert_eq!(job.env[script_env::DATASET], "");
+        assert_eq!(job.env[script_env::PLAN], "");
     }
 
     #[test]
@@ -325,7 +407,7 @@ mod tests {
             unreachable!()
         };
         let _ = CodeRef { name: "n".into(), sha: "s".into() }; // touch the type
-        let staging = TrainStaging { entrypoint_cmd: "e", code_unit_uri: "u", grant: "g", resume: None };
+        let staging = TrainStaging { entrypoint_cmd: "e", code_unit_uri: "u", grant: "g", resume: None, data: None };
         let job = train_job(&RunId::from("RUN-6"), &spec, &staging);
         assert_eq!(job.env[script_env::CONFIG], "");
         assert_eq!(job.env[script_env::SEED], "");

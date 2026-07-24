@@ -169,6 +169,9 @@ async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> Option<AuthConte
 /// Enforce a minimum role inside a handler. Returns `Ok` when allowed, or a
 /// ready 403 response to return early. The [`AuthContext`] is provided by
 /// [`require_bearer`] via `Extension<AuthContext>`.
+// One call per request, not a hot loop — boxing `Response` would just push
+// an allocation onto every one of this fn's ~20 call sites for no benefit.
+#[allow(clippy::result_large_err)]
 pub fn require_role(ctx: &AuthContext, min: Role) -> Result<(), Response> {
     if ctx.may(min) {
         return Ok(());

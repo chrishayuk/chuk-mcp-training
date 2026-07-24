@@ -9,12 +9,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chuk_compute_wire::{Job, JobId, KillReason, UploadPolicy, WorkerToCp};
+use chuk_datasets_client::ContentCache;
 use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::constants::{EXIT_CODE_AGENT_ERROR, OUTPUT_SCAN_INTERVAL};
+use crate::constants::{cache_dir_env, EXIT_CODE_AGENT_ERROR, OUTPUT_SCAN_INTERVAL};
 use crate::httpclient::HttpClient;
 use crate::inputs;
 use crate::metrics::MetricTail;
@@ -105,9 +106,13 @@ async fn run(
     let sandbox_path = sandbox.path();
     let client = HttpClient::new(origin.to_owned(), job.grant.clone().unwrap_or_default());
 
-    // 1. Stage inputs into the sandbox.
+    // 1. Stage inputs into the sandbox. Inputs that carry a sha256 (dataset
+    //    shards, spec §6) are checked against the hash-keyed local cache
+    //    first when its root directory env var is set, so repeat runs on the
+    //    same lease hit disk, not R2.
+    let cache = std::env::var(cache_dir_env()).ok().map(ContentCache::new);
     for input in &job.inputs {
-        inputs::stage(input, sandbox_path, &client).await?;
+        inputs::stage(input, sandbox_path, &client, cache.as_ref()).await?;
     }
 
     // 2. Metrics tail + output collectors, resolved against the sandbox.

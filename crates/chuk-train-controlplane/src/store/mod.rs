@@ -30,10 +30,10 @@ const SCHEME_POSTGRES: &str = "postgres:";
 const SCHEME_POSTGRESQL: &str = "postgresql:";
 const SCHEME_REDIS: &str = "redis:";
 
-/// Persistent control-plane state, split into cohesive per-domain traits.
-/// `Store` is the object-safe union every backend provides; callers hold an
-/// `Arc<dyn Store>` and every sub-trait method is callable on it (supertrait
-/// methods live in the trait object's vtable), so the split is caller-invisible.
+// Persistent control-plane state, split into cohesive per-domain traits.
+// `Store` is the object-safe union every backend provides; callers hold an
+// `Arc<dyn Store>` and every sub-trait method is callable on it (supertrait
+// methods live in the trait object's vtable), so the split is caller-invisible.
 
 /// Fleet membership, presence, run-binding, persistence, and host telemetry.
 #[async_trait]

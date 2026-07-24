@@ -13,6 +13,7 @@ path = "src/main.rs"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 chuk-compute-wire = { workspace = true }
 chuk-train-proto = { workspace = true }
+chuk-datasets-client = { workspace = true }
 aes-gcm = "0.10"
 anyhow = { workspace = true }
 async-trait = "0.1"

@@ -1037,7 +1037,7 @@ mod live {
 
         let artifacts: Arc<dyn crate::artifacts::ArtifactStore> =
             Arc::new(crate::artifacts::FsArtifactStore::new(std::env::temp_dir()));
-        let hub = crate::hub::Hub::new(store.clone(), artifacts, Some(exp));
+        let hub = crate::hub::Hub::new(store.clone(), artifacts, Some(exp), None);
 
         let run_id = hub
             .submit_from_experiment(&ext_id, None, None)

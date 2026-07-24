@@ -16,6 +16,7 @@ mod codeunit;
 mod config;
 mod crypto;
 mod dash;
+mod datasets;
 mod drive;
 mod gate;
 mod experiments;
@@ -43,6 +44,7 @@ use tracing::{info, warn};
 use crate::archive::Archiver;
 use crate::artifacts::{open_artifact_store, ArtifactStore};
 use crate::config::Config;
+use crate::datasets::Datasets;
 use crate::drive::DriveClient;
 use crate::experiments::Experiments;
 use crate::hub::Hub;
@@ -152,7 +154,13 @@ async fn main() -> Result<()> {
         // drops an observation.
         tokio::spawn(exp.run_outbox_loop(chuk_train_proto::DEFAULT_EXPERIMENTS_OUTBOX_INTERVAL));
     }
-    let hub = Hub::new(store, artifacts.clone(), experiments);
+    // chuk-datasets dispatch-time resolution (spec §6/§7.3): optional and
+    // gated — off unless CHUK_DATASETS_URL + CHUK_DATASETS_API_KEY are set.
+    // Unlike the experiments mirror this isn't best-effort: a run declaring a
+    // `data:` block fails to dispatch without it.
+    let datasets = Datasets::from_env().map(Arc::new);
+    info!(datasets = datasets.is_some(), "chuk-datasets resolution");
+    let hub = Hub::new(store, artifacts.clone(), experiments, datasets);
     // Heartbeat reaper: sweeps the fleet for workers whose link is half-open
     // (a frozen tab that never delivered a socket close) and re-queues their
     // stranded resumable runs (spec §7). Always on — a core scheduling guarantee.

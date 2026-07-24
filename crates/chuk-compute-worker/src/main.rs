@@ -418,7 +418,7 @@ async fn run_session(
                     // A new job starts a fresh outbox; the previous job's events
                     // are done and must never replay against this one.
                     outbox.clear();
-                    *current = Some(executor::spawn(job, job_tx.clone(), seq.clone(), origin.clone()));
+                    *current = Some(executor::spawn(*job, job_tx.clone(), seq.clone(), origin.clone()));
                 }
                 Some(CpToWorker::Cancel { job_id }) => {
                     if let Some(job) = current.take() {

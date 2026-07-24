@@ -120,7 +120,7 @@ pub enum CpToWorker {
     },
     /// Run this job.
     AssignJob {
-        job: Job,
+        job: Box<Job>,
     },
     /// Stop this job (SIGTERM → grace → SIGKILL).
     Cancel {
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn assign_job_round_trips() {
         let msg = CpToWorker::AssignJob {
-            job: Job {
+            job: Box::new(Job {
                 id: JobId::from("j1"),
                 template: Template::from("eval"),
                 command: vec!["python".into(), "run.py".into()],
@@ -214,7 +214,7 @@ mod tests {
                 campaign: None,
                 placement: crate::Placement::default(),
                 grant: None,
-            },
+            }),
         };
         let value = serde_json::to_value(&msg).unwrap();
         assert_eq!(value["type"], "assign_job");

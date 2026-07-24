@@ -237,6 +237,10 @@ pub struct TrainSpec {
     /// Input artifacts the run reads (checkpoints, datasets, tokenizer).
     #[serde(default)]
     pub artifacts_in: Vec<ArtifactRef>,
+    /// The catalog dataset (and optional batch plan) this run reads, resolved
+    /// against chuk-datasets at dispatch time (spec §6 `data:` block).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<DataRef>,
     /// Checkpoint schedule + retention (spec §5.1 `checkpoint`).
     #[serde(default)]
     pub checkpoint: CheckpointPolicy,
@@ -253,6 +257,23 @@ pub struct TrainSpec {
     /// experiments-server dashboard, …), surfaced on the dashboard's run view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<RunLink>,
+}
+
+/// A dataset reference from a `TrainSpec` (spec §6 `data:` block):
+/// ```yaml
+/// data:
+///   dataset: tinystories/tok-<sha8>@<sha>
+///   plan: <plan_sha>        # or planset member ref
+/// ```
+/// `dataset` is `<name>@<content_sha>` or a bare content sha — concrete refs
+/// only, same rule chuk-datasets' resolve endpoint enforces. `plan` may be a
+/// concrete plan sha or a planset member ref; either way it is resolved to a
+/// concrete `plan_sha` at dispatch time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataRef {
+    pub dataset: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
 }
 
 /// A labelled out-link shown on a run's dashboard page.
@@ -308,6 +329,93 @@ pub struct CheckpointPolicy {
     pub every_steps: u64,
     pub keep_last: u32,
     pub keep_every: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_state_as_str_covers_every_variant() {
+        let pairs = [
+            (RunState::Queued, "queued"),
+            (RunState::Assigned, "assigned"),
+            (RunState::Running, "running"),
+            (RunState::Completed, "completed"),
+            (RunState::Failed, "failed"),
+            (RunState::Cancelled, "cancelled"),
+        ];
+        for (state, expected) in pairs {
+            assert_eq!(state.as_str(), expected);
+        }
+        assert!(RunState::Completed.is_terminal());
+        assert!(RunState::Failed.is_terminal());
+        assert!(RunState::Cancelled.is_terminal());
+        assert!(!RunState::Running.is_terminal());
+    }
+
+    #[test]
+    fn checkpoint_location_and_role_as_str_cover_every_variant() {
+        assert_eq!(CheckpointLocation::R2Hot.as_str(), "r2_hot");
+        assert_eq!(CheckpointLocation::R2Final.as_str(), "r2_final");
+        assert_eq!(CheckpointLocation::Drive.as_str(), "drive");
+
+        assert_eq!(Role::Read.as_str(), "read");
+        assert_eq!(Role::Write.as_str(), "write");
+        assert_eq!(Role::Admin.as_str(), "admin");
+        assert_eq!(Role::Sysadmin.as_str(), "sysadmin");
+    }
+
+    #[test]
+    fn event_kind_from_run_state_maps_every_variant() {
+        let pairs = [
+            (RunState::Queued, EventKind::Queued),
+            (RunState::Assigned, EventKind::Assigned),
+            (RunState::Running, EventKind::Running),
+            (RunState::Completed, EventKind::Completed),
+            (RunState::Failed, EventKind::Failed),
+            (RunState::Cancelled, EventKind::Cancelled),
+        ];
+        for (state, expected) in pairs {
+            assert_eq!(EventKind::from(state), expected);
+        }
+    }
+
+    #[test]
+    fn run_spec_kind_str_and_timeout_read_through_both_variants() {
+        let shell = RunSpec::Shell(ShellSpec { command: "echo hi".into(), timeout_s: 42 });
+        assert_eq!(shell.kind_str(), "shell");
+        assert_eq!(shell.timeout_s(), 42);
+
+        let train = RunSpec::Train(Box::new(TrainSpec {
+            code: CodeRef { name: "unit".into(), sha: "abc".into() },
+            entrypoint: "train".into(),
+            config: None,
+            overrides: serde_json::json!({}),
+            artifacts_in: Vec::new(),
+            data: None,
+            checkpoint: CheckpointPolicy::default(),
+            seed: None,
+            arch: None,
+            timeout_s: 900,
+            links: Vec::new(),
+        }));
+        assert_eq!(train.kind_str(), "train");
+        assert_eq!(train.timeout_s(), 900);
+    }
+
+    #[test]
+    fn code_ref_display_matches_the_name_at_sha256_convention() {
+        let code = CodeRef { name: "unit".into(), sha: "abc123".into() };
+        assert_eq!(code.to_string(), "unit@sha256:abc123");
+    }
+
+    #[test]
+    fn string_id_from_string_and_from_str_both_work() {
+        assert_eq!(RunId::from(String::from("RUN-1")).0, "RUN-1");
+        assert_eq!(WorkerId::from(String::from("W-1")).0, "W-1");
+        assert_eq!(RunId::from("RUN-2").0, "RUN-2");
+    }
 }
 
 impl Default for CheckpointPolicy {

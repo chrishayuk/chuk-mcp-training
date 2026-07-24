@@ -7,6 +7,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use chuk_compute_wire::InputArtifact;
+use chuk_datasets_client::ContentCache;
 use sha2::{Digest, Sha256};
 
 use crate::httpclient::HttpClient;
@@ -17,12 +18,40 @@ const HTTPS_SCHEME: &str = "https://";
 /// Leading bytes of a zstd frame (magic `0xFD2FB528`, little-endian on disk).
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// Fetch, verify, and place one input into the sandbox at `sandbox_path`.
-pub async fn stage(input: &InputArtifact, sandbox_path: &str, client: &HttpClient) -> Result<()> {
-    let bytes = fetch(&input.uri, client)
+/// Fetch, verify, and place one input into the sandbox at `sandbox_path`. When
+/// `cache` is set and the input carries a sha256 (dataset shards, spec §6),
+/// a cache hit skips the network entirely; a miss fetches, verifies-then-
+/// stores into the cache, and reuses those bytes.
+pub async fn stage(
+    input: &InputArtifact,
+    sandbox_path: &str,
+    client: &HttpClient,
+    cache: Option<&ContentCache>,
+) -> Result<()> {
+    let bytes = fetch_cached(input, client, cache)
         .await
         .with_context(|| format!("fetching input {}", input.uri))?;
     place(input, &bytes, sandbox_path).await
+}
+
+/// [`fetch`] through the hash-keyed local cache (spec §6: `resolve → fetch →
+/// verify → cache → refuse`). Only inputs carrying a sha256 are cacheable —
+/// today that's dataset shards; the code unit and resume checkpoint still
+/// carry none and always hit the network. A corrupted cache entry surfaces as
+/// [`chuk_datasets_client::ClientError::ShaMismatch`] (P1, never downgraded);
+/// the cache has already self-evicted it, so the *next* fetch heals.
+async fn fetch_cached(input: &InputArtifact, client: &HttpClient, cache: Option<&ContentCache>) -> Result<Vec<u8>> {
+    let keyed = cache.zip(input.sha256.as_deref());
+    if let Some((cache, sha)) = keyed {
+        if let Some(bytes) = cache.get(sha).map_err(anyhow::Error::from)? {
+            return Ok(bytes);
+        }
+    }
+    let bytes = fetch(&input.uri, client).await?;
+    if let Some((cache, sha)) = keyed {
+        cache.put(sha, &bytes, &input.uri).map_err(anyhow::Error::from)?;
+    }
+    Ok(bytes)
 }
 
 /// The offline half of [`stage`]: verify the hash then write or unpack the
@@ -217,8 +246,84 @@ mod tests {
             sha256: None,
             unpack: false,
         };
-        let error = stage(&input, "unused", &client).await.unwrap_err();
+        let error = stage(&input, "unused", &client, None).await.unwrap_err();
         assert!(format!("{error:#}").contains("fetching input"));
+    }
+
+    /// A minimal raw-socket HTTP/1.1 server returning `body` for one request,
+    /// bound to an ephemeral port — self-contained so the cache-populates test
+    /// below needs no mock-server dependency.
+    async fn serve_once(body: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(body).await;
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}/shard")
+    }
+
+    #[tokio::test]
+    async fn fetch_cached_hits_the_cache_without_touching_the_network() {
+        let dir = scratch("cache-hit");
+        let cache = ContentCache::new(dir.clone());
+        let bytes = b"cached shard bytes".to_vec();
+        let sha = hex::encode(Sha256::digest(&bytes));
+        cache.put(&sha, &bytes, "seed").unwrap();
+
+        let client = HttpClient::new(REFUSED_ORIGIN.into(), String::new());
+        // A refused origin would error if the cache hit fell through to the
+        // network at all.
+        let input = InputArtifact {
+            uri: format!("{REFUSED_ORIGIN}/would-fail"),
+            dest: "/unused".into(),
+            sha256: Some(sha),
+            unpack: false,
+        };
+        let got = fetch_cached(&input, &client, Some(&cache)).await.unwrap();
+        assert_eq!(got, bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fetch_cached_populates_the_cache_after_a_verified_fetch() {
+        let dir = scratch("cache-miss");
+        let cache = ContentCache::new(dir.clone());
+        let body: &'static [u8] = b"fresh shard bytes";
+        let sha = hex::encode(Sha256::digest(body));
+        let url = serve_once(body).await;
+
+        let client = HttpClient::new(REFUSED_ORIGIN.into(), String::new());
+        let input = InputArtifact { uri: url, dest: "/unused".into(), sha256: Some(sha.clone()), unpack: false };
+        assert!(cache.get(&sha).unwrap().is_none(), "starts as a miss");
+        let got = fetch_cached(&input, &client, Some(&cache)).await.unwrap();
+        assert_eq!(got, body);
+        assert_eq!(cache.get(&sha).unwrap(), Some(body.to_vec()), "populated after the fetch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fetch_cached_skips_the_cache_when_the_input_has_no_sha256() {
+        let dir = scratch("cache-skip");
+        let cache = ContentCache::new(dir.clone());
+        let client = HttpClient::new(REFUSED_ORIGIN.into(), String::new());
+        let input = InputArtifact {
+            uri: format!("{REFUSED_ORIGIN}/missing"),
+            dest: "/unused".into(),
+            sha256: None,
+            unpack: false,
+        };
+        // No sha to key on: falls straight through to the network (and fails,
+        // same as an uncached fetch) — the cache is never touched.
+        assert!(fetch_cached(&input, &client, Some(&cache)).await.is_err());
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "cache dir stays empty");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
