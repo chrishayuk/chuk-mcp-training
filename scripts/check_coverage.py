@@ -25,11 +25,6 @@ EXCLUDE = ("src/main.rs", "/examples/")
 # 2026-07-24 bootstrap snapshot, when the gate was introduced on an existing
 # codebase that had never been coverage-gated. Being paid down file by file.
 BOOTSTRAP_EXCLUDE = {
-    "chuk-train-controlplane/src/api/access.rs",
-    "chuk-train-controlplane/src/api/leases.rs",
-    "chuk-train-controlplane/src/api/mod.rs",
-    "chuk-train-controlplane/src/api/runs.rs",
-    "chuk-train-controlplane/src/archive.rs",
     "chuk-train-controlplane/src/auth.rs",
     "chuk-train-controlplane/src/drive.rs",
     "chuk-train-controlplane/src/experiments.rs",
