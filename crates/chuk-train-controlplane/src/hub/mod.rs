@@ -899,6 +899,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn on_message_job_started_after_cancel_does_not_resurrect_the_run() {
+        // Live-observed on Colab: operator cancels, then a flapped reconnect
+        // replays JobStarted with a genuinely new (higher) seq — dedup alone
+        // doesn't catch it. The run must stay Cancelled with its exit code
+        // intact, not flip back to Running.
+        let hub = test_hub().await;
+        let run = hub.submit("r", &shell_run(), None, None).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = WorkerId("w-flap".into());
+        hub.attach(&worker, tx, &[], &Hardware::default()).await.unwrap();
+        assert!(matches!(rx.recv().await.unwrap(), wire::CpToWorker::AssignJob { .. }));
+
+        let job_id = wire::JobId::from(run.0.clone());
+        hub.on_message(&worker, wire::WorkerToCp::JobStarted { seq: 1, job_id: job_id.clone() })
+            .await
+            .unwrap();
+        assert_eq!(hub.store.run(&run).await.unwrap().unwrap().summary.state, RunState::Running);
+
+        // Stop signals the worker; the run finalises once it confirms the kill.
+        hub.stop_run(&run).await.unwrap();
+        assert!(matches!(rx.recv().await.expect("cancel"), wire::CpToWorker::Cancel { .. }));
+        hub.on_message(
+            &worker,
+            wire::WorkerToCp::JobKilled { seq: 2, job_id: job_id.clone(), reason: wire::KillReason::Cancel },
+        )
+        .await
+        .unwrap();
+        let cancelled = hub.store.run(&run).await.unwrap().unwrap();
+        assert_eq!(cancelled.summary.state, RunState::Cancelled);
+        assert_eq!(cancelled.summary.exit_code, Some(EXIT_CODE_CANCELLED));
+
+        // The replay: a higher seq, so dedup lets it through to the handler.
+        hub.on_message(&worker, wire::WorkerToCp::JobStarted { seq: 3, job_id: job_id.clone() })
+            .await
+            .unwrap();
+        let after = hub.store.run(&run).await.unwrap().unwrap();
+        assert_eq!(after.summary.state, RunState::Cancelled, "replayed JobStarted must not resurrect a terminal run");
+        assert_eq!(after.summary.exit_code, Some(EXIT_CODE_CANCELLED), "exit code must not be left stale by an ignored transition");
+    }
+
+    #[tokio::test]
     async fn on_message_job_exited_nonzero_fails_the_run() {
         let hub = test_hub().await;
         let run = hub.submit("r", &shell_run(), None, None).await.unwrap();

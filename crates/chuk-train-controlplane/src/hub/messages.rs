@@ -64,10 +64,25 @@ impl Hub {
             }
             wire::WorkerToCp::JobStarted { job_id, .. } => {
                 let run_id = run_id(&job_id);
-                self.store
-                    .transition(&run_id, RunState::Running, Some(worker_id), None, Value::Null)
-                    .await?;
-                self.mirror_state(&run_id, RunState::Running);
+                // A flapped link can replay JobStarted for a job the CP has
+                // already finalised (observed on Colab during EI0 — see the
+                // watchdog convergence note in control.rs::evaluate_gates).
+                // seq dedup only catches replays at-or-below the high-water;
+                // a genuinely new JobStarted for an already-terminal run must
+                // not resurrect it.
+                let live = self
+                    .store
+                    .run(&run_id)
+                    .await?
+                    .is_some_and(|run| !run.summary.state.is_terminal());
+                if live {
+                    self.store
+                        .transition(&run_id, RunState::Running, Some(worker_id), None, Value::Null)
+                        .await?;
+                    self.mirror_state(&run_id, RunState::Running);
+                } else {
+                    warn!(run = %run_id.0, %worker_id, "JobStarted for terminal run; ignoring (stale/replayed)");
+                }
             }
             wire::WorkerToCp::JobExited { job_id, code, .. } => {
                 let state = if code == 0 {
