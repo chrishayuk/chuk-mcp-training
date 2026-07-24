@@ -383,8 +383,10 @@ def archive_runs(force: bool = False) -> ArchiveReport   # same policy across al
 def archive_status(run_id: str | None = None) -> ArchiveStatus
      # per run: hot (R2) vs cold (Drive), grace/age remaining, bytes freed
 @tool
-def build_code_unit(repo: str, commit: str, name: str | None = None) -> CodeUnitRef
+def build_code_unit(repo: str, commit: str | None = None, name: str | None = None,
+                     path: str | None = None) -> CodeUnitRef
      # tarball + uv.lock + manifest, hashed, uploaded; agents cache by hash
+     # path scopes repo to a subdirectory (monorepo unit, e.g. examples/<name>)
 @tool
 def artifact_url(name: str, ttl_min: int = 60) -> SignedUrl    # lazarus pulls via this
 @tool

@@ -150,6 +150,11 @@ pub struct BuildCodeUnitRequest {
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Subdirectory within `repo` that holds the unit (`unit.toml` +
+    /// entrypoint), for a monorepo where the code unit isn't at the tree
+    /// root — e.g. `examples/v11-pretrain`. Unset means the tree root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

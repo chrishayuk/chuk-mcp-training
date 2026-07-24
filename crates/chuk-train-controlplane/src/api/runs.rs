@@ -151,6 +151,7 @@ pub async fn build_code_unit(
         &request.repo,
         request.commit.as_deref(),
         request.name.as_deref(),
+        request.path.as_deref(),
     )
     .await;
     match built {

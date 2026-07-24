@@ -24,9 +24,27 @@ pub async fn build(
     repo: &str,
     commit: Option<&str>,
     name_override: Option<&str>,
+    path: Option<&str>,
 ) -> Result<CodeUnitInfo> {
     let source = materialize_source(repo, commit).await?;
-    let dir = source.path();
+    let root = source.path();
+    // A monorepo subdirectory (e.g. `examples/v11-pretrain`): the unit lives
+    // under `root`, not at its top — both the manifest lookup and the
+    // tarball below must be scoped to it, or the unit ships the whole repo.
+    let dir = match path {
+        Some(sub) => {
+            // `starts_with` on the joined path won't catch `..` segments (it
+            // compares components lexically, before any `..` is resolved),
+            // so reject them outright rather than trusting containment.
+            anyhow::ensure!(
+                chuk_train_proto::keys::is_safe_key(sub),
+                "path must stay within the repo: {sub}"
+            );
+            root.join(sub)
+        }
+        None => root.to_path_buf(),
+    };
+    let dir = dir.as_path();
 
     let manifest_path = dir.join(CODE_UNIT_MANIFEST);
     let manifest_text = tokio::fs::read_to_string(&manifest_path)
@@ -204,5 +222,101 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifacts::FsArtifactStore;
+
+    /// A throwaway local-directory "repo" with a unit optionally nested under
+    /// a subdirectory, mirroring a monorepo layout like `examples/<name>`.
+    /// `marker` keeps each test's tarball content (and so its content-address)
+    /// distinct — these tests share one `FsArtifactStore` root, and identical
+    /// content run concurrently races on that backend's fixed temp-file name.
+    fn scratch_repo(unit_subdir: Option<&str>, marker: &str) -> TempDir {
+        let repo = TempDir::new().unwrap();
+        let unit_root = match unit_subdir {
+            Some(sub) => {
+                let dir = repo.0.join(sub);
+                std::fs::create_dir_all(&dir).unwrap();
+                dir
+            }
+            None => repo.0.clone(),
+        };
+        std::fs::write(
+            unit_root.join(CODE_UNIT_MANIFEST),
+            "name = \"scratch\"\nversion = \"0.1.0\"\n[entrypoints]\ntrain = \"true\"\n",
+        )
+        .unwrap();
+        std::fs::write(unit_root.join("train.py"), format!("print('{marker}')\n")).unwrap();
+        repo
+    }
+
+    #[tokio::test]
+    async fn build_finds_the_manifest_under_a_monorepo_subdirectory() {
+        let repo = scratch_repo(Some("examples/v11-pretrain"), "finds-manifest");
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let info = build(
+            &store,
+            &repo.0.to_string_lossy(),
+            None,
+            None,
+            Some("examples/v11-pretrain"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.manifest.name, "scratch");
+    }
+
+    #[tokio::test]
+    async fn build_without_a_path_still_reads_the_root_manifest() {
+        let repo = scratch_repo(None, "root-manifest");
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let info = build(&store, &repo.0.to_string_lossy(), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(info.manifest.name, "scratch");
+    }
+
+    #[tokio::test]
+    async fn build_rejects_a_path_that_escapes_the_repo() {
+        let repo = scratch_repo(None, "escape-guard");
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let err = build(&store, &repo.0.to_string_lossy(), None, None, Some("../../etc"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("must stay within"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn build_tars_only_the_subdirectory_not_the_whole_repo() {
+        let repo = scratch_repo(Some("examples/v11-pretrain"), "tars-subdir-only");
+        // A file outside the unit subdir — must never end up in the tarball.
+        std::fs::write(repo.0.join("unrelated.txt"), "secret").unwrap();
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let info = build(
+            &store,
+            &repo.0.to_string_lossy(),
+            None,
+            None,
+            Some("examples/v11-pretrain"),
+        )
+        .await
+        .unwrap();
+        let tarball = store
+            .get(&keys::code_unit_tarball(&info.code.name, &info.code.sha))
+            .await
+            .unwrap();
+        let decoded = zstd::decode_all(tarball.as_slice()).unwrap();
+        let mut archive = tar::Archive::new(decoded.as_slice());
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"train.py".to_owned()), "names={names:?}");
+        assert!(!names.iter().any(|n| n.contains("unrelated.txt")), "names={names:?}");
     }
 }

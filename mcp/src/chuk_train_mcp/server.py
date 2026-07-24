@@ -245,14 +245,18 @@ def build_server(client: ControlPlaneClient | None = None) -> ChukMCPServer:
 
     @mcp.tool
     async def build_code_unit(
-        repo: str, commit: str | None = None, name: str | None = None
+        repo: str, commit: str | None = None, name: str | None = None, path: str | None = None
     ) -> dict[str, Any]:
         """Build a deployable code unit from a repo/commit (or local path).
 
         Tars the tree, pins the manifest + lockfile, content-addresses it, and
         registers it. Returns the code ref (name + sha) to pass to submit_run.
+
+        Pass path for a monorepo where the unit isn't at the tree root — e.g.
+        repo="https://github.com/org/monorepo", path="examples/some-unit". Only
+        that subdirectory is tarred; unit.toml is read from within it.
         """
-        request = BuildCodeUnitRequest(repo=repo, commit=commit, name=name)
+        request = BuildCodeUnitRequest(repo=repo, commit=commit, name=name, path=path)
         return await _envelope(cp.post_model(API_CODE_UNITS, request, CodeUnitInfo))
 
     @mcp.tool

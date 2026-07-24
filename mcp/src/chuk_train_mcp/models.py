@@ -419,6 +419,7 @@ class BuildCodeUnitRequest(BaseModel):
     repo: str
     commit: str | None = None
     name: str | None = None
+    path: str | None = None
 
 
 class PinCheckpointRequest(BaseModel):
