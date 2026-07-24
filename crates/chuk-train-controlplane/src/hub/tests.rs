@@ -1031,15 +1031,23 @@ async fn mock_experiments_server() -> (String, MockExperiments) {
 #[tokio::test]
 async fn mirror_reports_created_state_and_checkpoint_to_a_configured_experiments_server() {
     let (base_url, mock) = mock_experiments_server().await;
+    let store: Arc<dyn Store> = Arc::new(SqliteStore::open(":memory:").await.expect("store"));
     // Experiments::from_env only reads env at construction time, so the
     // mutation window is just this one call (mirrors the pattern the
-    // #[ignore]d live tests in experiments.rs already use).
-    std::env::set_var(chuk_train_proto::env::EXPERIMENTS_URL, &base_url);
-    std::env::set_var(chuk_train_proto::env::EXPERIMENTS_API_KEY, "test-key");
-    let store: Arc<dyn Store> = Arc::new(SqliteStore::open(":memory:").await.expect("store"));
-    let exp = Experiments::from_env(store.clone(), &base_url).expect("experiments client (env just set)");
-    std::env::remove_var(chuk_train_proto::env::EXPERIMENTS_URL);
-    std::env::remove_var(chuk_train_proto::env::EXPERIMENTS_API_KEY);
+    // #[ignore]d live tests in experiments.rs already use) — but it is still a
+    // process-global mutation, so it takes the shared lock that serializes it
+    // against `experiments::tests`'s own from_env test. Held across no await:
+    // everything inside is synchronous.
+    let exp = {
+        let _guard = crate::experiments::lock_experiments_env();
+        std::env::set_var(chuk_train_proto::env::EXPERIMENTS_URL, &base_url);
+        std::env::set_var(chuk_train_proto::env::EXPERIMENTS_API_KEY, "test-key");
+        let exp =
+            Experiments::from_env(store.clone(), &base_url).expect("experiments client (env just set)");
+        std::env::remove_var(chuk_train_proto::env::EXPERIMENTS_URL);
+        std::env::remove_var(chuk_train_proto::env::EXPERIMENTS_API_KEY);
+        exp
+    };
 
     let artifacts = Arc::new(FsArtifactStore::new(std::env::temp_dir()));
     let hub = Hub::new(store, artifacts, Some(exp), None);

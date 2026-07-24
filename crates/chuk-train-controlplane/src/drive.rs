@@ -85,6 +85,11 @@ pub struct DriveClient {
     client_id: String,
     client_secret: String,
     refresh_token: String,
+    /// The three Google endpoints this client calls, held as values rather than
+    /// used as constants directly so tests can point it at a loopback Drive.
+    token_url: String,
+    files_url: String,
+    upload_url: String,
     token: Mutex<Option<CachedToken>>,
     /// Full-path → folder-id cache (e.g. `chuk-train/runs/r1` → `<id>`).
     folders: Mutex<HashMap<String, String>>,
@@ -118,9 +123,29 @@ impl DriveClient {
             client_id,
             client_secret,
             refresh_token,
+            token_url: OAUTH_TOKEN_URL.to_owned(),
+            files_url: DRIVE_FILES_URL.to_owned(),
+            upload_url: DRIVE_UPLOAD_URL.to_owned(),
             token: Mutex::new(None),
             folders: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// A client pointed at a fake Drive on `base`, bypassing the env gating —
+    /// for tests that spin one up (mirrors `datasets.rs`'s `Datasets::at`).
+    #[cfg(test)]
+    pub(crate) fn at(base: &str) -> Self {
+        Self {
+            http: Client::new(),
+            client_id: "test-client-id".to_owned(),
+            client_secret: "test-client-secret".to_owned(),
+            refresh_token: "test-refresh-token".to_owned(),
+            token_url: format!("{base}/token"),
+            files_url: format!("{base}/drive/v3/files"),
+            upload_url: format!("{base}/upload/drive/v3/files"),
+            token: Mutex::new(None),
+            folders: Mutex::new(HashMap::new()),
+        }
     }
 
     /// A valid access token, refreshing (and caching) when the cached one is
@@ -134,7 +159,7 @@ impl DriveClient {
         }
         let resp = self
             .http
-            .post(OAUTH_TOKEN_URL)
+            .post(&self.token_url)
             .form(&[
                 ("client_id", self.client_id.as_str()),
                 ("client_secret", self.client_secret.as_str()),
@@ -196,7 +221,7 @@ impl DriveClient {
         );
         let resp = self
             .http
-            .get(DRIVE_FILES_URL)
+            .get(&self.files_url)
             .bearer_auth(&token)
             .query(&[
                 ("q", query.as_str()),
@@ -222,7 +247,7 @@ impl DriveClient {
         });
         let resp = self
             .http
-            .post(DRIVE_FILES_URL)
+            .post(&self.files_url)
             .bearer_auth(&token)
             .query(&[("fields", "id")])
             .json(&metadata)
@@ -266,7 +291,7 @@ impl DriveClient {
         let metadata = serde_json::json!({ "name": name, "parents": [parent_id] });
         let resp = self
             .http
-            .post(DRIVE_UPLOAD_URL)
+            .post(&self.upload_url)
             .bearer_auth(&token)
             .query(&[("uploadType", "resumable"), ("fields", "id")])
             .header("X-Upload-Content-Type", mime)
@@ -372,7 +397,7 @@ impl DriveClient {
     /// Download a file's bytes by id.
     pub async fn download(&self, file_id: &str) -> Result<Vec<u8>> {
         let token = self.access_token().await?;
-        let url = format!("{DRIVE_FILES_URL}/{file_id}");
+        let url = format!("{}/{file_id}", self.files_url);
         let resp = self
             .http
             .get(&url)
@@ -388,7 +413,7 @@ impl DriveClient {
     /// Permanently delete a file by id (used when a checkpoint is pruned).
     pub async fn delete(&self, file_id: &str) -> Result<()> {
         let token = self.access_token().await?;
-        let url = format!("{DRIVE_FILES_URL}/{file_id}");
+        let url = format!("{}/{file_id}", self.files_url);
         let resp = self
             .http
             .delete(&url)
@@ -449,6 +474,7 @@ fn now() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fakehttp::{FakeHttp, Received, Reply, REFUSED_ORIGIN};
 
     #[test]
     fn segments_skip_empties_and_slashes() {
@@ -475,39 +501,528 @@ mod tests {
         assert_eq!(escape_query(r"a\b"), r"a\\b");
     }
 
-    /// Live round-trip against real Drive. Ignored by default (needs a grant in
-    /// the env); run with `.env` sourced:
-    ///   cargo test -p chuk-train-controlplane drive::tests::live_round_trip -- --ignored --nocapture
-    /// Uses a >1-chunk payload so the resumable 308 → finalise path is exercised.
-    #[ignore]
-    #[tokio::test]
-    async fn live_round_trip() {
-        let client = match DriveClient::from_env().expect("build client") {
-            Some(c) => c,
-            None => {
-                eprintln!("skip: no {} in env", env_vars::GOOGLE_REFRESH_TOKEN);
-                return;
+    // -- the client itself, against a loopback fake Drive -------------------
+    //
+    // Everything below drives the real reqwest client through the real Drive v3
+    // request shapes (token refresh + caching, the folder walk, the resumable
+    // upload's 308/finalise/resume protocol, download, delete) against
+    // `fakehttp`. The live round-trip against Google's own servers stays in
+    // `drive/tests.rs`.
+
+    const TOKEN_JSON: &str = r#"{"access_token":"ya29.access","expires_in":3600}"#;
+
+    /// A Drive that answers the token refresh and hands out sequential file ids
+    /// for lookups/creates. `handler` sees only the non-token requests.
+    fn fake_drive<F>(handler: F) -> (FakeHttp, DriveClient)
+    where
+        F: Fn(&Received, usize) -> Reply + Send + Sync + 'static,
+    {
+        let server = FakeHttp::start(move |req, nth| {
+            if req.path().ends_with("/token") {
+                Reply::ok(TOKEN_JSON)
+            } else {
+                handler(req, nth)
             }
-        };
-        client.probe().await.expect("token refresh");
+        });
+        let client = DriveClient::at(&server.origin);
+        (server, client)
+    }
 
-        // 10 MiB pattern → two chunks (8 MiB + 2 MiB): a 308 then a finalise.
-        let payload: Vec<u8> = (0..10 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-        let folder = format!("{ARCHIVE_ROOT_FOLDER}/_smoke");
-        let suffix = now() as u64;
-        let name = format!("round-trip-{suffix}.bin");
+    /// Drive's "no such folder" answer to a lookup: an empty file list.
+    const NO_MATCH: &str = r#"{"files":[]}"#;
 
-        let file_id = client
-            .upload_to_path(&folder, &name, None, &payload)
+    #[tokio::test]
+    async fn the_access_token_is_refreshed_once_and_then_served_from_the_cache() {
+        let (server, client) = fake_drive(|_, _| Reply::ok(NO_MATCH));
+        client.probe().await.expect("probe refreshes the grant");
+        let first = client.access_token().await.expect("token");
+        let second = client.access_token().await.expect("cached token");
+
+        assert_eq!(first, "ya29.access");
+        assert_eq!(second, first);
+        assert_eq!(server.hits(), 1, "one refresh serves every later call");
+        let refresh = &server.requests()[0];
+        assert_eq!(refresh.method, "POST");
+        let form = String::from_utf8(refresh.body.clone()).expect("form body");
+        assert!(form.contains("grant_type=refresh_token"), "unexpected form: {form}");
+        assert!(form.contains("refresh_token=test-refresh-token"), "unexpected form: {form}");
+    }
+
+    #[tokio::test]
+    async fn a_token_inside_the_slack_window_is_refreshed_again() {
+        let (server, client) = fake_drive(|_, _| Reply::ok(NO_MATCH));
+        // Still valid, but inside TOKEN_SLACK_S of expiry: a long upload must
+        // not straddle the boundary, so it refreshes now.
+        *client.token.lock().await = Some(CachedToken {
+            access_token: "about-to-expire".to_owned(),
+            expires_at: now() + TOKEN_SLACK_S / 2.0,
+        });
+        assert_eq!(client.access_token().await.expect("token"), "ya29.access");
+        assert_eq!(server.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_grant_surfaces_googles_own_error_body() {
+        let server = FakeHttp::start(|_, _| Reply::new(400, r#"{"error":"invalid_grant"}"#));
+        let client = DriveClient::at(&server.origin);
+        let error = client.probe().await.unwrap_err();
+        assert!(error.to_string().contains("drive token refresh"), "unexpected error: {error}");
+        assert!(error.to_string().contains("invalid_grant"), "the body must survive: {error}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_drive_is_a_transport_error_not_a_panic() {
+        let client = DriveClient::at(REFUSED_ORIGIN);
+        let error = client.probe().await.unwrap_err();
+        assert!(
+            error.to_string().contains("drive token refresh request"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // -- the folder walk ----------------------------------------------------
+
+    #[tokio::test]
+    async fn ensure_folder_path_creates_each_missing_segment_under_the_last() {
+        let (server, client) = fake_drive(|req, _| match req.method.as_str() {
+            // Nothing exists yet...
+            "GET" => Reply::ok(NO_MATCH),
+            // ...so each segment is created, named after itself for the assert.
+            _ => {
+                let name = req.json()["name"].as_str().expect("name").to_owned();
+                Reply::ok(format!(r#"{{"id":"id-{name}"}}"#))
+            }
+        });
+
+        let leaf = client
+            .ensure_folder_path("chuk-train/runs/r1")
+            .await
+            .expect("ensure folder path");
+        assert_eq!(leaf, "id-r1");
+
+        let creates: Vec<serde_json::Value> = server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "POST" && !r.path().ends_with("/token"))
+            .map(Received::json)
+            .collect();
+        assert_eq!(creates.len(), 3, "one create per segment");
+        assert_eq!(creates[0]["parents"], serde_json::json!(["root"]));
+        assert_eq!(creates[1]["parents"], serde_json::json!(["id-chuk-train"]));
+        assert_eq!(creates[2]["parents"], serde_json::json!(["id-runs"]));
+        assert_eq!(creates[2]["mimeType"], FOLDER_MIME);
+    }
+
+    #[tokio::test]
+    async fn an_existing_folder_is_found_rather_than_duplicated() {
+        let (server, client) = fake_drive(|req, _| {
+            assert_eq!(req.method, "GET", "an existing folder must not be re-created");
+            Reply::ok(r#"{"files":[{"id":"already-there"}]}"#)
+        });
+
+        assert_eq!(client.ensure_folder_path("chuk-train").await.unwrap(), "already-there");
+        // The lookup escapes the name into Drive's `q` grammar.
+        let lookup = &server.requests()[1];
+        assert!(lookup.target.contains("trashed"), "unexpected query: {}", lookup.target);
+    }
+
+    #[tokio::test]
+    async fn a_resolved_folder_is_cached_so_a_runs_many_files_cost_one_walk() {
+        let (server, client) = fake_drive(|_, _| Reply::ok(r#"{"files":[{"id":"cached"}]}"#));
+        client.ensure_folder_path("chuk-train/runs").await.unwrap();
+        let after_first = server.hits();
+        client.ensure_folder_path("chuk-train/runs").await.unwrap();
+        assert_eq!(server.hits(), after_first, "the second walk hit the cache only");
+    }
+
+    #[tokio::test]
+    async fn a_refused_folder_lookup_is_reported_with_its_body() {
+        let (_server, client) = fake_drive(|_, _| Reply::new(403, "insufficientPermissions"));
+        let error = client.ensure_folder_path("chuk-train").await.unwrap_err();
+        assert!(error.to_string().contains("drive folder lookup"), "unexpected error: {error}");
+        assert!(error.to_string().contains("insufficientPermissions"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_folder_create_is_reported_with_its_body() {
+        let (_server, client) = fake_drive(|req, _| match req.method.as_str() {
+            "GET" => Reply::ok(NO_MATCH),
+            _ => Reply::new(403, "storageQuotaExceeded"),
+        });
+        let error = client.ensure_folder_path("chuk-train").await.unwrap_err();
+        assert!(error.to_string().contains("drive folder create"), "unexpected error: {error}");
+        assert!(error.to_string().contains("storageQuotaExceeded"), "unexpected error: {error}");
+    }
+
+    // -- the resumable upload ------------------------------------------------
+
+    // The resumable protocol's session URI is a URL Drive hands back, so these
+    // handlers are built with `start_with_origin`: they need the address of the
+    // very server they are about to run on.
+
+    #[tokio::test]
+    async fn upload_walks_the_folder_path_then_finalises_in_one_chunk() {
+        let payload = b"a small checkpoint".to_vec();
+        let total = payload.len();
+        let server = FakeHttp::start_with_origin(move |origin, req, _| {
+            match (req.method.as_str(), req.path()) {
+                (_, p) if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+                ("GET", "/drive/v3/files") => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+                ("POST", "/upload/drive/v3/files") => {
+                    Reply::ok(Vec::new()).header(LOCATION.as_str(), format!("{origin}/session"))
+                }
+                _ => {
+                    assert_eq!(
+                        req.header(CONTENT_RANGE.as_str()),
+                        format!("bytes 0-{}/{total}", total - 1)
+                    );
+                    Reply::ok(r#"{"id":"uploaded-file"}"#)
+                }
+            }
+        });
+        let client = DriveClient::at(&server.origin);
+
+        let id = client
+            .upload_to_path("chuk-train/runs/r1", "model.bin", None, &payload)
             .await
             .expect("upload");
-        eprintln!("uploaded {name} -> {file_id}");
+        assert_eq!(id, "uploaded-file");
 
-        let got = client.download(&file_id).await.expect("download");
-        assert_eq!(got.len(), payload.len(), "size round-trips");
-        assert_eq!(got, payload, "bytes round-trip");
+        let initiate = server
+            .requests()
+            .into_iter()
+            .find(|r| r.path() == "/upload/drive/v3/files")
+            .expect("initiate");
+        assert_eq!(initiate.header("x-upload-content-type"), OCTET_STREAM);
+        assert_eq!(initiate.header("x-upload-content-length"), total.to_string());
+        assert_eq!(initiate.json()["parents"], serde_json::json!(["folder-id"]));
+        assert_eq!(initiate.json()["name"], "model.bin");
+    }
 
-        client.delete(&file_id).await.expect("delete");
-        eprintln!("deleted {file_id} — round-trip ok");
+    #[tokio::test]
+    async fn a_multi_chunk_upload_resumes_after_each_308_and_reassembles_exactly() {
+        // Just over one chunk, so the 308 → next-chunk → finalise path runs.
+        let payload: Vec<u8> = (0..UPLOAD_CHUNK + 1024).map(|i| (i % 251) as u8).collect();
+        let total = payload.len();
+        let server = FakeHttp::start_with_origin(move |origin, req, _| {
+            match (req.method.as_str(), req.path()) {
+                (_, p) if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+                ("GET", "/drive/v3/files") => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+                ("POST", "/upload/drive/v3/files") => {
+                    Reply::ok(Vec::new()).header(LOCATION.as_str(), format!("{origin}/session"))
+                }
+                _ => {
+                    let range = req.header(CONTENT_RANGE.as_str());
+                    if range.starts_with(&format!("bytes 0-{}", UPLOAD_CHUNK - 1)) {
+                        Reply::new(308, Vec::new())
+                    } else {
+                        assert_eq!(range, format!("bytes {UPLOAD_CHUNK}-{}/{total}", total - 1));
+                        Reply::ok(r#"{"id":"big-file"}"#)
+                    }
+                }
+            }
+        });
+        let client = DriveClient::at(&server.origin);
+
+        let id = client
+            .upload_to_path("chuk-train", "big.bin", Some("application/x-tar"), &payload)
+            .await
+            .expect("upload");
+        assert_eq!(id, "big-file");
+
+        let sent: Vec<u8> = server
+            .requests()
+            .into_iter()
+            .filter(|r| r.path() == "/session")
+            .flat_map(|r| r.body)
+            .collect();
+        assert_eq!(sent.len(), total, "every byte was sent exactly once");
+        assert_eq!(sent, payload, "and reassembles to the original object");
+    }
+
+    #[tokio::test]
+    async fn an_empty_object_is_a_single_zero_length_finalising_put() {
+        let server = FakeHttp::start_with_origin(|origin, req, _| match req.path() {
+            p if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+            "/drive/v3/files" => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+            "/upload/drive/v3/files" => {
+                Reply::ok(Vec::new()).header(LOCATION.as_str(), format!("{origin}/session"))
+            }
+            _ => {
+                assert_eq!(req.header(CONTENT_RANGE.as_str()), "bytes */0");
+                assert!(req.body.is_empty());
+                Reply::ok(r#"{"id":"empty-file"}"#)
+            }
+        });
+        let client = DriveClient::at(&server.origin);
+        let id = client.upload_to_path("chuk-train", "empty.bin", None, &[]).await.unwrap();
+        assert_eq!(id, "empty-file");
+    }
+
+    #[tokio::test]
+    async fn an_initiate_without_a_session_uri_is_an_error() {
+        let server = FakeHttp::start_with_origin(|_, req, _| match req.path() {
+            p if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+            "/drive/v3/files" => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+            // 200, but no Location header.
+            _ => Reply::ok(Vec::new()),
+        });
+        let client = DriveClient::at(&server.origin);
+        let error = client.upload_to_path("chuk-train", "x.bin", None, b"x").await.unwrap_err();
+        assert!(error.to_string().contains("no Location header"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_initiate_is_reported_with_its_body() {
+        let server = FakeHttp::start_with_origin(|_, req, _| match req.path() {
+            p if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+            "/drive/v3/files" => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+            _ => Reply::new(403, "quotaExceeded"),
+        });
+        let client = DriveClient::at(&server.origin);
+        let error = client.upload_to_path("chuk-train", "x.bin", None, b"x").await.unwrap_err();
+        assert!(error.to_string().contains("drive resumable initiate"), "unexpected error: {error}");
+        assert!(error.to_string().contains("quotaExceeded"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_chunk_is_re_sent_from_the_offset_drive_says_it_committed() {
+        // The first chunk PUT fails; the status query reports 512 bytes
+        // committed, so the retry resumes from there rather than restarting.
+        let payload: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+        let server = FakeHttp::start_with_origin(|origin, req, _| match req.path() {
+            p if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+            "/drive/v3/files" => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+            "/upload/drive/v3/files" => {
+                Reply::ok(Vec::new()).header(LOCATION.as_str(), format!("{origin}/session"))
+            }
+            _ => {
+                let range = req.header(CONTENT_RANGE.as_str()).to_owned();
+                if range == "bytes */2048" {
+                    // The status query: 512 bytes are committed.
+                    Reply::new(308, Vec::new()).header(RANGE.as_str(), "bytes=0-511")
+                } else if range.starts_with("bytes 0-") {
+                    Reply::new(503, "backendError")
+                } else {
+                    assert_eq!(range, "bytes 512-2047/2048");
+                    Reply::ok(r#"{"id":"resumed-file"}"#)
+                }
+            }
+        });
+        let client = DriveClient::at(&server.origin);
+
+        let id = client.upload_to_path("chuk-train", "x.bin", None, &payload).await.unwrap();
+        assert_eq!(id, "resumed-file");
+    }
+
+    #[tokio::test]
+    async fn a_status_query_that_reports_no_committed_range_resumes_from_zero() {
+        let payload: Vec<u8> = vec![7; 1024];
+        let server = FakeHttp::start_with_origin(|origin, req, nth| match req.path() {
+            p if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+            "/drive/v3/files" => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+            "/upload/drive/v3/files" => {
+                Reply::ok(Vec::new()).header(LOCATION.as_str(), format!("{origin}/session"))
+            }
+            _ => {
+                let range = req.header(CONTENT_RANGE.as_str()).to_owned();
+                if range == "bytes */1024" {
+                    Reply::new(308, Vec::new()) // no Range header at all
+                } else if nth < 4 {
+                    Reply::new(503, "backendError")
+                } else {
+                    assert_eq!(range, "bytes 0-1023/1024", "restarted from the beginning");
+                    Reply::ok(r#"{"id":"restarted-file"}"#)
+                }
+            }
+        });
+        let client = DriveClient::at(&server.origin);
+        assert_eq!(
+            client.upload_to_path("chuk-train", "x.bin", None, &payload).await.unwrap(),
+            "restarted-file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_status_query_that_says_it_already_finished_stops_re_sending() {
+        let payload: Vec<u8> = vec![7; 1024];
+        let server = FakeHttp::start_with_origin(|origin, req, _| match req.path() {
+            p if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+            "/drive/v3/files" => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+            "/upload/drive/v3/files" => {
+                Reply::ok(Vec::new()).header(LOCATION.as_str(), format!("{origin}/session"))
+            }
+            _ if req.header(CONTENT_RANGE.as_str()) == "bytes */1024" => {
+                // 200 to the status query: the object actually landed.
+                Reply::ok(r#"{"id":"already-there"}"#)
+            }
+            // Every real chunk fails, so only the status query can end this.
+            _ => Reply::new(503, "backendError"),
+        });
+        let client = DriveClient::at(&server.origin);
+
+        // Offset reaches total, the loop exits without a finalising response.
+        let error = client.upload_to_path("chuk-train", "x.bin", None, &payload).await.unwrap_err();
+        assert!(
+            error.to_string().contains("without a finalising response"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunk_that_keeps_failing_gives_up_after_the_retry_budget() {
+        let payload: Vec<u8> = vec![7; 1024];
+        let server = FakeHttp::start_with_origin(|origin, req, _| match req.path() {
+            p if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+            "/drive/v3/files" => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+            "/upload/drive/v3/files" => {
+                Reply::ok(Vec::new()).header(LOCATION.as_str(), format!("{origin}/session"))
+            }
+            _ if req.header(CONTENT_RANGE.as_str()) == "bytes */1024" => {
+                Reply::new(308, Vec::new()).header(RANGE.as_str(), "bytes=0-0")
+            }
+            _ => Reply::new(500, "internalError"),
+        });
+        let client = DriveClient::at(&server.origin);
+
+        let error = client.upload_to_path("chuk-train", "x.bin", None, &payload).await.unwrap_err();
+        assert!(error.to_string().contains("drive chunk upload failed"), "unexpected error: {error}");
+        assert!(error.to_string().contains("internalError"), "unexpected error: {error}");
+        // MAX_CHUNK_RETRIES retries, then the giving-up attempt.
+        let chunks = server
+            .requests()
+            .iter()
+            .filter(|r| r.path() == "/session" && !r.body.is_empty())
+            .count();
+        assert_eq!(chunks as u32, MAX_CHUNK_RETRIES + 1);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_mid_upload_is_a_transport_error_after_the_budget() {
+        // The session URI points somewhere that refuses connections, so every
+        // chunk PUT *and* every status query fails at the transport layer.
+        let server = FakeHttp::start_with_origin(|_, req, _| match req.path() {
+            p if p.ends_with("/token") => Reply::ok(TOKEN_JSON),
+            "/drive/v3/files" => Reply::ok(r#"{"files":[{"id":"folder-id"}]}"#),
+            _ => Reply::ok(Vec::new()).header(LOCATION.as_str(), format!("{REFUSED_ORIGIN}/session")),
+        });
+        let client = DriveClient::at(&server.origin);
+
+        let error = client.upload_to_path("chuk-train", "x.bin", None, b"bytes").await.unwrap_err();
+        assert!(
+            error.to_string().contains("drive resumable status query"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // -- download / delete ---------------------------------------------------
+
+    #[tokio::test]
+    async fn download_asks_for_the_media_and_returns_the_bytes() {
+        let (server, client) = fake_drive(|_, _| Reply::ok(b"checkpoint bytes".to_vec()));
+        let got = client.download("file-123").await.expect("download");
+
+        assert_eq!(got, b"checkpoint bytes");
+        let get = &server.requests()[1];
+        assert_eq!(get.path(), "/drive/v3/files/file-123");
+        assert!(get.target.contains("alt=media"), "unexpected target: {}", get.target);
+        assert_eq!(get.header("authorization"), "Bearer ya29.access");
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_fails_the_download_with_drives_message() {
+        let (_server, client) = fake_drive(|_, _| Reply::new(404, "File not found: file-123"));
+        let error = client.download("file-123").await.unwrap_err();
+        assert!(error.to_string().contains("drive download"), "unexpected error: {error}");
+        assert!(error.to_string().contains("File not found"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_file_by_id() {
+        let (server, client) = fake_drive(|_, _| Reply::ok(Vec::new()));
+        client.delete("file-123").await.expect("delete");
+
+        let delete = &server.requests()[1];
+        assert_eq!(delete.method, "DELETE");
+        assert_eq!(delete.path(), "/drive/v3/files/file-123");
+    }
+
+    #[tokio::test]
+    async fn a_refused_delete_is_reported_with_its_body() {
+        let (_server, client) = fake_drive(|_, _| Reply::new(403, "insufficientFilePermissions"));
+        let error = client.delete("file-123").await.unwrap_err();
+        assert!(error.to_string().contains("drive delete"), "unexpected error: {error}");
+        assert!(error.to_string().contains("insufficientFilePermissions"), "unexpected error: {error}");
+    }
+
+    // -- from_env ------------------------------------------------------------
+
+    /// Touches the process-global Google env vars, so it is one `#[test]`
+    /// rather than several that could interleave (same convention as
+    /// `artifacts::s3`'s `from_env` test).
+    #[test]
+    fn from_env_is_off_without_a_refresh_token_and_names_whichever_half_is_missing() {
+        let restore: Vec<(&str, Option<String>)> = [
+            env_vars::GOOGLE_REFRESH_TOKEN,
+            env_vars::GOOGLE_CLIENT_ID,
+            env_vars::GOOGLE_CLIENT_SECRET,
+        ]
+        .iter()
+        .map(|var| (*var, std::env::var(var).ok()))
+        .collect();
+        for (var, _) in &restore {
+            std::env::remove_var(var);
+        }
+
+        // `DriveClient` has no `Debug`, so each case matches rather than
+        // unwrapping (which would need one just for the test).
+        let configured = || match DriveClient::from_env() {
+            Ok(client) => client,
+            Err(error) => panic!("the archive tier being off is not an error: {error}"),
+        };
+        let refused = || match DriveClient::from_env() {
+            Ok(_) => panic!("half-configured must be an error, not a silent no-op"),
+            Err(error) => error,
+        };
+
+        assert!(
+            configured().is_none(),
+            "the archive tier is simply off without a refresh token"
+        );
+        // Blank counts as absent, not as a misconfiguration.
+        std::env::set_var(env_vars::GOOGLE_REFRESH_TOKEN, "   ");
+        assert!(configured().is_none());
+
+        std::env::set_var(env_vars::GOOGLE_REFRESH_TOKEN, "1//refresh");
+        let error = refused();
+        assert!(error.to_string().contains(env_vars::GOOGLE_CLIENT_ID), "unexpected error: {error}");
+
+        std::env::set_var(env_vars::GOOGLE_CLIENT_ID, "client-id");
+        let error = refused();
+        assert!(
+            error.to_string().contains(env_vars::GOOGLE_CLIENT_SECRET),
+            "unexpected error: {error}"
+        );
+
+        std::env::set_var(env_vars::GOOGLE_CLIENT_SECRET, "client-secret");
+        let client = configured().expect("fully configured");
+        assert_eq!(client.token_url, OAUTH_TOKEN_URL);
+        assert_eq!(client.files_url, DRIVE_FILES_URL);
+        assert_eq!(client.upload_url, DRIVE_UPLOAD_URL);
+
+        for (var, value) in restore {
+            match value {
+                Some(value) => std::env::set_var(var, value),
+                None => std::env::remove_var(var),
+            }
+        }
     }
 }
+
+/// Live round-trip against real Drive — see `drive/tests.rs`. Kept in a
+/// `tests.rs` sibling because it is `#[ignore]`d and can never run in CI (it
+/// needs a real Google grant): the coverage gate excludes `tests.rs` files, so
+/// permanently-unrunnable lines don't count against this module's coverage.
+#[cfg(test)]
+#[path = "drive/tests.rs"]
+mod live;
