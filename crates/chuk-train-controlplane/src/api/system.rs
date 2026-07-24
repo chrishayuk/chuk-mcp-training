@@ -119,7 +119,75 @@ fn not_available(message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    use axum::body::to_bytes;
+
     use super::*;
+    use crate::artifacts::FsArtifactStore;
+    use crate::config::Config;
+    use crate::lease::LeaseManager;
+    use crate::provider::build_providers;
+    use crate::store::SqliteStore;
+    use crate::AppState;
+
+    fn base_config(agent_dir: Option<String>) -> Config {
+        Config {
+            api_token: "test-api-token".into(),
+            join_token: "test-join-token".into(),
+            store_spec: ":memory:".into(),
+            artifacts_spec: "file:./unused".into(),
+            public_url: "http://127.0.0.1:9".into(),
+            host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 9,
+            providers: "mock".into(),
+            agent_ws_url: "ws://127.0.0.1:9/ws".into(),
+            agent_bin: None,
+            agent_dir,
+            min_protocol: 0,
+            vast_api_key: None,
+            drain_window_min: 5.0,
+            confirm_cost_threshold: 0.0,
+            reconcile_interval: Duration::from_secs(30),
+            idle_reap: Duration::from_secs(60),
+            google_client_id: None,
+            google_client_secret: None,
+            allowed_emails: vec![],
+            sysadmin_email: None,
+        }
+    }
+
+    /// A real (if minimal) `AppState`: `serve_agent` takes `State<Arc<AppState>>`
+    /// directly, so there is no lighter seam than building one — mirrors
+    /// `dash.rs`'s `test_state` helper.
+    async fn test_state(agent_dir: Option<String>) -> Arc<AppState> {
+        let store: Arc<dyn crate::store::Store> =
+            Arc::new(SqliteStore::open(":memory:").await.expect("store"));
+        let artifacts: Arc<dyn crate::artifacts::ArtifactStore> =
+            Arc::new(FsArtifactStore::new(std::env::temp_dir()));
+        let hub = crate::hub::Hub::new(store, artifacts.clone(), None, None);
+        let providers = Arc::new(build_providers("mock", None, None));
+        let config = base_config(agent_dir);
+        let leases = LeaseManager::new(hub.clone(), providers, config.clone());
+        Arc::new(AppState {
+            config,
+            hub,
+            artifacts,
+            leases,
+            drive: None,
+            archiver: None,
+            key_encryption_key: None,
+        })
+    }
+
+    /// A fresh, empty directory under the system temp dir, unique per call so
+    /// parallel tests never collide.
+    fn unique_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("chuk-system-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).expect("create temp agent dir");
+        dir
+    }
 
     #[test]
     fn resolves_known_targets_and_checksum_suffix() {
@@ -159,5 +227,114 @@ mod tests {
     async fn healthz_is_ok() {
         let Json(body) = healthz().await;
         assert_eq!(body["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn serve_agent_404s_for_a_target_not_in_the_allowlist() {
+        let state = test_state(None).await;
+        let resp = serve_agent(State(state), Path("bogus-target".to_owned())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let error: ApiError = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(error.error, "unknown worker target");
+    }
+
+    #[tokio::test]
+    async fn serve_agent_falls_back_to_the_default_agent_dir_when_unconfigured() {
+        // No agent_dir configured: exercises the `unwrap_or_else(DEFAULT_AGENT_DIR)`
+        // fallback. Nothing lives there in the test sandbox, so this still 404s,
+        // but via the default-dir path rather than a configured one.
+        let state = test_state(None).await;
+        let resp = serve_agent(State(state), Path(SUPPORTED_TARGETS[0].to_owned())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_agent_404s_when_the_binary_is_missing_on_disk() {
+        let dir = unique_dir();
+        let state = test_state(Some(dir.to_string_lossy().into_owned())).await;
+        let target = SUPPORTED_TARGETS[0];
+        let resp = serve_agent(State(state), Path(target.to_owned())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let error: ApiError = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(error.error, "worker binary not available for this target");
+    }
+
+    #[tokio::test]
+    async fn serve_agent_serves_the_checksum_for_a_present_binary() {
+        let dir = unique_dir();
+        let target = SUPPORTED_TARGETS[0];
+        let contents = b"fake worker binary bytes";
+        std::fs::write(dir.join(target), contents).expect("write fake binary");
+        let state = test_state(Some(dir.to_string_lossy().into_owned())).await;
+
+        let resp = serve_agent(State(state), Path(format!("{target}{AGENT_SHA256_SUFFIX}"))).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            hex::encode(Sha256::digest(contents))
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_agent_serves_the_binary_with_download_headers() {
+        let dir = unique_dir();
+        let target = SUPPORTED_TARGETS[0];
+        let contents = b"fake worker binary bytes";
+        std::fs::write(dir.join(target), contents).expect("write fake binary");
+        let state = test_state(Some(dir.to_string_lossy().into_owned())).await;
+
+        let resp = serve_agent(State(state), Path(target.to_owned())).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            &format!("attachment; filename=\"{WORKER_FILENAME}\"")
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        assert_eq!(&body[..], contents);
+    }
+
+    #[tokio::test]
+    async fn binary_sha_is_none_for_a_target_not_in_the_allowlist() {
+        let dir = unique_dir();
+        assert_eq!(binary_sha(Some(dir.to_str().unwrap()), "bogus-target").await, None);
+    }
+
+    #[tokio::test]
+    async fn binary_sha_is_none_when_the_binary_is_missing_on_disk() {
+        let dir = unique_dir();
+        assert_eq!(binary_sha(Some(dir.to_str().unwrap()), SUPPORTED_TARGETS[0]).await, None);
+    }
+
+    #[tokio::test]
+    async fn binary_sha_hashes_the_binary_when_present() {
+        let dir = unique_dir();
+        let target = SUPPORTED_TARGETS[1];
+        let contents = b"another fake worker binary";
+        std::fs::write(dir.join(target), contents).expect("write fake binary");
+
+        let sha = binary_sha(Some(dir.to_str().unwrap()), target).await;
+
+        assert_eq!(sha, Some(hex::encode(Sha256::digest(contents))));
+    }
+
+    #[tokio::test]
+    async fn binary_sha_uses_the_default_dir_when_none_is_configured() {
+        // No agent dir configured and nothing at the default image path in the
+        // test sandbox, so this exercises the `unwrap_or(DEFAULT_AGENT_DIR)`
+        // fallback and still resolves to `None`.
+        assert_eq!(binary_sha(None, SUPPORTED_TARGETS[0]).await, None);
     }
 }

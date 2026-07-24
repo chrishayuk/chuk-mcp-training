@@ -26,25 +26,20 @@ EXCLUDE = ("src/main.rs", "/examples/")
 # codebase that had never been coverage-gated. Being paid down file by file.
 BOOTSTRAP_EXCLUDE = {
     "chuk-train-controlplane/src/api/access.rs",
-    "chuk-train-controlplane/src/api/archive.rs",
-    "chuk-train-controlplane/src/api/checkpoints.rs",
     "chuk-train-controlplane/src/api/leases.rs",
     "chuk-train-controlplane/src/api/mod.rs",
     "chuk-train-controlplane/src/api/runs.rs",
-    "chuk-train-controlplane/src/api/system.rs",
     "chuk-train-controlplane/src/archive.rs",
-    "chuk-train-controlplane/src/artifacts/fs.rs",
-    "chuk-train-controlplane/src/artifacts/s3.rs",
     "chuk-train-controlplane/src/auth.rs",
     "chuk-train-controlplane/src/drive.rs",
     "chuk-train-controlplane/src/experiments.rs",
     "chuk-train-controlplane/src/lease.rs",
-    "chuk-train-controlplane/src/provider/mock.rs",
-    "chuk-train-controlplane/src/provider/vast.rs",
-    "chuk-train-controlplane/src/upload.rs",
     "chuk-train-controlplane/src/ws.rs",
-    "chuk-compute-worker/src/httpclient.rs",
-    "chuk-compute-worker/src/selfupdate.rs",
+    # Genuinely can't clear 90% without a live S3/R2 endpoint (put/get/exists/
+    # delete/copy and apply_lifecycle's network calls) -- see the module's own
+    # doc comment and its #[ignore]d live::lifecycle_round_trip test. Real gap,
+    # kept honest rather than force-tested. Currently 78.29%.
+    "chuk-train-controlplane/src/artifacts/s3.rs",
 }
 
 data = json.load(sys.stdin)

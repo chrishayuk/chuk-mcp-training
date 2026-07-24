@@ -151,3 +151,349 @@ pub async fn blob(State(state): State<Arc<AppState>>, Path(key): Path<String>) -
             .into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    use axum::body::to_bytes;
+    use chuk_train_proto::{keys, CheckpointMeta, RunSpec, ShellSpec};
+
+    use super::*;
+    use crate::artifacts::FsArtifactStore;
+    use crate::config::Config;
+    use crate::lease::LeaseManager;
+    use crate::provider::build_providers;
+    use crate::store::SqliteStore;
+    use crate::AppState;
+
+    fn test_ctx(role: Role) -> AuthContext {
+        AuthContext {
+            role,
+            team_id: "default".into(),
+            subject: "tester".into(),
+            owner_email: "tester@example.com".into(),
+        }
+    }
+
+    fn shell_run() -> RunSpec {
+        RunSpec::Shell(ShellSpec { command: "true".into(), timeout_s: 60 })
+    }
+
+    /// A real (if minimal) `AppState`, matching `dash.rs`'s/`archive.rs`'s
+    /// pattern — these handlers take `State<Arc<AppState>>` directly, so
+    /// there's no lighter seam. Each call gets its own artifact-store root (a
+    /// fresh temp dir) since — unlike `dash.rs`'s state, which never touches
+    /// the artifact store — `serve_checkpoint`/`blob` here read and write real
+    /// bytes and must not collide across tests.
+    async fn test_state() -> Arc<AppState> {
+        let store: Arc<dyn crate::store::Store> =
+            Arc::new(SqliteStore::open(":memory:").await.expect("store"));
+        let root = std::env::temp_dir().join(format!("chuk-checkpoints-test-{}", uuid::Uuid::new_v4()));
+        let artifacts: Arc<dyn crate::artifacts::ArtifactStore> = Arc::new(FsArtifactStore::new(root));
+        let hub = crate::hub::Hub::new(store, artifacts.clone(), None, None);
+        let providers = Arc::new(build_providers("mock", None, None));
+        let config = Config {
+            api_token: "test-api-token".into(),
+            join_token: "test-join-token".into(),
+            store_spec: ":memory:".into(),
+            artifacts_spec: "file:./unused".into(),
+            public_url: "http://127.0.0.1:9".into(),
+            host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 9,
+            providers: "mock".into(),
+            agent_ws_url: "ws://127.0.0.1:9/ws".into(),
+            agent_bin: None,
+            agent_dir: None,
+            min_protocol: 0,
+            vast_api_key: None,
+            drain_window_min: 5.0,
+            confirm_cost_threshold: 0.0,
+            reconcile_interval: Duration::from_secs(30),
+            idle_reap: Duration::from_secs(60),
+            google_client_id: None,
+            google_client_secret: None,
+            allowed_emails: vec![],
+            sysadmin_email: None,
+        };
+        let leases = LeaseManager::new(hub.clone(), providers, config.clone());
+        Arc::new(AppState {
+            config,
+            hub,
+            artifacts,
+            leases,
+            drive: None,
+            archiver: None,
+            key_encryption_key: None,
+        })
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    async fn body_bytes(resp: Response) -> Vec<u8> {
+        to_bytes(resp.into_body(), usize::MAX).await.expect("read body").to_vec()
+    }
+
+    // ---- list_checkpoints --------------------------------------------------
+
+    #[tokio::test]
+    async fn list_checkpoints_returns_recorded_checkpoints_in_step_order() {
+        let state = test_state().await;
+        let run = state.hub.submit("r", &shell_run(), None, None).await.unwrap();
+        state
+            .hub
+            .store
+            .record_checkpoint(&run, 2, "ckpt-hot/r/step_2", "hash2", &CheckpointMeta::default())
+            .await
+            .unwrap();
+        state
+            .hub
+            .store
+            .record_checkpoint(&run, 1, "ckpt-hot/r/step_1", "hash1", &CheckpointMeta::default())
+            .await
+            .unwrap();
+
+        let resp = list_checkpoints(State(state), Path(run.0.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let rows = body.as_array().expect("array");
+        assert_eq!(rows.len(), 2);
+        // Stored ordered by step ascending, regardless of recording order.
+        assert_eq!(rows[0]["step"], 1);
+        assert_eq!(rows[1]["step"], 2);
+    }
+
+    #[tokio::test]
+    async fn list_checkpoints_is_empty_for_an_unknown_run() {
+        let state = test_state().await;
+        let resp = list_checkpoints(State(state), Path("RUN-does-not-exist".into())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await, serde_json::json!([]));
+    }
+
+    // ---- pin_checkpoint -----------------------------------------------------
+
+    #[tokio::test]
+    async fn pin_checkpoint_refuses_below_write_role() {
+        let state = test_state().await;
+        let resp = pin_checkpoint(
+            State(state),
+            axum::Extension(test_ctx(Role::Read)),
+            Path("RUN-1".into()),
+            Json(PinCheckpointRequest { step: 1, name: "best".into() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn pin_checkpoint_pins_an_existing_checkpoint() {
+        let state = test_state().await;
+        let run = state.hub.submit("r", &shell_run(), None, None).await.unwrap();
+        state
+            .hub
+            .store
+            .record_checkpoint(&run, 3, "ckpt-hot/r/step_3", "hash3", &CheckpointMeta::default())
+            .await
+            .unwrap();
+
+        let resp = pin_checkpoint(
+            State(state.clone()),
+            axum::Extension(test_ctx(Role::Write)),
+            Path(run.0.clone()),
+            Json(PinCheckpointRequest { step: 3, name: "best".into() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await, serde_json::json!({ "ok": true }));
+
+        let ckpts = state.hub.store.checkpoints(&run).await.unwrap();
+        assert!(ckpts[0].pinned);
+        assert_eq!(ckpts[0].pin_name.as_deref(), Some("best"));
+    }
+
+    #[tokio::test]
+    async fn pin_checkpoint_404s_for_an_unknown_checkpoint() {
+        let state = test_state().await;
+        let run = state.hub.submit("r", &shell_run(), None, None).await.unwrap();
+        let resp = pin_checkpoint(
+            State(state),
+            axum::Extension(test_ctx(Role::Admin)),
+            Path(run.0.clone()),
+            Json(PinCheckpointRequest { step: 99, name: "nope".into() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], ERR_CKPT_NOT_FOUND);
+    }
+
+    // ---- serve_checkpoint ----------------------------------------------------
+
+    #[tokio::test]
+    async fn serve_checkpoint_rejects_an_unsafe_file_name() {
+        let state = test_state().await;
+        let resp = serve_checkpoint(State(state), Path(("RUN-1".into(), 1, "..".into()))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn serve_checkpoint_rejects_a_nested_file_name() {
+        let state = test_state().await;
+        let resp = serve_checkpoint(State(state), Path(("RUN-1".into(), 1, "a/b".into()))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn serve_checkpoint_404s_when_the_step_is_not_recorded() {
+        let state = test_state().await;
+        let run = state.hub.submit("r", &shell_run(), None, None).await.unwrap();
+        let resp = serve_checkpoint(State(state), Path((run.0.clone(), 1, "model.bin".into()))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_checkpoint_404s_when_the_recorded_bytes_are_missing() {
+        let state = test_state().await;
+        let run = state.hub.submit("r", &shell_run(), None, None).await.unwrap();
+        // Metadata recorded, but the file was never actually uploaded to the
+        // artifact store — the hot-path fallback (no presign) must 404, not panic.
+        state
+            .hub
+            .store
+            .record_checkpoint(&run, 1, "ckpt-hot/r/step_1", "hash1", &CheckpointMeta::default())
+            .await
+            .unwrap();
+        let resp = serve_checkpoint(State(state), Path((run.0.clone(), 1, "model.bin".into()))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_checkpoint_serves_hot_bytes_from_the_artifact_store() {
+        let state = test_state().await;
+        let run = state.hub.submit("r", &shell_run(), None, None).await.unwrap();
+        state
+            .hub
+            .store
+            .record_checkpoint(&run, 1, "ckpt-hot/r/step_1", "hash1", &CheckpointMeta::default())
+            .await
+            .unwrap();
+        state
+            .artifacts
+            .put(&keys::checkpoint_file(&run.0, 1, "model.bin"), b"weights-v1".to_vec())
+            .await
+            .unwrap();
+
+        let resp = serve_checkpoint(State(state), Path((run.0.clone(), 1, "model.bin".into()))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"weights-v1");
+    }
+
+    #[tokio::test]
+    async fn serve_checkpoint_serves_promoted_final_bytes_from_the_final_prefix() {
+        let state = test_state().await;
+        let run = state.hub.submit("r", &shell_run(), None, None).await.unwrap();
+        state
+            .hub
+            .store
+            .record_checkpoint(&run, 1, "ckpt-hot/r/step_1", "hash1", &CheckpointMeta::default())
+            .await
+            .unwrap();
+        state
+            .hub
+            .store
+            .set_checkpoint_location(&run, 1, chuk_train_proto::CheckpointLocation::R2Final)
+            .await
+            .unwrap();
+        // Only the *final* key holds bytes — proves the handler reads from
+        // ckpt-final/, not ckpt-hot/, once promoted.
+        state
+            .artifacts
+            .put(&keys::checkpoint_final_file(&run.0, 1, "model.bin"), b"weights-final".to_vec())
+            .await
+            .unwrap();
+
+        let resp = serve_checkpoint(State(state), Path((run.0.clone(), 1, "model.bin".into()))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"weights-final");
+    }
+
+    #[tokio::test]
+    async fn serve_checkpoint_errors_when_marked_on_drive_but_drive_is_not_configured() {
+        let state = test_state().await;
+        let run = state.hub.submit("r", &shell_run(), None, None).await.unwrap();
+        state
+            .hub
+            .store
+            .record_checkpoint(&run, 1, "ckpt-hot/r/step_1", "hash1", &CheckpointMeta::default())
+            .await
+            .unwrap();
+        state
+            .hub
+            .store
+            .set_checkpoint_location(&run, 1, chuk_train_proto::CheckpointLocation::Drive)
+            .await
+            .unwrap();
+
+        let resp = serve_checkpoint(State(state), Path((run.0.clone(), 1, "model.bin".into()))).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ---- artifact_url ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn artifact_url_falls_back_to_the_blob_endpoint_for_a_backend_with_no_native_signing() {
+        let state = test_state().await;
+        let before = super::now();
+        let resp = artifact_url(
+            State(state),
+            Query(ArtifactUrlParams { key: "some/key".into(), ttl_s: None }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["url"], "http://127.0.0.1:9/api/blob/some/key");
+        let expires_at = body["expires_at"].as_f64().expect("expires_at");
+        // Default TTL is 3600s; allow generous slack for test wall-clock.
+        assert!(expires_at >= before + 3500.0 && expires_at <= before + 3700.0);
+    }
+
+    #[tokio::test]
+    async fn artifact_url_honors_a_custom_ttl() {
+        let state = test_state().await;
+        let before = super::now();
+        let resp = artifact_url(
+            State(state),
+            Query(ArtifactUrlParams { key: "k".into(), ttl_s: Some(60) }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let expires_at = body["expires_at"].as_f64().expect("expires_at");
+        assert!(expires_at >= before + 30.0 && expires_at <= before + 120.0);
+    }
+
+    // ---- blob -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn blob_serves_bytes_that_were_put() {
+        let state = test_state().await;
+        state.artifacts.put("some/key", b"blob-bytes".to_vec()).await.unwrap();
+        let resp = blob(State(state), Path("some/key".into())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"blob-bytes");
+    }
+
+    #[tokio::test]
+    async fn blob_404s_for_a_missing_key() {
+        let state = test_state().await;
+        let resp = blob(State(state), Path("no/such/key".into())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "no such artifact");
+    }
+}
