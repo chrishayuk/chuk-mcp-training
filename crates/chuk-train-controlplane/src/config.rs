@@ -198,3 +198,406 @@ fn required_token(var: &str) -> Result<String> {
     anyhow::ensure!(!value.trim().is_empty(), "{var} must not be empty");
     Ok(value)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes every test in this module: `Config::from_env` reads
+    /// process-wide env vars, and `cargo test` runs tests on multiple
+    /// threads within the same process, so unsynchronized tests would
+    /// stomp on each other's env state.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Every env var `Config::from_env` reads, including the `PORT`
+    /// PaaS-convention fallback. Cleared at the top of every test so a
+    /// leftover value from a previous test (or the real process env —
+    /// never the repo's `.env` file, which is not loaded here) can't
+    /// leak into an assertion.
+    const ALL_VARS: &[&str] = &[
+        env::API_TOKEN,
+        env::JOIN_TOKEN,
+        env::STORE_URL,
+        env::DB_PATH,
+        env::ARTIFACTS_DIR,
+        PUBLIC_URL_VAR,
+        env::HOST,
+        env::PORT,
+        FALLBACK_PORT_VAR,
+        env::PROVIDERS,
+        env::AGENT_WS_URL,
+        env::AGENT_BIN,
+        env::AGENT_DIR,
+        env::MIN_PROTOCOL,
+        env::VAST_API_KEY,
+        env::RECONCILE_INTERVAL_S,
+        env::IDLE_REAP_S,
+        env::DRAIN_WINDOW_MIN,
+        env::CONFIRM_COST_THRESHOLD,
+        env::ALLOWED_EMAILS,
+        env::GOOGLE_CLIENT_ID,
+        env::GOOGLE_CLIENT_SECRET,
+        env::SYSADMIN_EMAIL,
+    ];
+
+    fn clear_env() {
+        for var in ALL_VARS {
+            std::env::remove_var(var);
+        }
+    }
+
+    fn set_required_tokens() {
+        std::env::set_var(env::API_TOKEN, "api-secret");
+        std::env::set_var(env::JOIN_TOKEN, "join-secret");
+    }
+
+    /// A fully-populated `Config` for exercising the pure methods
+    /// (`auth_enabled`, `bootstrap_sysadmin`) without touching env vars.
+    fn base_config() -> Config {
+        Config {
+            api_token: "t".into(),
+            join_token: "j".into(),
+            store_spec: "sqlite:test.db".into(),
+            artifacts_spec: "file:/tmp/artifacts".into(),
+            public_url: "http://127.0.0.1:8700".into(),
+            host: DEFAULT_HOST,
+            port: DEFAULT_PORT,
+            providers: DEFAULT_PROVIDERS.into(),
+            agent_ws_url: "ws://127.0.0.1:8700/ws/agent".into(),
+            agent_bin: None,
+            agent_dir: None,
+            min_protocol: 1,
+            vast_api_key: None,
+            drain_window_min: DEFAULT_DRAIN_WINDOW_MIN,
+            confirm_cost_threshold: chuk_train_proto::DEFAULT_CONFIRM_COST_THRESHOLD,
+            reconcile_interval: DEFAULT_RECONCILE_INTERVAL,
+            idle_reap: DEFAULT_IDLE_REAP,
+            google_client_id: None,
+            google_client_secret: None,
+            allowed_emails: Vec::new(),
+            sysadmin_email: None,
+        }
+    }
+
+    #[test]
+    fn missing_api_token_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains(env::API_TOKEN));
+
+        clear_env();
+    }
+
+    #[test]
+    fn empty_or_whitespace_api_token_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+
+        std::env::set_var(env::API_TOKEN, "");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+
+        std::env::set_var(env::API_TOKEN, "   ");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+
+        clear_env();
+    }
+
+    #[test]
+    fn missing_join_token_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::set_var(env::API_TOKEN, "api-secret");
+
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains(env::JOIN_TOKEN));
+
+        clear_env();
+    }
+
+    #[test]
+    fn defaults_when_optional_vars_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+
+        let cfg = Config::from_env().unwrap();
+
+        assert_eq!(cfg.api_token, "api-secret");
+        assert_eq!(cfg.join_token, "join-secret");
+        assert_eq!(cfg.store_spec, "sqlite:chuk_train.db");
+        assert_eq!(cfg.artifacts_spec, "file:./chuk_train_artifacts");
+        assert_eq!(cfg.host, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(cfg.port, 8700);
+        assert_eq!(cfg.public_url, "http://127.0.0.1:8700");
+        assert_eq!(cfg.providers, "mock");
+        assert_eq!(cfg.agent_ws_url, "ws://127.0.0.1:8700/ws/agent");
+        assert_eq!(cfg.agent_bin, None);
+        assert_eq!(cfg.agent_dir, None);
+        assert_eq!(cfg.min_protocol, chuk_compute_wire::PROTOCOL_VERSION);
+        assert_eq!(cfg.vast_api_key, None);
+        assert_eq!(cfg.drain_window_min, 5.0);
+        assert_eq!(cfg.confirm_cost_threshold, 5.0);
+        assert_eq!(cfg.reconcile_interval, Duration::from_secs(600));
+        assert_eq!(cfg.idle_reap, Duration::from_secs(600));
+        assert_eq!(cfg.google_client_id, None);
+        assert_eq!(cfg.google_client_secret, None);
+        assert!(cfg.allowed_emails.is_empty());
+        assert_eq!(cfg.sysadmin_email, None);
+        assert!(!cfg.auth_enabled());
+        assert_eq!(cfg.bootstrap_sysadmin(), None);
+
+        clear_env();
+    }
+
+    #[test]
+    fn full_custom_config_overrides_all_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::STORE_URL, "sqlite:explicit.db");
+        std::env::set_var(env::DB_PATH, "should-be-ignored.db");
+        std::env::set_var(env::ARTIFACTS_DIR, "file:/srv/artifacts");
+        std::env::set_var(PUBLIC_URL_VAR, "https://train.example.com");
+        std::env::set_var(env::HOST, "127.0.0.1");
+        std::env::set_var(env::PORT, "9100");
+        std::env::set_var(FALLBACK_PORT_VAR, "9999"); // CHUK_TRAIN_PORT wins
+        std::env::set_var(env::PROVIDERS, "mock,vast");
+        std::env::set_var(env::AGENT_WS_URL, "wss://train.example.com/ws/agent");
+        std::env::set_var(env::AGENT_BIN, "/opt/chuk-worker");
+        std::env::set_var(env::AGENT_DIR, "/opt/chuk-worker-bins");
+        std::env::set_var(env::MIN_PROTOCOL, "3");
+        std::env::set_var(env::VAST_API_KEY, "vast-key");
+        std::env::set_var(env::RECONCILE_INTERVAL_S, "30");
+        std::env::set_var(env::IDLE_REAP_S, "15.5");
+        std::env::set_var(env::DRAIN_WINDOW_MIN, "12.5");
+        std::env::set_var(env::CONFIRM_COST_THRESHOLD, "42");
+        std::env::set_var(env::ALLOWED_EMAILS, " Foo@Example.com ,, bar@EXAMPLE.com,   ");
+        std::env::set_var(env::GOOGLE_CLIENT_ID, "client-id");
+        std::env::set_var(env::GOOGLE_CLIENT_SECRET, "client-secret");
+        std::env::set_var(env::SYSADMIN_EMAIL, " Admin@Example.COM ");
+
+        let cfg = Config::from_env().unwrap();
+
+        assert_eq!(cfg.store_spec, "sqlite:explicit.db");
+        assert_eq!(cfg.artifacts_spec, "file:/srv/artifacts");
+        assert_eq!(cfg.public_url, "https://train.example.com");
+        assert_eq!(cfg.host, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(cfg.port, 9100);
+        assert_eq!(cfg.providers, "mock,vast");
+        assert_eq!(cfg.agent_ws_url, "wss://train.example.com/ws/agent");
+        assert_eq!(cfg.agent_bin.as_deref(), Some("/opt/chuk-worker"));
+        assert_eq!(cfg.agent_dir.as_deref(), Some("/opt/chuk-worker-bins"));
+        assert_eq!(cfg.min_protocol, 3);
+        assert_eq!(cfg.vast_api_key.as_deref(), Some("vast-key"));
+        assert_eq!(cfg.reconcile_interval, Duration::from_secs_f64(30.0));
+        assert_eq!(cfg.idle_reap, Duration::from_secs_f64(15.5));
+        assert_eq!(cfg.drain_window_min, 12.5);
+        assert_eq!(cfg.confirm_cost_threshold, 42.0);
+        assert_eq!(
+            cfg.allowed_emails,
+            vec!["foo@example.com".to_string(), "bar@example.com".to_string()]
+        );
+        assert_eq!(cfg.google_client_id.as_deref(), Some("client-id"));
+        assert_eq!(cfg.google_client_secret.as_deref(), Some("client-secret"));
+        assert_eq!(cfg.sysadmin_email.as_deref(), Some("admin@example.com"));
+        assert!(cfg.auth_enabled());
+        assert_eq!(cfg.bootstrap_sysadmin().as_deref(), Some("admin@example.com"));
+
+        clear_env();
+    }
+
+    #[test]
+    fn port_falls_back_to_generic_port_var() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(FALLBACK_PORT_VAR, "5555");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.port, 5555);
+        assert_eq!(cfg.public_url, "http://127.0.0.1:5555");
+        assert_eq!(cfg.agent_ws_url, "ws://127.0.0.1:5555/ws/agent");
+
+        clear_env();
+    }
+
+    #[test]
+    fn store_spec_falls_back_to_db_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::DB_PATH, "legacy.db");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.store_spec, "legacy.db");
+
+        clear_env();
+    }
+
+    #[test]
+    fn malformed_host_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::HOST, "not-an-ip");
+
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains(env::HOST));
+
+        clear_env();
+    }
+
+    #[test]
+    fn malformed_port_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::PORT, "not-a-number");
+
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains(env::PORT));
+
+        clear_env();
+    }
+
+    #[test]
+    fn malformed_drain_window_min_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::DRAIN_WINDOW_MIN, "not-a-number");
+
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains(env::DRAIN_WINDOW_MIN));
+
+        clear_env();
+    }
+
+    #[test]
+    fn malformed_confirm_cost_threshold_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::CONFIRM_COST_THRESHOLD, "not-a-number");
+
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains(env::CONFIRM_COST_THRESHOLD));
+
+        clear_env();
+    }
+
+    #[test]
+    fn malformed_reconcile_interval_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::RECONCILE_INTERVAL_S, "not-a-number");
+
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains(env::RECONCILE_INTERVAL_S));
+
+        clear_env();
+    }
+
+    #[test]
+    fn min_protocol_falls_back_to_default_on_parse_failure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::MIN_PROTOCOL, "not-a-number");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.min_protocol, chuk_compute_wire::PROTOCOL_VERSION);
+
+        clear_env();
+    }
+
+    #[test]
+    fn google_client_credentials_empty_string_filtered_to_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::GOOGLE_CLIENT_ID, "");
+        std::env::set_var(env::GOOGLE_CLIENT_SECRET, "");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.google_client_id, None);
+        assert_eq!(cfg.google_client_secret, None);
+        assert!(!cfg.auth_enabled());
+
+        clear_env();
+    }
+
+    #[test]
+    fn sysadmin_email_blank_after_trim_filtered_to_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        set_required_tokens();
+        std::env::set_var(env::SYSADMIN_EMAIL, "   ");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.sysadmin_email, None);
+
+        clear_env();
+    }
+
+    #[test]
+    fn auth_enabled_requires_client_id_and_secret_and_nonempty_allowed_emails() {
+        assert!(!base_config().auth_enabled());
+
+        let id_only = Config {
+            google_client_id: Some("id".into()),
+            ..base_config()
+        };
+        assert!(!id_only.auth_enabled());
+
+        let id_and_secret_no_emails = Config {
+            google_client_id: Some("id".into()),
+            google_client_secret: Some("secret".into()),
+            ..base_config()
+        };
+        assert!(!id_and_secret_no_emails.auth_enabled());
+
+        let fully_configured = Config {
+            google_client_id: Some("id".into()),
+            google_client_secret: Some("secret".into()),
+            allowed_emails: vec!["a@example.com".into()],
+            ..base_config()
+        };
+        assert!(fully_configured.auth_enabled());
+    }
+
+    #[test]
+    fn bootstrap_sysadmin_prefers_explicit_then_first_allowed_email_then_none() {
+        let explicit = Config {
+            sysadmin_email: Some("admin@example.com".into()),
+            allowed_emails: vec!["other@example.com".into()],
+            ..base_config()
+        };
+        assert_eq!(
+            explicit.bootstrap_sysadmin().as_deref(),
+            Some("admin@example.com")
+        );
+
+        let fallback_to_first_allowed = Config {
+            sysadmin_email: None,
+            allowed_emails: vec!["first@example.com".into(), "second@example.com".into()],
+            ..base_config()
+        };
+        assert_eq!(
+            fallback_to_first_allowed.bootstrap_sysadmin().as_deref(),
+            Some("first@example.com")
+        );
+
+        let none_available = Config {
+            sysadmin_email: None,
+            allowed_emails: Vec::new(),
+            ..base_config()
+        };
+        assert_eq!(none_available.bootstrap_sysadmin(), None);
+    }
+}

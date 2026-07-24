@@ -291,6 +291,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_applies_a_name_override() {
+        let repo = scratch_repo(None, "name-override");
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let info = build(
+            &store,
+            &repo.0.to_string_lossy(),
+            None,
+            Some("overridden-name"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.manifest.name, "overridden-name");
+        assert_eq!(info.code.name, "overridden-name");
+        // The tarball must be stored under the override, not the manifest's
+        // original name, or a later fetch by the returned CodeRef would miss.
+        store
+            .get(&keys::code_unit_tarball("overridden-name", &info.code.sha))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_rejects_an_empty_manifest_name() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(
+            repo.0.join(CODE_UNIT_MANIFEST),
+            "name = \"\"\nversion = \"0.1.0\"\n[entrypoints]\ntrain = \"true\"\n",
+        )
+        .unwrap();
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let err = build(&store, &repo.0.to_string_lossy(), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing a name"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn build_stores_the_lockfile_when_present() {
+        let repo = scratch_repo(None, "with-lockfile");
+        std::fs::write(repo.0.join(CODE_UNIT_LOCKFILE), "# pinned deps\n").unwrap();
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let info = build(&store, &repo.0.to_string_lossy(), None, None, None)
+            .await
+            .unwrap();
+        let stored = store
+            .get(&keys::code_unit_lockfile(&info.code.name, &info.code.sha))
+            .await
+            .unwrap();
+        assert_eq!(stored, b"# pinned deps\n");
+    }
+
+    #[tokio::test]
+    async fn build_ignores_a_commit_pin_for_a_local_directory() {
+        // A local directory has no notion of a commit; `build` should warn
+        // and proceed against the directory as-is rather than failing.
+        let repo = scratch_repo(None, "commit-ignored-for-local-dir");
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let info = build(
+            &store,
+            &repo.0.to_string_lossy(),
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.manifest.name, "scratch");
+    }
+
+    /// Initializes a throwaway local git repo (no network involved) with one
+    /// commit, so the git-clone path in `materialize_source` can be exercised
+    /// against a `file://` URL instead of a real remote.
+    fn init_git_repo(marker: &str) -> (TempDir, String) {
+        let repo = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo.0)
+                .status()
+                .expect("git must be installed to run this test");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "codeunit-test@example.com"]);
+        git(&["config", "user.name", "codeunit-test"]);
+        std::fs::write(
+            repo.0.join(CODE_UNIT_MANIFEST),
+            "name = \"scratch\"\nversion = \"0.1.0\"\n[entrypoints]\ntrain = \"true\"\n",
+        )
+        .unwrap();
+        std::fs::write(repo.0.join("train.py"), format!("print('{marker}')\n")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo.0)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse HEAD failed");
+        let sha = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+        (repo, sha)
+    }
+
+    #[tokio::test]
+    async fn build_clones_a_local_git_repo_over_a_file_url() {
+        let (repo, _sha) = init_git_repo("clone-over-file-url");
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let url = format!("file://{}", repo.0.display());
+        let info = build(&store, &url, None, None, None).await.unwrap();
+        assert_eq!(info.manifest.name, "scratch");
+    }
+
+    #[tokio::test]
+    async fn build_clones_a_local_git_repo_and_checks_out_a_pinned_commit() {
+        let (repo, sha) = init_git_repo("clone-pinned-commit");
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let url = format!("file://{}", repo.0.display());
+        let info = build(&store, &url, Some(&sha), None, None).await.unwrap();
+        assert_eq!(info.manifest.name, "scratch");
+    }
+
+    #[tokio::test]
+    async fn build_surfaces_a_git_clone_failure() {
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        // Not a directory (so it takes the clone path) and not a real git
+        // remote, so `git clone` itself fails and the error should propagate.
+        let err = build(
+            &store,
+            "file:///definitely/not/a/real/git/repo/anywhere",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("git"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn build_excludes_ignored_dirs_and_recurses_into_real_subdirectories() {
+        let repo = scratch_repo(None, "excludes-and-recurses");
+        // `target` is a TAR_EXCLUDES entry: it and everything under it must
+        // never reach the tarball, even though it sits right at the root.
+        std::fs::create_dir_all(repo.0.join("target")).unwrap();
+        std::fs::write(repo.0.join("target").join("built.bin"), b"binary").unwrap();
+        // A real (non-excluded) nested subdirectory: append_dir must recurse
+        // into it and preserve the relative path in the tar entry name.
+        std::fs::create_dir_all(repo.0.join("src").join("nested")).unwrap();
+        std::fs::write(repo.0.join("src").join("nested").join("helper.py"), "pass\n").unwrap();
+        let store = FsArtifactStore::new(std::env::temp_dir());
+        let info = build(&store, &repo.0.to_string_lossy(), None, None, None)
+            .await
+            .unwrap();
+        let tarball = store
+            .get(&keys::code_unit_tarball(&info.code.name, &info.code.sha))
+            .await
+            .unwrap();
+        let decoded = zstd::decode_all(tarball.as_slice()).unwrap();
+        let mut archive = tar::Archive::new(decoded.as_slice());
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"src/nested/helper.py".to_owned()),
+            "names={names:?}"
+        );
+        assert!(!names.iter().any(|n| n.contains("target")), "names={names:?}");
+    }
+
+    #[tokio::test]
     async fn build_tars_only_the_subdirectory_not_the_whole_repo() {
         let repo = scratch_repo(Some("examples/v11-pretrain"), "tars-subdir-only");
         // A file outside the unit subdir — must never end up in the tarball.

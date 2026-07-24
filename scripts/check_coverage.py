@@ -36,8 +36,6 @@ BOOTSTRAP_EXCLUDE = {
     "chuk-train-controlplane/src/artifacts/fs.rs",
     "chuk-train-controlplane/src/artifacts/s3.rs",
     "chuk-train-controlplane/src/auth.rs",
-    "chuk-train-controlplane/src/codeunit.rs",
-    "chuk-train-controlplane/src/config.rs",
     "chuk-train-controlplane/src/drive.rs",
     "chuk-train-controlplane/src/experiments.rs",
     "chuk-train-controlplane/src/lease.rs",
