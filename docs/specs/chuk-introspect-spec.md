@@ -66,7 +66,7 @@ GPU, not just Mac-side reads of finished checkpoints.
 
 ---
 
-## 0. Implementation status (v0.4, 2026-07-21)
+## 0. Implementation status (v0.4, updated 2026-07-25)
 
 | Milestone | State | Gate | Proven |
 |-----------|-------|------|--------|
@@ -77,12 +77,20 @@ GPU, not just Mac-side reads of finished checkpoints.
 | **I4** j-space over training: cheap rows every snapshot, paper-faithful `J_ℓ` at milestone checkpoints (inline + eval-job modes), nulls enforced, curves dashboarded | ⬜ not started | EI4 | — |
 | **I5** introspection sweeps: cross-run comparison (probe curves across a sweep's children) | ⬜ not started | EI5 | — |
 
-Nothing is built. The load-bearing decision already made upstream: the worker and wire
-crates are **permanently domain-free** (chuk-compute-spec §1; enforced by the lexical CI
-guard `chuk-compute-wire/tests/no_domain_vocabulary.rs`). Everything below rides
-existing generic channels — a new metric namespace, a new artifact class string, two new
-script-contract env vars. **Zero wire changes in the entire spec.** (The v0.2 eval-job
-fit mode reuses the existing batch-eval job type — still zero wire changes.)
+**I0 is built and live-proven; I1 and beyond are not started.** (This paragraph read
+"nothing is built" through v0.4 — true when the spec was written, stale since 2026-07-22.)
+What shipped for I0: the normative `introspect/*` key grammar in `chuk-train-proto`, the
+`chuk_introspect` pulse-capture library (`introspect/`, vendored into code units at build
+time, 17 tests), stub-trainer probe wiring, gates accepting introspect keys unchanged, and
+the dashboard's Introspection tab.
+
+The load-bearing decision already made upstream: the worker and wire crates are
+**permanently domain-free** (chuk-compute-spec §1; enforced by the lexical CI guard
+`chuk-compute-wire/tests/no_domain_vocabulary.rs`). Everything below rides existing
+generic channels — a new metric namespace, a new artifact class string, two new
+script-contract env vars. **Zero wire changes in the entire spec**, and I0 shipped with
+none. (The v0.2 eval-job fit mode reuses the existing batch-eval job type — still zero
+wire changes.)
 
 ---
 

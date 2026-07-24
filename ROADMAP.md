@@ -72,6 +72,21 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   dash.css,app.js}`) behind a thin Rust handler, and the store's monolithic adapters are split into
   10 per-domain sub-traits (`WorkerStore`/`RunStore`/… → `store/{sqlite,postgres}/*.rs`); every
   store file is ≥90% line-covered (sqlite in-process, postgres via the CI Postgres service).
+- **Per-file ≥90% coverage, no allowlist** (2026-07-25) — the gate
+  (`scripts/check_coverage.py`, CI) now holds for **every** file; the bootstrap allowlist it
+  shipped with is deleted. The last six (`auth`, `drive`, `experiments`, `lease`, `ws`,
+  `artifacts/s3` — 9–78% before) were paid down by testing them where they actually are:
+  a shared loopback HTTP server (`fakehttp.rs`) so Drive, the experiments mirror, S3/R2
+  (a real `aws-sdk-s3` client against a fake bucket) and Google sign-in sign and send real
+  requests; the worker websocket driven end-to-end against a real axum server; and the
+  lease state machine (clock → drain → T-0 → reconcile → idle reaper, plus destroy failures
+  and orphans) against a scriptable `Provider`. Small production seams made that possible
+  rather than mocks — endpoint URLs as values (`Google::live`, `DriveClient::at`,
+  `Experiments::at`), an injected destroy-verification `VerifyPolicy` so the 2-minute spec
+  constant isn't slept out, and `Providers::of` for a test-only driver. `#[ignore]`d live
+  checks moved to `tests.rs` siblings (excluded from the report) so code CI can never run
+  stops counting against a module. Found + fixed a real flake on the way: two tests raced
+  over `CHUK_EXPERIMENTS_*`, now serialized by a shared env lock.
 - **Hosted HTTP MCP endpoint** (2026-07-21) — `chuk-train-mcp --http` serves the same tool
   registration over HTTP; deployed as its own Fly app (`chuk-train-mcp.fly.dev/mcp`,
   `deploy/mcp/`, auto-deployed by CI after the CP). It is a **zero-credential proxy**
@@ -444,6 +459,22 @@ Things we've hit or know are soft, roughly by priority:
   provision → worker boots → joins with its bound `cj_` token → fleet connected.
 - **Observability** — structured request logging, a `/metrics` endpoint, orphan/gate
   alerting beyond log lines.
-- **Tests** — integration tests for the agent↔CP protocol and the lease state machine;
-  today's coverage is unit tests + live round-trip tests (Neon, Drive, R2 lifecycle) +
-  manual/`demo.sh` end-to-end runs.
+- **Tests** — every **Rust** file now clears the ≥90% per-file line gate with no
+  allowlist (2026-07-25): the agent↔CP handshake + message loop is driven over a real
+  websocket against a real axum server, the lease state machine (clock, drain, T-0,
+  reconcile, idle reaper) against a scriptable provider, and Drive / the experiments
+  mirror / S3-R2 / Google sign-in against loopback fakes. Still outstanding:
+  - **Neither Python package is gated.** `mcp/` ships 34 tools with **no `tests/` dir
+    at all**, and `introspect/`'s 17 tests exist but **no CI job runs them** — the
+    workflow is cargo-only. So the ≥90% house rule holds everywhere except the surface
+    agents actually call and the library that runs inside every trainer. `mcp/` is a
+    thin REST client, so the shape is cheap: a fake CP (the same loopback pattern as
+    the Rust side) plus schema/envelope assertions per tool. Highest-value remaining
+    test gap; a `pytest` job for both packages is the smaller half of it.
+  - A multi-worker scheduling integration test (packing/assignment under contention).
+  - The live round-trip tests (Drive, R2 lifecycle, experiments-server) stay
+    `#[ignore]`d in `tests.rs` siblings — CI can't hold their credentials, so they
+    remain a manual step and are excluded from the coverage report rather than
+    counted as gaps. (Postgres is the exception: `pg_live` is `#[ignore]`d but CI
+    runs it against a throwaway `postgres:16` service, so the adapter is genuinely
+    covered.)

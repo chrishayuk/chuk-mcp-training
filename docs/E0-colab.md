@@ -12,21 +12,27 @@ the Colab cell needs only the Fly URL + join token — nothing else to host.
 From the repo root (you're already logged in as `fly auth whoami`):
 
 ```bash
-# First time: create the app + volume (edit the app name in deploy/fly.toml first).
+# First time: create the app (edit the app name in deploy/fly.toml first).
 fly launch --no-deploy --copy-config -c deploy/fly.toml
-fly volumes create chuk_train_data --size 1 -c deploy/fly.toml
 
 # Secrets (the two tokens are the whole security model for M0/E0).
 fly secrets set -c deploy/fly.toml \
   CHUK_TRAIN_API_TOKEN=$(openssl rand -hex 24) \
   CHUK_TRAIN_JOIN_TOKEN=$(openssl rand -hex 24)
 
-fly deploy -c deploy/fly.toml --dockerfile deploy/Dockerfile
+# Deploy from the PARENT of this repo, with chuk-datasets-server checked out as
+# a sibling — chuk-datasets-client is a path dependency into it, so the build
+# context has to span both repos (see deploy/Dockerfile's header). Same command
+# CI runs on a green push to main, which is the normal way this deploys.
+(cd .. && fly deploy -c chuk-mcp-training/deploy/fly.toml \
+                     --dockerfile chuk-mcp-training/deploy/Dockerfile)
 ```
 
 The Dockerfile builds the control plane (native) and the worker (static musl,
-portable to Colab) on Fly's x86_64 builder. After deploy, point public URLs at
-the real host:
+portable to Colab) on Fly's x86_64 builder. The store is Neon (set
+`CHUK_TRAIN_STORE` as a secret) — the control plane is stateless, and the
+`/data` volume in `fly.toml` is legacy, no longer written. After deploy, point
+public URLs at the real host:
 
 ```bash
 APP=$(fly status -c deploy/fly.toml --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["Name"])')
@@ -113,4 +119,6 @@ Colab first.
   in `crates/chuk-compute-worker/Cargo.toml`); Colab's normal image has the certs.
 - E1 (real training) reuses this exact setup: build a code unit from your v11
   trainer repo with `build_code_unit`, then `submit_run` against the Colab
-  worker — checkpoints upload to `/data/artifacts` on Fly with full lineage.
+  worker — checkpoints upload **directly to R2** (presigned; the bytes never
+  touch the control plane) with full lineage, and tier to Drive when the run
+  completes. E1 is done: it passed on a real T4, resume test included.

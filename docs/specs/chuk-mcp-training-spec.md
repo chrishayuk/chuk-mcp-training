@@ -1,10 +1,23 @@
-# chuk-mcp-training — Specification v0.8
+# chuk-mcp-training — Specification v0.9
 
 **MCP-controlled remote training harness for Colab and rented single GPUs**
 Control plane + a compute-generic worker (`chuk-compute-worker`) in **Rust** (axum · tokio ·
 sqlx) · MCP tool surface in **Python** on `chuk-mcp-server` (thin client over the control
 plane's REST API) · Workers: Google Colab, Vast.ai, Lambda Cloud
 
+v0.9 changes: **content-addressed data (§5.1)** — a train job may carry a `data:` block
+naming a dataset (+ optional batch plan) from the sibling **chuk-datasets-server**; the
+control plane resolves it to a concrete `content_sha`/`plan_sha` at dispatch and stages
+each manifest shard as a hash-verified input, exporting `$CHUK_DATASET`/`$CHUK_PLAN` to
+the script contract and stamping the **resolved** (never trainer-claimed) identity into
+checkpoint lineage (§11.2). Unlike every other external tier this one is *not*
+best-effort once opted into: a run declaring `data:` with no configured client **fails to
+dispatch** rather than silently training on nothing (§1 principle 10 still holds — a run
+without a `data:` block needs nothing). **Training-time introspection** ships as its own
+spec (`chuk-introspect-spec.md`, tier I0 live): `introspect/*` metric keys ride the
+existing metric channel, gates accept them unchanged, and the dashboard has an
+Introspection tab. **Engineering bar (§14)**: every source file holds ≥90% line coverage,
+gated per file in CI with no allowlist.
 v0.8 changes: **cost governance (§8) is built** — budget caps (`global` / `provider:<name>`
 per `month`/`all` period) enforced on provision/extend, and a `confirm_cost` pre-flight on
 submissions (sweeps refuse with the multiplied total). **Watchdog gates (§6) are built** —
@@ -47,7 +60,7 @@ scheduler; cost governance and dashboard; lazarus reduced to the artifact contra
 
 ---
 
-## 0. Implementation status (v0.8, 2026-07-21)
+## 0. Implementation status (v0.9, 2026-07-25)
 
 | Milestone | State | Gate | Proven |
 |-----------|-------|------|--------|
@@ -92,6 +105,26 @@ down; and a version-mismatched persistent worker **self-updates** in place). M4 
 host-telemetry sampler streams GPU/CPU/memory out-of-band; the CP keeps a pruned per-worker
 window (`worker_telemetry` + dashboard gauges). All proven. (The control plane crate is
 `chuk-train-controlplane`.)
+
+**chuk-datasets (2026-07-24):** `data:` resolution is built and proven locally end-to-end
+(a real chuk-datasets control plane + this control plane + a real worker, three processes
+over real HTTP/WS, zero mocks: resolved identity stamped into every checkpoint, shard
+fetched and hash-verified from the worker's content-addressed cache). Not yet run against
+the deployed `chuk-datasets.fly.dev`.
+
+**chuk-introspect (2026-07-22):** tier I0 live and proven on a real Colab T4 — 10
+`introspect/*` pulse keys at ~3% steady-state overhead, mirrored into the experiments
+registry as results. See `chuk-introspect-spec.md`.
+
+**Engineering bar:** clippy clean (`--all-targets`) and **≥90% line coverage on every
+file**, gated per file in CI (`scripts/check_coverage.py`) with no allowlist as of
+2026-07-25; `src/main.rs` and `examples/` are the only structural exclusions. Checks that
+need third-party credentials CI can't hold (R2, Drive, chuk-experiments-server) stay
+`#[ignore]`d in `tests.rs` siblings — excluded from the report rather than counted as
+gaps. Everything else is tested against loopback fakes at the socket, including the worker
+websocket and the S3/Drive/experiments clients; the Postgres adapter runs for real against
+a CI service container. The bar is **Rust-only today**: the Python MCP package has no test
+suite, and `chuk_introspect`'s tests aren't wired into CI — the open gap in the rule.
 
 ---
 
@@ -269,6 +302,10 @@ worth watching — image caching / pre-baked Vast templates are the fix if it gr
     { "name": "v11-base", "kind": "checkpoint" },
     { "name": "r1.1-corpus", "kind": "dataset" }
   ],
+  "data": {                              // optional; chuk-datasets-server (v0.9)
+    "dataset": "r1.1-corpus@sha256:…",   //   name@content_sha, or a bare content sha
+    "plan": "sha256:…"                   //   optional batch plan / planset member ref
+  },
   "requirements": { "min_vram_gb": 16, "cuda": true, "disk_gb": 30 },
   "checkpoint": { "every_steps": 500, "keep_last": 3, "keep_every": 5000 },
   "max_hours": 12,                       // cumulative across slices
@@ -277,9 +314,19 @@ worth watching — image caching / pre-baked Vast templates are the fix if it gr
 }
 ```
 
-Script contract unchanged: `$CHUK_CONFIG`, metrics JSONL to `$CHUK_METRICS`, checkpoints
-to `$CHUK_CKPT_DIR`, exit 0. Additionally the harness exports `$CHUK_RESUME_CKPT` when a
-slice resumes. ~5 lines to adopt.
+Script contract: `$CHUK_CONFIG`, metrics JSONL to `$CHUK_METRICS`, checkpoints to
+`$CHUK_CKPT_DIR`, exit 0. The harness also exports `$CHUK_OVERRIDES`, `$CHUK_RUN_ID`,
+`$CHUK_SEED`, `$CHUK_RESUME_CKPT` (when a slice resumes), and — when the job declared a
+`data:` block — `$CHUK_DATASET` / `$CHUK_PLAN` carrying the **resolved** shas. ~5 lines to
+adopt.
+
+**`data:` resolution (v0.9).** At dispatch the control plane resolves the block against
+chuk-datasets-server into a concrete `content_sha` (+ `plan_sha`) and stages each manifest
+shard as a hash-verified input, the same contract code units already use; the worker
+checks its content-addressed local cache (`$CHUK_TRAIN_CACHE`) before any fetch and
+populates it after a verified one. Gated on `CHUK_DATASETS_URL` + `CHUK_DATASETS_API_KEY`:
+a run declaring `data:` with no configured client **fails to dispatch** — the data is
+required to run at all, so degrading silently would produce a meaningless run.
 
 ### 5.2 SweepSpec
 
@@ -580,12 +627,16 @@ unit id    =  sha256 over the tarball
   "config_hash": "…", "tokenizer_hash": "…",
   "parent_checkpoint": "v11-base@sha256:…",        // resume/base lineage
   "datasets": ["r1.1-corpus@sha256:…"],
+  "dataset_sha": "…", "plan_sha": "…",             // resolved chuk-datasets identity (v0.9)
   "run_id": "…", "slices": [[0, 9500], [9500, 15000]]
 }
 ```
 
 Every number on a panel is mechanically traceable to exact code, corpus, tokenizer,
 base, and seed. The tokenizer-hash check stays a load-time refusal in lazarus.
+The dataset fields are written by the control plane from what it **resolved** at
+dispatch, never from a value the trainer reported — a run can't claim to have trained on
+a corpus it didn't receive.
 
 ### 11.3 Logs & metrics as artifacts
 
@@ -759,13 +810,28 @@ without renting anything. No dollar leaves the building until M2/E2.
 4. **M3** ⬜ — **packing**: job classes, learned estimates, assignment rule, resumable
    slicing, `submit_batch` preview, utilization metric. *Test: 6 short evals + 1
    resumable train packed into one 60-min lease, ≥85% utilization.*
-5. **M4** 🟡 — budgets + dashboard: ledger, caps, `spend_status`, watchdog gates, the
-   one-page dashboard. *(Ledger + `spend_status` done in M2; caps, watchdog gates, and
-   the real dashboard remain — only a M0 stub dashboard exists.)*
-6. **M5** ⬜ — sweeps + panel gates; lazarus `load_checkpoint` + tokenizer-hash
-   verification; first training-dynamics probe curve. Lambda driver.
+5. **M4** ✅ code done — budgets + dashboard: ledger, caps, `spend_status`, watchdog gates,
+   the dashboard. *(All built: caps enforced on provision/extend including the post-price
+   abort-and-destroy, the watchdog trio checkpoint-then-stops, and the dashboard went well
+   past "one page" — tabbed per-run drill-in, fleet/runs filters, Money/Budgets, Gates,
+   sweeps, Access, Join. The **E4 proving run** on real hardware is what's left.)*
+6. **M5** 🟡 — sweeps ✅ (`submit_sweep` fan-out + per-sweep concurrency + cross-child
+   aggregation); panel gates (needs the `eval` job kind), lazarus `load_checkpoint` +
+   tokenizer-hash verification, first training-dynamics probe curve, and the Lambda driver
+   remain.
 
 M2 before M3 deliberately: **cleanup is trusted before packing makes leases busy.**
+
+**Engineering bar.** Every source file holds **≥90% line coverage**, gated per file in CI
+with no allowlist, alongside clippy `--all-targets` and the wire/worker lexical guards.
+Two structural exclusions only (`src/main.rs`, `examples/`), each justified in
+`scripts/check_coverage.py` rather than in CI config. Tests exercise real seams: loopback
+HTTP fakes for every third-party client (Drive, chuk-experiments-server, S3/R2, Google
+sign-in) and a real socket for the worker websocket, so what is asserted is the wire shape
+actually produced. Checks that need third-party credentials are `#[ignore]`d, kept in
+`tests.rs` siblings, and excluded from the coverage report — CI cannot run them, so they
+are recorded as a manual step, never counted as coverage. Where a real dependency *can* be
+stood up in CI it is: the Postgres adapter runs against a throwaway service container.
 
 ---
 
