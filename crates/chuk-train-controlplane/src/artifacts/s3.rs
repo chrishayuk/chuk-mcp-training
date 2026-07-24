@@ -335,11 +335,12 @@ mod tests {
         assert_ne!(get.url, put.url);
     }
 
-    // -- from_env: the one test in this crate allowed to touch the S3 env
-    // vars (mirrors `artifacts::clear_s3_env`'s reasoning — duplicated here
-    // rather than shared since sharing it would mean editing mod.rs). Kept as
-    // a single #[test] rather than several so it can't race a sibling test
-    // over the same process-global vars.
+    // -- from_env: touches the same process-global S3 env vars as
+    // `artifacts::mod::tests::s3_backend_requires_credentials_then_selects_
+    // and_strips_the_bucket` — takes the shared `S3_ENV_LOCK` (see its doc
+    // comment in mod.rs) so the two can't interleave under cargo test's
+    // default parallelism. Kept as a single #[test] rather than several so
+    // it can't race itself either.
     fn clear_s3_env() {
         std::env::remove_var(env::S3_ENDPOINT);
         std::env::remove_var(env::S3_REGION);
@@ -349,6 +350,7 @@ mod tests {
 
     #[test]
     fn from_env_names_each_missing_var_in_turn_then_builds_with_a_default_region() {
+        let _guard = super::super::lock_s3_env();
         clear_s3_env();
 
         let err = S3ArtifactStore::from_env("bucket").unwrap_err();

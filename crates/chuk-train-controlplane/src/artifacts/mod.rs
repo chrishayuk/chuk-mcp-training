@@ -28,6 +28,26 @@ const SCHEME_FILE: &str = "file:";
 const SCHEME_S3: &str = "s3:";
 const SCHEME_R2: &str = "r2:";
 
+/// Serializes every test in this crate that mutates the process-global
+/// `CHUK_TRAIN_S3_*` env vars — currently one in this module's own `tests`
+/// and one in `s3::tests`, written independently of each other and each
+/// originally (and wrongly, once the other landed) believing it was the only
+/// one touching these vars. `cargo test`'s default parallelism interleaves
+/// them otherwise, so a run reads a partially-set-by-a-sibling-test env and
+/// fails nondeterministically (observed in CI: `s3_backend_requires_
+/// credentials_then_selects_and_strips_the_bucket` failed because `s3::
+/// tests::from_env_...` had set `S3_ENDPOINT` mid-run). `parking_lot`-free
+/// std `Mutex` on purpose (no new dependency); poison-recovers so one
+/// panicking test while holding the lock can't cascade-fail every test after
+/// it.
+#[cfg(test)]
+pub(crate) static S3_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_s3_env() -> std::sync::MutexGuard<'static, ()> {
+    S3_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Byte storage for artifacts. Keys are store-relative POSIX paths under the
 /// layout in [`keys`]; the store never interprets them beyond joining.
 #[async_trait]
@@ -95,10 +115,6 @@ mod tests {
 
     use super::*;
 
-    // These four vars aren't read anywhere else in this crate's test suite
-    // (they're only sourced from `.env` by the `main.rs` binary entrypoint,
-    // never by `cargo test`), so a dedicated env-var mutex would be overkill
-    // for one test — same reasoning as `datasets::tests::from_env_is_none_…`.
     fn clear_s3_env() {
         std::env::remove_var(env::S3_ENDPOINT);
         std::env::remove_var(env::S3_REGION);
@@ -125,9 +141,11 @@ mod tests {
 
     // Both cases below touch the same four process-global env vars, so they
     // live in one #[test] (run sequenced, not interleaved with a sibling
-    // test) rather than two — see `clear_s3_env`'s doc comment.
+    // test) rather than two — and take `S3_ENV_LOCK` since `s3::tests` also
+    // touches these vars (see the lock's own doc comment).
     #[test]
     fn s3_backend_requires_credentials_then_selects_and_strips_the_bucket() {
+        let _guard = super::lock_s3_env();
         clear_s3_env();
 
         // No credentials at all: refused, naming the missing var.
