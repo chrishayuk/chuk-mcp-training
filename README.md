@@ -76,8 +76,10 @@ code units already use. Unlike the other integrations above this one is
 rather than silently training on nothing. `CheckpointMeta.dataset_sha`/
 `plan_sha` record the resolved (not trainer-claimed) identity. The worker
 links `chuk-datasets-client` directly and caches fetched shards locally by
-hash. Gate G1 (one live end-to-end run) is the remaining proof; see
-`ROADMAP.md`.
+hash. Gate G1 is proven live locally (real control planes + a real worker,
+zero mocks, checkpoints stamped with the resolved identity); the deployed
+chuk-datasets.fly.dev + chuk-mcp-training.fly.dev run is the remaining
+proof — see `ROADMAP.md`.
 
 **chuk-compute substrate (M1–M4 done).** Underneath the training-first control
 plane the rig is being factored into a **compute fabric**: a permanently

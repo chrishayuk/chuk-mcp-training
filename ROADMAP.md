@@ -120,8 +120,20 @@ proving experiments E0–E5 (spec §15): a milestone isn't done until its E is g
   verified against the real x86_64 CI runner and Fly's remote builder.
   **chuk-datasets's Gate G1** (one run end-to-end with `data:` resolution +
   meta stamped) is code-complete and unit/integration-tested against a mock
-  resolve server, plus the CI/deploy path is proven — not yet run against
-  the live `chuk-datasets-server` deployment with a real worker.
+  resolve server, plus the CI/deploy path is proven. **Live local proof,
+  2026-07-24**: a real `chuk-datasets-controlplane` + this repo's
+  `chuk-train-controlplane` + a real `chuk-compute-worker`, three separate
+  processes on real HTTP/WS, zero mocks — `assemble_train_job` resolved a
+  registered dataset via a genuine `/v1/resolve` call, the worker made a
+  real HTTP fetch of the shard (confirmed in the byte server's access log),
+  and every checkpoint of the run came back with `dataset_sha`/`datasets`
+  stamped from the resolved identity. Caught two real `.env`-auto-load leaks
+  along the way (the Drive archive tier picking up a real refresh token, and
+  `CHUK_TRAIN_PUBLIC_URL` sending the worker to fetch a code unit from
+  *production* — 401'd harmlessly, nothing written) — fixed by running from
+  a directory outside the repo so dotenvy can't find `.env`. Not yet run
+  against the actual deployed chuk-datasets.fly.dev +
+  chuk-mcp-training.fly.dev.
 - **Agent-first MCP surface** (2026-07-20, patterns borrowed from chuk-experiments-server's
   tool design) — `whoami` (role/team/experiments-key-linked, so an agent can predict 403s
   instead of debugging them) and `worker_telemetry` (live `sys/*` sample per worker) expose
