@@ -107,6 +107,7 @@ impl AuthContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{SqliteStore, WorkerTokenStore};
 
     #[test]
     fn api_key_carries_its_prefix_and_round_trips() {
@@ -124,5 +125,102 @@ mod tests {
         assert_eq!(prefix.len(), WORKER_TOKEN_PREFIX.len() + 8);
         // The stored hash is the sha256 of the plaintext shown once at creation.
         assert_eq!(hash, hash_token(&plaintext));
+    }
+
+    #[test]
+    fn join_token_carries_its_prefix_and_round_trips() {
+        let (plaintext, prefix, hash) = generate_join_token();
+        assert!(plaintext.starts_with(JOIN_TOKEN_PREFIX));
+        assert!(prefix.starts_with(JOIN_TOKEN_PREFIX));
+        assert_eq!(prefix.len(), JOIN_TOKEN_PREFIX.len() + 8);
+        assert_eq!(hash, hash_token(&plaintext));
+    }
+
+    /// Two independently generated tokens never collide on either the
+    /// plaintext or its display prefix — the random tail is doing real work,
+    /// not just decoration.
+    #[test]
+    fn generated_tokens_are_unique() {
+        let (p1, prefix1, _) = generate();
+        let (p2, prefix2, _) = generate();
+        assert_ne!(p1, p2);
+        assert_ne!(prefix1, prefix2);
+    }
+
+    #[tokio::test]
+    async fn mint_join_token_persists_a_hash_the_store_resolves_back_to_the_worker() {
+        let store = SqliteStore::open(":memory:").await.expect("store");
+        let worker_id = WorkerId("w-mint".into());
+        let plaintext = mint_join_token(&store, &worker_id).await.expect("mint");
+
+        assert!(plaintext.starts_with(JOIN_TOKEN_PREFIX));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs_f64();
+        // The store only ever saw the sha256 hash, never the plaintext.
+        let (bound, first_use) = store
+            .resolve_join_token(&hash_token(&plaintext), now)
+            .await
+            .expect("resolve")
+            .expect("minted token must resolve");
+        assert_eq!(bound, worker_id);
+        assert!(first_use);
+
+        // A second resolution is the replayed-reconnect case: same bound id,
+        // no longer first use.
+        let (bound_again, first_use_again) = store
+            .resolve_join_token(&hash_token(&plaintext), now)
+            .await
+            .expect("resolve")
+            .expect("consumed token still resolves for reconnect");
+        assert_eq!(bound_again, worker_id);
+        assert!(!first_use_again);
+
+        // An unrelated token was never minted, so it resolves to nothing.
+        assert!(store
+            .resolve_join_token(&hash_token("never-minted"), now)
+            .await
+            .expect("resolve")
+            .is_none());
+    }
+
+    #[test]
+    fn may_treats_role_as_a_minimum_bar_least_to_most_privileged() {
+        let ctx = |role| AuthContext {
+            role,
+            team_id: "default".into(),
+            subject: "user@example.com".into(),
+            owner_email: "user@example.com".into(),
+        };
+
+        // A read-role caller may only do read-level things.
+        let reader = ctx(Role::Read);
+        assert!(reader.may(Role::Read));
+        assert!(!reader.may(Role::Write));
+        assert!(!reader.may(Role::Admin));
+        assert!(!reader.may(Role::Sysadmin));
+
+        // Write clears read + write but not admin/sysadmin.
+        let writer = ctx(Role::Write);
+        assert!(writer.may(Role::Read));
+        assert!(writer.may(Role::Write));
+        assert!(!writer.may(Role::Admin));
+
+        // Sysadmin clears every bar, including itself.
+        let sysadmin = ctx(Role::Sysadmin);
+        for min in [Role::Read, Role::Write, Role::Admin, Role::Sysadmin] {
+            assert!(sysadmin.may(min));
+        }
+    }
+
+    #[test]
+    fn master_token_sentinel_is_not_a_real_email() {
+        // Per-user features must reject this sentinel rather than silently
+        // attaching state to it; guard the literal so a future rename or
+        // format change is caught here rather than downstream.
+        assert_eq!(MASTER_TOKEN_SENTINEL, "master-token");
+        assert!(!MASTER_TOKEN_SENTINEL.contains('@'));
     }
 }

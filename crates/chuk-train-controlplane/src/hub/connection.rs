@@ -67,9 +67,17 @@ impl Hub {
     /// for a half-open link (a frozen Colab tab) that never delivered a socket
     /// close, so `detach` was never called from the websocket task.
     pub async fn reap_stale_workers(&self) -> Result<()> {
-        let preempt_after = HEARTBEAT_PREEMPT_TIMEOUT.as_secs_f64();
+        self.reap_stale_workers_older_than(HEARTBEAT_PREEMPT_TIMEOUT.as_secs_f64())
+            .await
+    }
+
+    /// Test seam for [`Self::reap_stale_workers`]: takes the preempt age
+    /// directly (mirrors [`Self::reap_stuck_assignments_older_than`]) so a
+    /// test can force an immediate sweep instead of waiting out the real
+    /// `HEARTBEAT_PREEMPT_TIMEOUT`.
+    pub(super) async fn reap_stale_workers_older_than(&self, preempt_after_s: f64) -> Result<()> {
         for worker in self.store.fleet().await? {
-            if !should_reap(&worker, preempt_after) {
+            if !should_reap(&worker, preempt_after_s) {
                 continue;
             }
             let class = if self.store.worker_is_persistent(&worker.id).await? {
@@ -83,8 +91,10 @@ impl Hub {
         Ok(())
     }
 
-    /// Run [`Self::reap_stale_workers`] forever on a fixed interval. Spawned once
-    /// at startup; a failed sweep is logged and retried on the next tick.
+    /// Run [`Self::reap_stale_workers`] and [`Self::reap_stuck_assignments`]
+    /// forever on a fixed interval. Spawned once at startup; a failed sweep is
+    /// logged and retried on the next tick (independently — one failing
+    /// doesn't skip the other).
     pub async fn run_reaper_loop(self: Arc<Self>, interval: std::time::Duration) {
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -92,6 +102,9 @@ impl Hub {
             tick.tick().await;
             if let Err(error) = self.reap_stale_workers().await {
                 warn!(%error, "heartbeat reaper sweep failed");
+            }
+            if let Err(error) = self.reap_stuck_assignments().await {
+                warn!(%error, "stuck-assignment reaper sweep failed");
             }
         }
     }
